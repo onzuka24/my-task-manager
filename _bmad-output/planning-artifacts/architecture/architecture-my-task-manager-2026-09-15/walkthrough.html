@@ -1,0 +1,583 @@
+<title>境界の設計図</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Archivo:wght@500;600;700&family=IBM+Plex+Mono:wght@400;500&family=Zen+Kaku+Gothic+New:wght@400;500;700&display=swap">
+
+<style>
+:root {
+  --paper:      #EFF1F4;
+  --surface:    #FFFFFF;
+  --surface-2:  #E6E9ED;
+  --edge:       #D3D8DE;
+  --edge-soft:  #E2E6EA;
+  --text:       #171B21;
+  --text-mid:   #4B5462;
+  --text-dim:   #79828F;
+  --brass:      #8F6417;
+  --brass-soft: #F0E4CC;
+  --crimson:    #97374C;
+  --crimson-soft:#F6E2E6;
+  --sea:        #2E6355;
+  --sea-soft:   #DDEAE6;
+  --shadow:     0 1px 2px rgba(23,27,33,.06), 0 8px 24px -12px rgba(23,27,33,.18);
+
+  --f-disp: "Archivo", "Zen Kaku Gothic New", system-ui, sans-serif;
+  --f-body: "Zen Kaku Gothic New", "Hiragino Sans", "Noto Sans JP", system-ui, sans-serif;
+  --f-mono: "IBM Plex Mono", ui-monospace, "SFMono-Regular", monospace;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --paper:      #13161B;
+    --surface:    #1B1F26;
+    --surface-2:  #232831;
+    --edge:       #2E343E;
+    --edge-soft:  #252B34;
+    --text:       #E5E9EE;
+    --text-mid:   #A7B0BC;
+    --text-dim:   #757E8B;
+    --brass:      #D8A44E;
+    --brass-soft: #342915;
+    --crimson:    #E08095;
+    --crimson-soft:#2A1A1F;
+    --sea:        #6FBBA6;
+    --sea-soft:   #17251F;
+    --shadow:     0 1px 2px rgba(0,0,0,.4), 0 10px 28px -14px rgba(0,0,0,.7);
+  }
+}
+:root[data-theme="dark"] {
+  --paper:      #13161B;
+  --surface:    #1B1F26;
+  --surface-2:  #232831;
+  --edge:       #2E343E;
+  --edge-soft:  #252B34;
+  --text:       #E5E9EE;
+  --text-mid:   #A7B0BC;
+  --text-dim:   #757E8B;
+  --brass:      #D8A44E;
+  --brass-soft: #342915;
+  --crimson:    #E08095;
+  --crimson-soft:#2A1A1F;
+  --sea:        #6FBBA6;
+  --sea-soft:   #17251F;
+  --shadow:     0 1px 2px rgba(0,0,0,.4), 0 10px 28px -14px rgba(0,0,0,.7);
+}
+
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  background: var(--paper);
+  color: var(--text);
+  font-family: var(--f-body);
+  font-size: 15px;
+  line-height: 1.75;
+  -webkit-font-smoothing: antialiased;
+}
+.wrap { max-width: 1120px; margin: 0 auto; padding: 0 28px 96px; }
+
+/* ---------- masthead ---------- */
+.masthead { padding: 56px 0 28px; border-bottom: 1px solid var(--edge); }
+.eyebrow {
+  font-family: var(--f-disp); font-size: 11px; font-weight: 600;
+  letter-spacing: .16em; text-transform: uppercase; color: var(--brass);
+  display: flex; gap: 10px; align-items: center; margin-bottom: 18px;
+}
+.eyebrow::after { content:""; flex:1; height:1px; background: var(--edge); }
+h1 {
+  font-family: var(--f-disp); font-weight: 700; font-size: clamp(30px, 5vw, 46px);
+  line-height: 1.12; letter-spacing: -.02em; margin: 0 0 14px; text-wrap: balance;
+}
+.lede { font-size: 17px; color: var(--text-mid); max-width: 62ch; margin: 0; }
+.meta {
+  display: flex; flex-wrap: wrap; gap: 8px 22px; margin-top: 24px;
+  font-family: var(--f-mono); font-size: 12px; color: var(--text-dim);
+  font-variant-numeric: tabular-nums;
+}
+.meta b { color: var(--text-mid); font-weight: 500; }
+
+/* ---------- scope toggle ---------- */
+.scopebar {
+  position: sticky; top: 0; z-index: 20;
+  display: flex; align-items: center; gap: 16px; flex-wrap: wrap;
+  padding: 12px 0; margin-bottom: 8px;
+  background: color-mix(in srgb, var(--paper) 92%, transparent);
+  backdrop-filter: blur(8px);
+  border-bottom: 1px solid var(--edge-soft);
+}
+.scopebar .lbl {
+  font-family: var(--f-disp); font-size: 11px; font-weight: 600;
+  letter-spacing: .14em; text-transform: uppercase; color: var(--text-dim);
+}
+.seg { display: inline-flex; border: 1px solid var(--edge); border-radius: 2px; overflow: hidden; }
+.seg button {
+  font-family: var(--f-mono); font-size: 12px; padding: 6px 15px;
+  background: var(--surface); color: var(--text-mid);
+  border: 0; border-right: 1px solid var(--edge); cursor: pointer;
+}
+.seg button:last-child { border-right: 0; }
+.seg button[aria-pressed="true"] { background: var(--brass); color: var(--surface); font-weight: 500; }
+.seg button:focus-visible { outline: 2px solid var(--brass); outline-offset: -2px; }
+.hint { font-size: 12.5px; color: var(--text-dim); }
+
+/* dimming for out-of-scope */
+.dimmable { transition: opacity .22s ease; }
+body[data-scope="v1"] .v2only { opacity: .26; }
+body[data-scope="v2"] .v2only { opacity: 1; }
+@media (prefers-reduced-motion: reduce) { .dimmable { transition: none; } }
+
+/* ---------- sections ---------- */
+section { padding-top: 56px; }
+h2 {
+  font-family: var(--f-disp); font-weight: 600; font-size: 13px;
+  letter-spacing: .15em; text-transform: uppercase; color: var(--text-dim);
+  margin: 0 0 6px;
+}
+.h2sub { font-family: var(--f-disp); font-size: 26px; font-weight: 700; letter-spacing:-.015em; margin: 0 0 20px; text-wrap: balance; }
+p.note { color: var(--text-mid); max-width: 64ch; }
+
+/* ---------- hexagon ---------- */
+.hexwrap { display: grid; grid-template-columns: minmax(0,1.15fr) minmax(0,1fr); gap: 36px; align-items: center; }
+@media (max-width: 860px) { .hexwrap { grid-template-columns: 1fr; } }
+.hexfig { background: var(--surface); border: 1px solid var(--edge); border-radius: 3px; padding: 18px; box-shadow: var(--shadow); }
+.hexfig svg { width: 100%; height: auto; display: block; }
+.port { cursor: pointer; }
+.port rect { fill: var(--surface-2); stroke: var(--edge); stroke-width: 1; transition: fill .18s, stroke .18s; }
+.port:hover rect, .port[aria-current="true"] rect { fill: var(--brass-soft); stroke: var(--brass); }
+.port text { font-family: var(--f-mono); font-size: 9.5px; fill: var(--text-mid); }
+.port:hover text, .port[aria-current="true"] text { fill: var(--brass); }
+.port:focus-visible rect { stroke: var(--brass); stroke-width: 2; }
+.corefill { fill: var(--brass-soft); stroke: var(--brass); stroke-width: 1.5; }
+.corelabel { font-family: var(--f-disp); font-size: 12px; font-weight: 700; fill: var(--text); }
+.coresub { font-family: var(--f-mono); font-size: 9px; fill: var(--text-mid); }
+.arrow { stroke: var(--edge); stroke-width: 1; marker-end: url(#ah); }
+
+.legend { font-size: 14px; color: var(--text-mid); }
+.legend h3 { font-family: var(--f-disp); font-size: 15px; margin: 0 0 8px; color: var(--text); }
+.legend p { margin: 0 0 16px; }
+.pill {
+  display:inline-block; font-family: var(--f-mono); font-size: 11px;
+  padding: 1px 7px; border-radius: 2px; background: var(--surface-2); color: var(--text-mid);
+  border: 1px solid var(--edge);
+}
+
+/* ---------- AD cards ---------- */
+.adfilter { display: flex; align-items: baseline; gap: 12px; margin-bottom: 18px; flex-wrap: wrap; }
+.adfilter .clear {
+  font-family: var(--f-mono); font-size: 12px; color: var(--brass);
+  background: none; border: 0; cursor: pointer; padding: 2px 0; border-bottom: 1px solid currentColor;
+}
+.ads { display: grid; gap: 14px; }
+.ad {
+  background: var(--surface); border: 1px solid var(--edge); border-radius: 3px;
+  padding: 18px 20px; box-shadow: var(--shadow);
+  border-left: 3px solid var(--brass);
+}
+.ad.hidden { display: none; }
+.ad-head { display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap; margin-bottom: 12px; }
+.ad-id {
+  font-family: var(--f-mono); font-size: 12px; font-weight: 500;
+  color: var(--brass); letter-spacing: .04em;
+}
+.ad-t { font-family: var(--f-disp); font-weight: 700; font-size: 16.5px; letter-spacing:-.01em; color: var(--text); }
+.tag {
+  font-family: var(--f-mono); font-size: 10px; letter-spacing:.06em;
+  padding: 1px 6px; border-radius: 2px; text-transform: uppercase;
+}
+.tag.adopted { background: var(--sea-soft); color: var(--sea); border:1px solid color-mix(in srgb, var(--sea) 35%, transparent); }
+.tag.new { background: var(--brass-soft); color: var(--brass); border:1px solid color-mix(in srgb, var(--brass) 35%, transparent); }
+.ad dl { display: grid; grid-template-columns: 86px 1fr; gap: 6px 16px; margin: 0; }
+@media (max-width: 620px) { .ad dl { grid-template-columns: 1fr; gap: 2px 0; } .ad dd { margin-bottom: 10px; } }
+.ad dt {
+  font-family: var(--f-disp); font-size: 10.5px; font-weight: 600;
+  letter-spacing: .12em; text-transform: uppercase; color: var(--text-dim);
+  padding-top: 5px;
+}
+.ad dd { margin: 0; color: var(--text-mid); font-size: 14.5px; }
+.ad dd.rule { color: var(--text); }
+.ad dt.prevents { color: var(--crimson); }
+.ad dd.prevents { color: var(--text-mid); }
+.binds { display: flex; flex-wrap: wrap; gap: 5px; padding-top: 3px; }
+.binds span {
+  font-family: var(--f-mono); font-size: 10.5px; padding: 1px 6px;
+  background: var(--surface-2); border: 1px solid var(--edge-soft); border-radius: 2px; color: var(--text-dim);
+}
+
+/* ---------- tables ---------- */
+.tablewrap { overflow-x: auto; border: 1px solid var(--edge); border-radius: 3px; background: var(--surface); box-shadow: var(--shadow); }
+table { border-collapse: collapse; width: 100%; font-size: 14px; min-width: 520px; }
+th, td { text-align: left; padding: 10px 16px; border-bottom: 1px solid var(--edge-soft); vertical-align: top; }
+th {
+  font-family: var(--f-disp); font-size: 10.5px; font-weight: 600; letter-spacing: .12em;
+  text-transform: uppercase; color: var(--text-dim); background: var(--surface-2);
+}
+tbody tr:last-child td { border-bottom: 0; }
+td.mono, .mono { font-family: var(--f-mono); font-size: 12.5px; font-variant-numeric: tabular-nums; }
+td.owner-core { color: var(--brass); font-family: var(--f-mono); font-size: 12.5px; }
+td.owner-view { color: var(--text-dim); font-family: var(--f-mono); font-size: 12.5px; }
+
+/* ---------- chain ---------- */
+.chain { display: grid; gap: 10px; }
+.link {
+  display: grid; grid-template-columns: 150px 1fr; gap: 18px; align-items: start;
+  background: var(--surface); border: 1px solid var(--edge); border-left: 3px solid var(--crimson);
+  border-radius: 3px; padding: 14px 18px;
+}
+@media (max-width: 620px) { .link { grid-template-columns: 1fr; gap: 4px; } }
+.link .src { font-family: var(--f-mono); font-size: 12px; color: var(--crimson); }
+.link .dst { color: var(--text-mid); font-size: 14.5px; }
+.link .dst b { color: var(--text); font-weight: 500; }
+
+/* ---------- deferred ---------- */
+.defer { display: grid; gap: 2px; }
+.defer details {
+  background: var(--surface); border: 1px solid var(--edge); border-radius: 3px; padding: 0;
+}
+.defer summary {
+  cursor: pointer; padding: 12px 18px; font-family: var(--f-disp); font-weight: 600; font-size: 14.5px;
+  display: flex; justify-content: space-between; gap: 14px; align-items: baseline;
+}
+.defer summary::-webkit-details-marker { display: none; }
+.defer summary:focus-visible { outline: 2px solid var(--brass); outline-offset: -2px; }
+.defer summary .when { font-family: var(--f-mono); font-size: 11px; color: var(--text-dim); font-weight: 400; }
+.defer p { margin: 0; padding: 0 18px 14px; color: var(--text-mid); font-size: 14px; }
+
+pre.tree {
+  font-family: var(--f-mono); font-size: 12.5px; line-height: 1.7; color: var(--text-mid);
+  background: var(--surface); border: 1px solid var(--edge); border-radius: 3px;
+  padding: 18px 20px; overflow-x: auto; margin: 0; box-shadow: var(--shadow);
+}
+pre.tree b { color: var(--brass); font-weight: 500; }
+pre.tree i { color: var(--text-dim); font-style: normal; }
+
+footer {
+  margin-top: 72px; padding-top: 22px; border-top: 1px solid var(--edge);
+  font-family: var(--f-mono); font-size: 12px; color: var(--text-dim);
+}
+</style>
+
+<div class="wrap">
+
+<header class="masthead">
+  <div class="eyebrow">Architecture Spine · my-task-manager</div>
+  <h1>境界の設計図</h1>
+  <p class="lede">このツールが扱うのはタスクとタスクの「あいだ」であり、このアーキテクチャが扱うのは OS とドメインの「あいだ」である。どちらも境界をどこに引くかが全てを決める。</p>
+  <div class="meta">
+    <span><b>パラダイム</b> ports and adapters</span>
+    <span><b>不変条件</b> 15</span>
+    <span><b>v1 対象</b> FR-1…8, 15, 19</span>
+    <span><b>ビルド対象</b> macOS</span>
+    <span><b>確定</b> 2026-09-15</span>
+  </div>
+</header>
+
+<div class="scopebar">
+  <span class="lbl">Scope</span>
+  <div class="seg" role="group" aria-label="スコープの切り替え">
+    <button type="button" data-scope="v1" aria-pressed="true">v1 のみ</button>
+    <button type="button" data-scope="v2" aria-pressed="false">v2 を含む</button>
+  </div>
+  <span class="hint">v1 に含まれない要素を淡く表示します。</span>
+</div>
+
+<section id="hex">
+  <h2>Paradigm</h2>
+  <div class="h2sub">OS を知る場所は、ここにしかない</div>
+  <div class="hexwrap">
+    <div class="hexfig">
+      <svg viewBox="0 0 520 380" role="img" aria-label="六角形のドメインコアと、その境界上に並ぶ5つのアダプタ">
+        <defs>
+          <marker id="ah" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="6" markerHeight="6" orient="auto">
+            <path d="M0,0 L8,4 L0,8 z" fill="currentColor" opacity=".5"/>
+          </marker>
+        </defs>
+        <polygon class="corefill" points="260,96 356,150 356,258 260,312 164,258 164,150"/>
+        <text class="corelabel" x="260" y="186" text-anchor="middle">ドメインコア</text>
+        <text class="coresub" x="260" y="206" text-anchor="middle">タスク / ステップ / 現在地</text>
+        <text class="coresub" x="260" y="220" text-anchor="middle">中断メモ / 連続作業時間</text>
+        <text class="coresub" x="260" y="242" text-anchor="middle" style="fill:var(--brass)">OS を知らない</text>
+
+        <g class="port" data-port="hotkey" tabindex="0" role="button" aria-label="hotkey アダプタ">
+          <rect x="16" y="52" width="118" height="40" rx="2"/>
+          <text x="75" y="70" text-anchor="middle">hotkey</text>
+          <text x="75" y="83" text-anchor="middle">FR-1 · AD-7</text>
+        </g>
+        <g class="port" data-port="autostart" tabindex="0" role="button" aria-label="autostart アダプタ">
+          <rect x="16" y="160" width="118" height="40" rx="2"/>
+          <text x="75" y="178" text-anchor="middle">autostart</text>
+          <text x="75" y="191" text-anchor="middle">FR-3</text>
+        </g>
+        <g class="port" data-port="presentation" tabindex="0" role="button" aria-label="presentation アダプタ">
+          <rect x="16" y="268" width="118" height="40" rx="2"/>
+          <text x="75" y="286" text-anchor="middle">presentation</text>
+          <text x="75" y="299" text-anchor="middle">AD-6 · AD-15</text>
+        </g>
+        <g class="port" data-port="storage" tabindex="0" role="button" aria-label="storage アダプタ">
+          <rect x="386" y="106" width="118" height="40" rx="2"/>
+          <text x="445" y="124" text-anchor="middle">storage</text>
+          <text x="445" y="137" text-anchor="middle">AD-4 · AD-5</text>
+        </g>
+        <g class="port v2only dimmable" data-port="observation" tabindex="0" role="button" aria-label="observation アダプタ、v2">
+          <rect x="386" y="230" width="118" height="40" rx="2"/>
+          <text x="445" y="248" text-anchor="middle">observation</text>
+          <text x="445" y="261" text-anchor="middle">AD-9 · v2</text>
+        </g>
+
+        <g style="color:var(--text-dim)">
+          <line class="arrow" x1="134" y1="72"  x2="180" y2="140"/>
+          <line class="arrow" x1="134" y1="180" x2="160" y2="192"/>
+          <line class="arrow" x1="134" y1="288" x2="180" y2="268"/>
+          <line class="arrow" x1="386" y1="126" x2="344" y2="160"/>
+          <line class="arrow v2only dimmable" x1="386" y1="250" x2="344" y2="250"/>
+        </g>
+        <text class="coresub" x="260" y="352" text-anchor="middle">依存は常にアダプタ → コアの一方向</text>
+      </svg>
+    </div>
+    <div class="legend">
+      <h3>この形が選ばれた理由</h3>
+      <p>これはアーキテクチャ側の発明ではない。PRD §8 が先に「OS 固有の統合を必要とする点は四つに限定し、いずれも差し替え可能な境界として切り出す」と書いていた。要求がすでにこの形を指定していたので、批准しただけである。</p>
+      <h3>何が守られるか</h3>
+      <p>OS 依存がドメインに染み出すと、v2 の観測追加と将来の移植が<b>同時に</b>不可能になる。書き直しが必要になる範囲を <span class="pill">adapters/</span> の内側に閉じ込めておくのが、この境界の唯一の仕事である。</p>
+      <h3>使い方</h3>
+      <p>アダプタをクリックすると、それを支配する不変条件だけが下に残る。</p>
+    </div>
+  </div>
+</section>
+
+<section id="ads">
+  <h2>Invariants</h2>
+  <div class="h2sub">15 の不変条件</div>
+  <div class="adfilter">
+    <p class="note" style="margin:0;flex:1;min-width:280px">それぞれが「何を縛り (Binds)」「どの分岐を防ぎ (Prevents)」「何を強制するか (Rule)」を持つ。Prevents が書けない決定は、そもそも不変条件ではない。</p>
+    <button type="button" class="clear" id="clearFilter" hidden>フィルタを解除</button>
+  </div>
+  <div class="ads" id="adlist"></div>
+</section>
+
+<section id="state">
+  <h2>Ownership</h2>
+  <div class="h2sub">状態には必ず所有者がいる</div>
+  <p class="note">最初の版では AD-2 の題が「状態の唯一の所有者」でありながら、Rule が縛っていたのは現在地だけだった。レビューで見つかった 22 件の分岐のうち 14 件が、この書き落とし一つに還元された。所有者のない状態は、必ず二箇所に生える。</p>
+  <div class="tablewrap">
+    <table>
+      <thead><tr><th>状態</th><th>所有者</th><th>永続化</th><th>備考</th></tr></thead>
+      <tbody>
+        <tr><td>現在地 (値・活性/非活性)</td><td class="owner-core">コア</td><td class="mono">する</td><td>変更しうる経路はコア内に一つだけ</td></tr>
+        <tr><td>ステップの完了</td><td class="owner-core">コア</td><td class="mono">する</td><td>明示宣言。現在地から導出しない</td></tr>
+        <tr><td>タスク / ステップ / 中断メモ</td><td class="owner-core">コア</td><td class="mono">する</td><td></td></tr>
+        <tr><td>連続作業時間の起点</td><td class="owner-core">コア</td><td class="mono">する</td><td>スリープ中は加算しない</td></tr>
+        <tr><td>切り替え履歴</td><td class="owner-core">コア</td><td class="mono">する</td><td>SM-C3 の測定基盤。表示しない</td></tr>
+        <tr><td>設定値</td><td class="owner-core">コア</td><td class="mono">する</td><td>設定ファイルを別に持たない</td></tr>
+        <tr><td>介入の表示状態</td><td class="owner-core">コア</td><td class="mono">しない</td><td>起動時は常に非表示</td></tr>
+        <tr><td>ホットキー登録集合</td><td class="owner-core">コア</td><td class="mono">しない</td><td>登録と解除の所有者は単一経路</td></tr>
+        <tr><td>中断メモの下書き</td><td class="owner-view">Svelte</td><td class="mono">しない</td><td>確定前に失われてよい</td></tr>
+        <tr><td>開示面の開閉状態</td><td class="owner-view">Svelte</td><td class="mono">しない</td><td>閉じた時点で破棄 (FR-19)</td></tr>
+        <tr><td>入力途中の文字列・スクロール位置</td><td class="owner-view">Svelte</td><td class="mono">しない</td><td></td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p class="note" style="margin-top:14px">Svelte が持ってよい揮発ビュー状態はこの 3 行だけである。「フロントは状態を持たない」と書くと、下書きと開示面で最初のストーリーで破られ、以降は誰も従わなくなる。例外を先に列挙しておくほうが拘束力が残る。</p>
+</section>
+
+<section id="chain">
+  <h2>Constraints</h2>
+  <div class="h2sub">要求が技術選定を決めた経路</div>
+  <p class="note">この四つは好みで選んだのではなく、PRD に書かれた数値と条件から逆算された。後から「なぜこうなっているのか」を思い出すための鎖である。</p>
+  <div class="chain">
+    <div class="link">
+      <div class="src">§8 メモリ 100MB 未満</div>
+      <div class="dst"><b>Electron が脱落。</b> 実測報告で待機時 168〜300MB、上限の 1.7〜3 倍。Tauri は 30〜50MB。嗜好ではなく制約充足による除外。</div>
+    </div>
+    <div class="link">
+      <div class="src">§7.2 入力先を奪わない<br>+ FR-7 メモをタイプする</div>
+      <div class="dst"><b>提示面が二種類に割れた。</b> 介入は非活性パネル (キーを受け取れない)、オーバーレイは通常ウィンドウ (フォーカスを取る)。片方に統一すると、どちらかの要求が必ず壊れる。</div>
+    </div>
+    <div class="link">
+      <div class="src">§7.1 端末内のみ<br>§7.3 継続費用なし</div>
+      <div class="dst"><b>自動更新機構を持たない。</b> 配信サーバが必要になり両方と衝突する。代わりにビルドから配置までを make タスク一つに畳む。</div>
+    </div>
+    <div class="link">
+      <div class="src">AD-2 状態はコアが所有</div>
+      <div class="dst"><b><span class="mono">tauri-plugin-sql</span> を捨てた。</b> あのプラグインはフロントから SQL を投げる設計で、不変条件と正面衝突する。標準的な使い方が不変条件を破るなら、捨てるのは使い方のほうである。</div>
+    </div>
+  </div>
+</section>
+
+<section id="stack">
+  <h2>Stack</h2>
+  <div class="h2sub">2026-09 時点で検証済み</div>
+  <div class="tablewrap">
+    <table>
+      <thead><tr><th>名前</th><th>バージョン</th><th>注意</th></tr></thead>
+      <tbody>
+        <tr><td class="mono">Tauri</td><td class="mono">2.11.5</td><td>3.0.0-alpha が存在するが v1 は 2.11 系に留まる</td></tr>
+        <tr><td class="mono">Svelte</td><td class="mono">5.57</td><td>SvelteKit は使わない (ルーティング/SSR 不要)</td></tr>
+        <tr><td class="mono">rusqlite</td><td class="mono">0.40.2</td><td>sqlx は async ランタイムをコアに引き込むため不採用</td></tr>
+        <tr><td class="mono">tauri-plugin-global-shortcut</td><td class="mono">2.3.2</td><td>ハンドラは 1 押下につき 2 回発火する。Pressed のみ処理すること</td></tr>
+        <tr><td class="mono">tauri-plugin-autostart</td><td class="mono">2.5.1</td><td></td></tr>
+        <tr><td class="mono">tauri-nspanel</td><td class="mono">git rev 固定</td><td>crates.io に存在しない。<span class="mono">macos-private-api</span> 必須 → App Store 配布は恒久的に不可</td></tr>
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<section id="tree">
+  <h2>Seed</h2>
+  <div class="h2sub">ソースツリー</div>
+<pre class="tree">my-task-manager/
+  <b>src/</b>                      <i># Svelte — 表示と入力のみ</i>
+    overlay/                <i># 通常ウィンドウ。フォーカスを取る</i>
+    intervention/           <i># 非活性パネル。フォーカスを取らない</i>
+  <b>src-tauri/src/</b>
+    <b>domain/</b>                <i># OS を知らない。ここが守るべき中心</i>
+    <b>ports/</b>                 <i># コアが外界に要求する契約</i>
+    <b>adapters/</b>
+      hotkey/               <i># 登録と解除の所有者 (AD-7)</i>
+      autostart/
+      presentation/         <i># ウィンドウ生成・表示制御・フォーカス復帰</i>
+      storage/              <i># SQL が存在してよい唯一の場所 (AD-4)</i>
+      observation/          <i># v1 は宣言由来のみ。v2 で NSWorkspace</i>
+    commands/               <i># Tauri command 境界 (AD-3)</i>
+  Makefile                  <i># ビルド → /Applications (AD-13)</i></pre>
+</section>
+
+<section id="deferred">
+  <h2>Deferred</h2>
+  <div class="h2sub">決めないと決めたこと</div>
+  <p class="note">先送りの半分が、スパインを薄く保っている。いずれも「なぜ今決めなくてよいか」が言えるものだけを置いた。</p>
+  <div class="defer" id="deferlist"></div>
+</section>
+
+<footer>
+  ARCHITECTURE-SPINE.md · 不変条件 15 · レビュー 4 本 / 指摘 91 件を反映 · 2026-09-15
+</footer>
+
+</div>
+
+<script>
+const ADS = [
+  {id:"AD-1", t:"ports and adapters をパラダイムとする", tag:"adopted", ports:["hotkey","autostart","presentation","storage","observation"],
+   binds:["all"],
+   prevents:"OS 依存がドメインに染み出し、v2 の観測追加と移植が同時に不可能になること",
+   rule:"OS API の呼び出しは adapters/ 配下にのみ存在してよい。domain/ は OS API・Tauri API・Web API のいずれも参照しない。"},
+  {id:"AD-2", t:"状態は表で所有者が一意に定まる", ports:["storage","presentation"],
+   binds:["FR-2","FR-6","FR-7","FR-8","FR-15","FR-19"],
+   prevents:"所有者の定まらない状態が二箇所に生え、現在地が二重化して FR-6 の一意性が壊れること",
+   rule:"v1 に存在する状態は所有表がすべて。各行の所有者以外がその状態を保持してはならない。揮発ビュー状態は 3 行に限られる。"},
+  {id:"AD-3", t:"コマンドは内向き、イベントは外向き", ports:["presentation"],
+   binds:["FR-2","FR-7","FR-8","FR-15","FR-19"],
+   prevents:"双方向に状態を書き合う経路が生まれ、どちらが真か決められなくなること。およびイベント取りこぼしによる古い表示",
+   rule:"Svelte → コアは command のみ、コア → Svelte は event のみ。加えて、表示されるたびにコマンドで完全なスナップショットを取り直す — イベントは再描画の契機であって状態の出所ではない。"},
+  {id:"AD-4", t:"永続化に触れるのはコアだけ", ports:["storage"],
+   binds:["FR-3","FR-6","FR-7"],
+   prevents:"フロントから SQL が発行され、AD-2 の状態所有が規律頼みになること",
+   rule:"tauri-plugin-sql は使用しない。フロントエンドのコードに SQL 文字列が存在してはならない。"},
+  {id:"AD-5", t:"書き込みの確定点は切り替えの完了時", ports:["storage"],
+   binds:["FR-3","FR-7"],
+   prevents:"入力途中のメモが永続化されること。および休息遷移と切り替えコミットが交錯し、現在地が活性のまま休息中になること",
+   rule:"中断メモの確定・現在地の移動・履歴の追記を単一トランザクションで書く。状態変更はコア内の単一の直列化経路を通す — アグリゲート単位の個別ロックを禁じる。"},
+  {id:"AD-6", t:"提示面は二種類、フォーカス挙動が異なる", ports:["presentation"],
+   binds:["FR-1","FR-2","FR-7","FR-15","FR-19"],
+   prevents:"介入が入力先を奪って作業を壊すこと。逆にオーバーレイがフォーカスを取れず中断メモを打てないこと",
+   rule:"オーバーレイは通常ウィンドウ、介入は非活性パネル。生成後の種別変更も禁じる。パネルには nonactivating_panel / hides_on_deactivate(false) / full_screen_auxiliary の三点が必須 — 最後の一つを欠くと、フルスクリーン作業中にだけ静かに失敗する。"},
+  {id:"AD-7", t:"介入への応答は一時登録のホットキー", ports:["hotkey","presentation"],
+   binds:["FR-15"],
+   prevents:"二択がマウス操作を強制すること。および解除漏れ・二重発火・多重表示で、消せない介入パネルが画面に残ること",
+   rule:"介入は同時に一つ。後発は待ち行列へ。Pressed のみ処理し Released を破棄する (上流が二重発火を恒久化しているため)。登録と解除は単一経路が所有する。登録に失敗したらクリック応答で出す — 出さないことを禁じる。"},
+  {id:"AD-8", t:"すべての計時はコアが所有する", ports:[],
+   binds:["FR-15"],
+   prevents:"オーバーレイが閉じている間に時間が進まないこと。および時計源の違いでスリープ跨ぎの経過時間が実装ごとに食い違うこと",
+   rule:"連続作業時間は現在地が非活性→活性へ遷移した時のみリセットされ、切り替えではリセットされない。スリープ中は加算せず、スリープ長が閾値を超えていれば休息とみなす。"},
+  {id:"AD-9", t:"コアが消費する入力ストリームの形", ports:["observation"], v2:true,
+   binds:["FR-11","FR-15","FR-20","FR-21"],
+   prevents:"v1 を「観測が存在しない」前提で書き、v2 でドメインの書き直しが必要になること",
+   rule:"コアは { 時刻, 作業文脈(省略可), 出所 } の三つ組を単一ストリームとして消費する。v1 は宣言由来のみを流し作業文脈は常に省略される。省略時に動かないロジックを書いてはならない。push 型とし pull を禁じる。"},
+  {id:"AD-10", t:"用語と識別子は 1:1 で対応する", ports:[],
+   binds:["all"],
+   prevents:"同一概念が currentPosition / pointer / cursor と複数の名前で実装され、PRD §3 の同義語禁止がコード側で破れること",
+   rule:"31 語の対応表を唯一の正とする。表にない語をドメインに導入する場合、PRD 用語集への追加と対応表への追加を同時に行う。NextAction・Drift・Fixation・Reentry は v1 では型を持たない。"},
+  {id:"AD-11", t:"設定値は永続化層に一元化する", ports:["storage"],
+   binds:["FR-14","FR-15","FR-17"],
+   prevents:"設定ファイルと DB に状態が分かれ、所有者が二つになること",
+   rule:"休息閾値・猶予・腐敗判定期間を含む設定は SQLite の設定テーブルに置く。別建ての設定ファイルを持たない。"},
+  {id:"AD-12", t:"外部送信を一切行わない", ports:[],
+   binds:["all"],
+   prevents:"将来クラッシュレポートや利用統計が足され、PRD §7.1 の不可侵条件が気づかれずに破られること",
+   rule:"ログはローカルファイルのみ。ネットワーク送信を行うコードをアプリに含めない。自動更新機構もこれに含まれる。"},
+  {id:"AD-13", t:"ローカルビルド、自動更新なし", ports:["autostart"],
+   binds:["FR-3"],
+   prevents:"配信インフラが必要になりコスト制約と衝突すること。およびビルド手順の面倒さが修正の動機を殺すこと",
+   rule:"ビルドから /Applications への配置までを単一の make タスクに集約する。署名は v1 では行わない。"},
+  {id:"AD-14", t:"資源予算は検証可能であり、所有者を持つ", tag:"new", ports:["presentation"],
+   binds:["all"],
+   prevents:"CPU 1% / メモリ 100MB が誰の責任でもないまま放置され、Electron を排除した根拠そのものが検証されずに失われること",
+   rule:"待機状態の資源をリリースビルドで実測して記録する。測定は WKWebView のヘルパープロセスを含む全プロセス合計 — 除外した値を根拠にしてはならない。超過したまま進めることを禁じる。"},
+  {id:"AD-15", t:"抑制は仕様である", tag:"new", ports:["presentation"],
+   binds:["FR-2","FR-8","FR-19"],
+   prevents:"全 AD に適合したまま、PRD §5 の非目標と設計上の賭けが破られること",
+   rule:"進捗率・消化数・連続達成日数・達成グラフを実装しない。常時表示される一覧を持たない。開示面での一括編集や棚卸しを実装しない。介入以外の通知・バッジ・音を持たない。切り替え履歴は測定のためだけに存在し、表示しない。"}
+];
+
+const DEFERRED = [
+  ["交差の検出と介入の内部設計","v2","本日計画が前提であり v1 に存在しない。AD-6 と AD-7 が提示面と応答経路を既に固定しているため、v2 で足すのは判定ロジックだけで済む。"],
+  ["本日計画のモデル","v2","ERD に形だけ置いた。時間配分の保持形式は v2 で決める。"],
+  ["腐敗の判定と復帰","v2","判定期間の初期値が PRD OQ-3 として未決のため。"],
+  ["決定の記録のスキーマ","v2","活用先が未定 (PRD OQ-5) であり、保存形式を先に決めても無駄になる。"],
+  ["テスト戦略","未決","コアが OS 非依存なので単体テストは容易。ただしスリープ跨ぎ (AD-8) と二重発火の抑止 (AD-7) は手で再現しにくく壊れても気づかないため、最初に書くテストの候補として記録する。"],
+  ["Tauri の capabilities / CSP","未決","ネットワークを使わない (AD-12) ため既定の絞り込みで足りる見込み。実装着手時に確認する。"],
+  ["イベントのペイロード形式","未決","AD-3 の鮮度規則によりイベントは再描画の契機にすぎないため、最小に保てば分岐しにくい。最初のストーリーで確定させる。"],
+  ["署名への移行","v2 着手時","v2 の観測は Accessibility 権限を要求し、署名なしでは再ビルドごとに権限がリセットされる可能性が高い。"],
+  ["Windows 移植","行わない","AD-1 により可能性のみ維持。書き直しは adapters/ 配下に限られるが、非活性パネルに相当する概念が Windows にないため介入の提示は再設計を要する。"]
+];
+
+const list = document.getElementById("adlist");
+list.innerHTML = ADS.map(a => `
+  <article class="ad dimmable${a.v2 ? " v2only" : ""}" data-ports="${(a.ports||[]).join(" ")}">
+    <div class="ad-head">
+      <span class="ad-id">${a.id}</span>
+      <span class="ad-t">${a.t}</span>
+      ${a.tag === "adopted" ? '<span class="tag adopted">adopted</span>' : ""}
+      ${a.tag === "new" ? '<span class="tag new">レビューで追加</span>' : ""}
+    </div>
+    <dl>
+      <dt>Binds</dt><dd><div class="binds">${a.binds.map(b=>`<span>${b}</span>`).join("")}</div></dd>
+      <dt class="prevents">Prevents</dt><dd class="prevents">${a.prevents}</dd>
+      <dt>Rule</dt><dd class="rule">${a.rule}</dd>
+    </dl>
+  </article>`).join("");
+
+document.getElementById("deferlist").innerHTML = DEFERRED.map(([t,w,why]) => `
+  <details>
+    <summary><span>${t}</span><span class="when">${w}</span></summary>
+    <p>${why}</p>
+  </details>`).join("");
+
+/* scope toggle */
+document.querySelectorAll(".seg button").forEach(btn => {
+  btn.addEventListener("click", () => {
+    document.querySelectorAll(".seg button").forEach(b =>
+      b.setAttribute("aria-pressed", String(b === btn)));
+    document.body.dataset.scope = btn.dataset.scope;
+  });
+});
+document.body.dataset.scope = "v1";
+
+/* port filter */
+const clearBtn = document.getElementById("clearFilter");
+let active = null;
+function applyFilter() {
+  document.querySelectorAll(".ad").forEach(el => {
+    const ports = (el.dataset.ports || "").split(" ").filter(Boolean);
+    el.classList.toggle("hidden", !!active && !ports.includes(active));
+  });
+  document.querySelectorAll(".port").forEach(p =>
+    p.setAttribute("aria-current", String(p.dataset.port === active)));
+  clearBtn.hidden = !active;
+}
+document.querySelectorAll(".port").forEach(p => {
+  const pick = () => { active = (active === p.dataset.port) ? null : p.dataset.port; applyFilter(); };
+  p.addEventListener("click", pick);
+  p.addEventListener("keydown", e => {
+    if (e.key === "Enter" || e.key === " ") { e.preventDefault(); pick(); }
+  });
+});
+clearBtn.addEventListener("click", () => { active = null; applyFilter(); });
+</script>

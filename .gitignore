@@ -1,0 +1,134 @@
+.bmad-loop/runs/
+.bmad-loop/cache/
+.bmad-loop/policy.toml
+.claude/.workflow-usage/
+
+# BMAD モジュール実体は npx bmad-method install で導入する(git 管理しない)。
+# 追跡するのは導入設定(config.toml / config.yaml)とチーム用オーバーレイ(custom/)のみ。
+_bmad/*
+!_bmad/config.toml
+!_bmad/config.yaml
+!_bmad/custom/
+_bmad/custom/*.user.*
+
+# 秘密情報の混入防止: .env 系は追跡しない(例示用の .env.example のみ許可)
+.env
+.env.*
+!.env.example
+
+# 秘密鍵・認証情報ファイルの混入防止(betterleaks の検知と併せた多層防御)
+*.pem
+*.key
+*.p12
+*.pfx
+*.keystore
+id_rsa
+id_dsa
+id_ecdsa
+id_ed25519
+*.ppk
+credentials
+credentials.json
+.envrc
+
+# Python(記録検証スクリプトの実行で生成される)
+__pycache__/
+*.py[cod]
+
+# Created by https://www.toptal.com/developers/gitignore/api/linux,macos,windows,visualstudiocode
+# Edit at https://www.toptal.com/developers/gitignore?templates=linux,macos,windows,visualstudiocode
+
+### Linux ###
+*~
+
+# temporary files which can be created if a process still has a handle open of a deleted file
+.fuse_hidden*
+
+# KDE directory preferences
+.directory
+
+# Linux trash folder which might appear on any partition or disk
+.Trash-*
+
+# .nfs files are created when an open file is removed but is still being accessed
+.nfs*
+
+### macOS ###
+# General
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Icon must end with two \r
+Icon
+
+
+# Thumbnails
+._*
+
+# Files that might appear in the root of a volume
+.DocumentRevisions-V100
+.fseventsd
+.Spotlight-V100
+.TemporaryItems
+.Trashes
+.VolumeIcon.icns
+.com.apple.timemachine.donotpresent
+
+# Directories potentially created on remote AFP share
+.AppleDB
+.AppleDesktop
+Network Trash Folder
+Temporary Items
+.apdisk
+
+### macOS Patch ###
+# iCloud generated files
+*.icloud
+
+### VisualStudioCode ###
+.vscode/*
+!.vscode/settings.json
+!.vscode/tasks.json
+!.vscode/launch.json
+!.vscode/extensions.json
+!.vscode/*.code-snippets
+
+# Local History for Visual Studio Code
+.history/
+
+# Built Visual Studio Code Extensions
+*.vsix
+
+### VisualStudioCode Patch ###
+# Ignore all local history of files
+.history
+.ionide
+
+### Windows ###
+# Windows thumbnail cache files
+Thumbs.db
+Thumbs.db:encryptable
+ehthumbs.db
+ehthumbs_vista.db
+
+# Dump file
+*.stackdump
+
+# Folder config file
+[Dd]esktop.ini
+
+# Recycle Bin used on file shares
+$RECYCLE.BIN/
+
+# Windows Installer files
+*.cab
+*.msi
+*.msix
+*.msm
+*.msp
+
+# Windows shortcuts
+*.lnk
+
+# End of https://www.toptal.com/developers/gitignore/api/linux,macos,windows,visualstudiocode
