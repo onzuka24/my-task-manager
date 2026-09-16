@@ -1,0 +1,32 @@
+:root {
+  --overlay-bg: #16181d;
+  --overlay-fg: #e8eaed;
+  --overlay-muted: #9aa0a6;
+  --overlay-alert: #ffb4a2;
+
+  font-family: -apple-system, BlinkMacSystemFont, "Hiragino Sans", "Noto Sans JP", sans-serif;
+  color-scheme: dark;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  height: 100%;
+}
+
+body {
+  background: var(--overlay-bg);
+  color: var(--overlay-fg);
+  /* 器としてのオーバーレイ。テキスト選択もドラッグも要らない。 */
+  user-select: none;
+  cursor: default;
+  overflow: hidden;
+}
+
+#app {
+  height: 100%;
+}
