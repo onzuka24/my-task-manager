@@ -1,0 +1,49 @@
+[package]
+name = "my-task-manager"
+version = "0.1.0"
+description = "タスクとタスクの「あいだ」を扱う常駐ツール"
+authors = ["onzuka"]
+license = "MIT"
+repository = ""
+edition = "2021"
+
+[lib]
+name = "my_task_manager_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "=2.6.3", features = [] }
+
+# バージョンはすべて `=` で厳密に固定する。`@latest` / `@next` 相当の解決で 3.x 系を
+# 引くことを避けるため (Tauri 3.0.0-alpha および tauri-plugin-single-instance
+# 3.0.0-alpha は公開済みだが v1 は 2.x 系に留まる)。
+#
+# tauri の feature:
+#   tray-icon — メニューバー項目 (NSStatusItem)。唯一の明示的な終了経路 (CAP-3)
+#   image-png — Image::from_bytes。上の 2 つは既定 feature に含まれない
+[dependencies]
+serde = { version = "=1.0.229", features = ["derive"] }
+log = "=0.4.34"
+tauri = { version = "=2.11.5", features = ["tray-icon", "image-png"] }
+tauri-plugin-log = "=2.9.1"
+
+[target."cfg(not(any(target_os = \"android\", target_os = \"ios\")))".dependencies]
+tauri-plugin-global-shortcut = "=2.3.2"
+# 二重起動を許さない。後発は自ら終了し、先発が応答する。二重起動は待機時
+# フットプリントを倍にし AD-14 の実測を無効化する。
+tauri-plugin-single-instance = "=2.4.4"
+
+[target."cfg(any(target_os = \"macos\", windows, target_os = \"linux\"))".dependencies]
+tauri-plugin-autostart = "=2.5.1"
+
+# フルスクリーン空間でオーバーレイを出すための NSWindow 直接操作に使う。
+# tao の set_visible_on_all_workspaces は CanJoinAllSpaces しか立てず、
+# FullScreenAuxiliary は tauri.conf.json にも tao にも存在しない。
+# バージョンは Tauri 2.11.5 自身の依存に合わせる — ずらすと crate が二重になり
+# リンクが壊れる。
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2-app-kit = { version = "=0.3.2", features = ["NSWindow", "NSResponder"] }
+
+# テストでのみ使う。Rust → TS の配線 (フィールド名) を JSON の形として固定するため。
+[dev-dependencies]
+serde_json = "=1.0.151"

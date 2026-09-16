@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <!-- Dock にアイコンを出さない常駐プロセスにする (CAP-3)。
+       bundle.macOS.infoPlist はパス文字列であってインラインの辞書ではないため、
+       tauri.conf.json と同じディレクトリに置いて自動マージさせる。
+       LSUIElement を立てたアプリは自前のメニューバーを持たないため、可視面は
+       オーバーレイとメニューバー項目 (NSStatusItem) の 2 つになる。 -->
+  <key>LSUIElement</key>
+  <true/>
+</dict>
+</plist>

@@ -132,3 +132,8 @@ $RECYCLE.BIN/
 *.lnk
 
 # End of https://www.toptal.com/developers/gitignore/api/linux,macos,windows,visualstudiocode
+
+# Node / Vite / Cargo のビルド成果物 (このプロジェクトのアプリケーションコード)
+node_modules/
+dist/
+src-tauri/target/
