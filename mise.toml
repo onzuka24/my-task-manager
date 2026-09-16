@@ -1,6 +1,0 @@
-# ~/.tool-versions の rust = 1.81.0 は mise によって RUSTUP_TOOLCHAIN として export され、
-# rustup の優先順位では rust-toolchain.toml より強い。このプロジェクト配下だけ現行 stable を
-# 選ばせるため、mise 側でも同じバージョンを固定する (グローバル設定は変更しない)。
-# mise を使わない環境では rust-toolchain.toml が同じ結果をもたらす。
-[tools]
-rust = "1.98.1"

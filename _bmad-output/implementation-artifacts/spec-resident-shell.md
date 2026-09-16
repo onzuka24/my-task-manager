@@ -2,14 +2,55 @@
 title: '常駐の骨格 — 常駐プロセス・自動起動・ホットキー呼び出し'
 type: 'feature'
 created: '2026-09-15'
-status: 'in-review'
+status: 'draft'
 route: 'dispatch'
-review_loop_iteration: 0
+review_loop_iteration: 1
 baseline_commit: 'd35ce686464c3145106e818933c26208ca8372a3'
 context:
   - '{project-root}/_bmad-output/specs/spec-my-task-manager/SPEC.md'
   - '{project-root}/_bmad-output/planning-artifacts/architecture/architecture-my-task-manager-2026-09-15/ARCHITECTURE-SPINE.md'
   - '{project-root}/_bmad-output/implementation-artifacts/research-scaffold.md'
+---
+
+## 次セッションへの申し送り
+
+**この仕様は第 1 回ループバックの直後にある。** 第 1 試行のコードは revert 済みで、`resident-shell-attempt-1` タグ (commit `a30a832`) に保全されている。
+
+### 再開の手順
+
+`bmad-build` を新しいセッションで起動する。`status: draft` のため step-02 (計画) に入る。
+
+### ⚠️ 凍結ブロックはそのまま引き継いではならない
+
+step-02 の draft 再開チェックは、`status: draft` の凍結ブロックを `preserved_intent` として**逐語的に引き継ぐ**。**本件ではそれをしてはならない。** 今回のループバックは intent_gap であり、根本原因は凍結ブロックそのものの欠落 (常駐プロセスの終了経路が未定義) だからである。凍結ブロックは人間の決定を反映して**書き直す**こと。
+
+### 人間が既に決めたこと
+
+- **終了経路はメニューバー項目とする。** Cmd+W / Cmd+Q は無効化する。(intent_gap #1 の解決)
+
+### 凍結ブロックに新たに入れるべきもの
+
+1. メニューバー項目からの終了。`enable_macos_default_menu(false)` と `RunEvent::ExitRequested` での `prevent_exit`。
+2. 単一インスタンスの保証 (#2)。二重起動は AD-14 の実測を無効化する。
+3. フルスクリーン空間でのオーバーレイ可視性 (#4)。CAP-1「いかなるアプリケーションが最前面にあっても」を満たすため。
+4. 自動起動の解除手段 (#16)。`make uninstall` と、`is_enabled()` を確認してから `enable()` を呼ぶこと。
+
+### I/O マトリクスに欠けていた行
+
+初版のマトリクスには無く、3 層のレビューが見つけたもの — 「フォーカスが外れたとき」「Cmd+W / Cmd+Q を押したとき」「二重起動したとき」「フルスクリーン空間でホットキーを押したとき」「ウィンドウが存在しないとき」。
+
+### 上流に波及する変更
+
+`_bmad-output/specs/spec-my-task-manager/glossary.md` の **「オーバーレイ — 常駐プロセスの唯一の可視面」はメニューバー項目の追加により誤りになる。** SPEC.md と合わせて更新すること。上流を直さないと、次に読む者が同じ前提で設計する。
+
+### patch 経路の 15 件
+
+`## Review Triage Log` の #3・#5〜#14・#17〜#21。コードが再導出されるためループバック時には適用していない。**再導出後に同じ欠陥が再発していないか確認すること** — 特に #3 (setup 内の `?` が常駐を殺す)、#5 (`app.show()` の欠落)、#7 (Esc テストが恒真)、#10 (AD-14 の計測が fail-open)。
+
+### マシンの状態
+
+`/Applications/My Task Manager.app` は**インストールされたまま稼働しており**、LaunchAgent に登録され、`Ctrl+Option+Space` を握っている。リポジトリを巻き戻してもアンインストールはされない。現時点で対応するソースは存在しない。
+
 ---
 
 <frozen-after-approval reason="human-owned intent — do not modify unless human renegotiates">
@@ -194,6 +235,30 @@ greenfield。既存コードはなく、再利用も破壊回避の対象もな�
 ホットキー押下・Esc・フォーカス復帰・300ms の実測は、この環境にアクセシビリティ権限と画面収録権限がないため検証できていない。実装は正しく見えるが、動作は確認されていない。利用者による手動確認が必要。
 
 ## Spec Change Log
+
+## Spec Change Log
+
+### 第 1 回ループバック (intent_gap 1 / bad_spec 3)
+
+**引き金** — レビュー所見 #1 (intent_gap): 凍結ブロックが常駐プロセスの終了経路を一切定義していなかった。macOS 既定メニューが生きているため Cmd+W / Cmd+Q で常駐が事故的に終了し、次のログインまでホットキーが死ぬ。CAP-3「明示的な終了まで動作を継続する」に反する。加えて bad_spec 3 件 (#2 単一インスタンス / #4 フルスクリーン空間での可視性 / #16 自動起動の解除手段) がいずれも lib.rs・tauri.conf.json・adapters の中核に触れるため、継ぎはぎではなく再導出とする。
+
+**人間の決定** — 終了経路はメニューバー項目とする。Cmd+W / Cmd+Q は無効化する。
+
+**回避される既知の不良状態** — 反射的な一打で常駐が死ぬ状態。二重起動でフットプリントが倍になり AD-14 の実測が無効化される状態。フルスクリーン作業中にホットキーが無反応になる状態。ログイン項目から消しても次回ログインで復活する状態。
+
+**上流への波及** — `glossary.md` の「オーバーレイ — 常駐プロセスの唯一の可視面」はメニューバー項目の追加により誤りとなる。SPEC.md と glossary.md の更新を要する。
+
+### KEEP — 再導出で必ず残すもの
+
+第 1 試行は `resident-shell-attempt-1` タグ (commit a30a832) に保全されている。以下は検証済みであり、再導出時に同等以上を維持すること。
+
+1. **`scripts/measure-footprint.sh` の測定方式。** `responsibility_get_pid_responsible_for_pid` で WKWebView ヘルパーを束ね、RSS ではなく `phys_footprint` を使う。AD-14 が要求する「ヘルパーを除外した値を根拠にしない」を実際に満たす唯一の実装。ただし所見 #10 (footprint 失敗時に 0 を返し fail-open する) と #17 #18 は修正すること。
+2. **判断を純粋関数に切り出す形。** `should_toggle` / `toggle_action` / `visibility_after` により、OS を起動せずにトグル規則を検証できる。ただし所見 #7 のとおり `escape_action()` は引数を取らないため恒真である — Esc の判断は可視状態を入力に取る形へ改めること。
+3. **`hotkey::register` が `Result` ではなく `HotkeyStatus` を返す設計。** 「登録失敗を理由に常駐を止めない」を型で保証する。ただし所見 #3 のとおり `lib.rs` 側が `?` で手放しているため、setup 内では `?` を使わないこと。
+4. **`rust-toolchain.toml` + `mise.toml` + Makefile の `unexport RUSTUP_TOOLCHAIN`。** mise が `RUSTUP_TOOLCHAIN` を export すると rustup の優先順位で `rust-toolchain.toml` を上書きするため、3 箇所すべてが必要。グローバル既定は変更しない。
+5. **`bundle.macOS.infoPlist` ではなく `src-tauri/Info.plist` を置いて自動マージさせる形。** インラインの辞書は Tauri 2 では無効。
+6. **`macos-private-api` を有効化していないこと。** 本スライスは `transparent` を必要としない。CAP-10 まで先送りしたまま維持する。
+7. **実測値 52.4MB / 0.05% (単一インスタンス時)。** 再導出後に再測定し、メニューバー項目の追加による増分を確認すること。
 
 ## Review Triage Log
 
