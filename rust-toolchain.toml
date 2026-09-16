@@ -1,0 +1,9 @@
+# 宣言 MSRV (tauri-plugin-global-shortcut 2.3.2 は rust >= 1.77.2) は依存ツリーの実要求
+# より低い。手元のグローバル既定 (1.81.0) では依存が解決しないため、このプロジェクトだけ
+# 現行 stable を固定する。rustup がこのファイルを見て toolchain を自動選択するので、
+# 利用者のグローバル既定 (`rustup default`) は変更しない。
+[toolchain]
+channel = "1.98.1"
+components = ["clippy", "rustfmt"]
+targets = ["aarch64-apple-darwin"]
+profile = "minimal"
