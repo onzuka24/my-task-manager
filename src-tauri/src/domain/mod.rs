@@ -12,10 +12,12 @@
 //!
 //! - [`task`] — [`task::Task`] / [`task::Step`] と、その不変条件を破れない形の操作
 //! - [`position`] — [`position::CurrentPosition`] と活性/非活性の遷移
+//! - [`switch`] — [`switch::SwitchRecord`]。**切り替え**が残す 1 行 (SM-C3)
 //! - [`state`] — 全タスクと唯一の現在地を保持し、状態を変えうる操作を集約する
 
 pub mod position;
 pub mod state;
+pub mod switch;
 pub mod task;
 
 use std::fmt;
@@ -261,6 +263,10 @@ pub enum DomainError {
     UnknownStep,
     /// 挿入位置が 1..=N+1 の範囲外である。
     OrdinalOutOfRange,
+    /// **現在地**が**未着手**であり、離れるべき**ステップ**が無い。
+    ///
+    /// **切り替え**は「いまいる場所を離れる」操作であり、いない場所からは離れられない。
+    NoCurrentPosition,
 }
 
 impl fmt::Display for DomainError {
@@ -271,6 +277,9 @@ impl fmt::Display for DomainError {
             Self::UnknownTask => f.write_str("指定されたタスクが存在しない"),
             Self::UnknownStep => f.write_str("指定されたステップが存在しない"),
             Self::OrdinalOutOfRange => f.write_str("指定された位置はステップの範囲外である"),
+            Self::NoCurrentPosition => {
+                f.write_str("現在地が未着手であり、離れるべきステップが無い")
+            }
         }
     }
 }

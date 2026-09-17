@@ -15,7 +15,7 @@
         "label": "main",
         "title": "My Task Manager",
         "width": 640,
-        "height": 220,
+        "height": 280,
         "center": true,
         "resizable": false,
         "fullscreen": false,

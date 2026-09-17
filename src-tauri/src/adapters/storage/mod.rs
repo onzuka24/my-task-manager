@@ -26,6 +26,7 @@ use std::sync::{Mutex, MutexGuard};
 use rusqlite::{Connection, OptionalExtension, Transaction};
 
 use crate::domain::position::CurrentPosition;
+use crate::domain::switch::SwitchRecord;
 use crate::domain::task::{InterruptionNote, Step, StepId, Task, TaskId};
 use crate::domain::Timestamp;
 use crate::ports::storage::{Commit, RestoredState, Storage, StorageError};
@@ -117,11 +118,17 @@ impl Storage for SqliteStorage {
             .transaction()
             .map_err(|error| StorageError::Write(format!("トランザクションを開けない: {error}")))?;
 
+        // **順序が意味を持つ。** 外部キーの向き (現在地 → ステップ → タスク、
+        // 切り替え履歴 → ステップ) から、**タスク**が先に書かれていなければ残り二つは
+        // 書けない。同じトランザクションの中でも制約は文ごとに評価される。
         if let Some(task) = &commit.task {
             write_task(&transaction, task)?;
         }
         if let Some(position) = &commit.current_position {
             write_current_position(&transaction, *position)?;
+        }
+        if let Some(record) = &commit.switch_record {
+            write_switch_record(&transaction, record)?;
         }
 
         transaction
@@ -215,6 +222,33 @@ fn write_current_position(
                 .map_err(|error| StorageError::Write(format!("現在地を書けない: {error}")))?;
         }
     }
+    Ok(())
+}
+
+/// **切り替え履歴**を 1 行追記する (CAP-7 / SM-C3)。
+///
+/// **追記専用であり、読み戻す関数を対に置かない。** コアが起動時に読む理由が無く、
+/// 読めばメモリ上に「表示されうる値」を置くことになる (AD-15)。測定が必要になった
+/// 時点で SQL から直接数える。
+///
+/// **本文は運ばれてこない。** [`SwitchRecord`] が欄を持たないため、ここで書ける形が
+/// そもそも存在しない。
+fn write_switch_record(
+    transaction: &Transaction<'_>,
+    record: &SwitchRecord,
+) -> Result<(), StorageError> {
+    transaction
+        .execute(
+            "INSERT INTO switch_record (id, departed_step_id, occurred_at, note_written) \
+             VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![
+                record.id().to_string(),
+                record.departed_step_id().to_string(),
+                record.occurred_at().to_iso8601(),
+                i64::from(record.note_written()),
+            ],
+        )
+        .map_err(|error| StorageError::Write(format!("切り替え履歴を書けない: {error}")))?;
     Ok(())
 }
 
@@ -603,6 +637,7 @@ mod tests {
             .apply(&Commit {
                 task: Some(task.clone()),
                 current_position: Some(position),
+                switch_record: None,
             })
             .expect("タスクが同じトランザクションで先に書かれるため成立する");
 
@@ -746,6 +781,7 @@ mod tests {
         let outcome = storage.apply(&Commit {
             task: Some(task.clone()),
             current_position: Some(CurrentPosition::rehydrate(task.id(), stranger, true, NOW)),
+            switch_record: None,
         });
         assert!(outcome.is_err(), "存在しないステップを指す現在地は書けない");
 
@@ -766,6 +802,243 @@ mod tests {
             storage.restore().expect("読める").current_position,
             CurrentPosition::NotStarted
         );
+    }
+
+    /// **一つのコミットが三つの欄をすべて運べる** (AD-5)。
+    ///
+    /// **切り替え**が確定させるのは、離脱側の**中断メモ**と**完了**・**現在地**の移動・
+    /// **切り替え履歴**の追記の三つである。三者が同じトランザクションに載ることを、
+    /// 実際に SQLite を通して確かめる。
+    #[test]
+    fn one_commit_can_carry_the_task_the_position_and_the_switch_record() {
+        let storage = SqliteStorage::in_memory().expect("開ける");
+        let mut task = a_task();
+        let departed = task.steps()[0].id();
+        let destination = task.steps()[1].id();
+        task.set_interruption_note(departed, Some(InterruptionNote::new("3 段落目まで")))
+            .expect("メモを置ける");
+        task.declare_completion(NOW, departed).expect("宣言できる");
+        let position = CurrentPosition::NotStarted.move_to(task.id(), destination, NOW);
+
+        storage
+            .apply(&Commit {
+                task: Some(task.clone()),
+                current_position: Some(position),
+                switch_record: Some(SwitchRecord::new(NOW, departed, true)),
+            })
+            .expect("三つが同じトランザクションで書ける");
+
+        let restored = storage.restore().expect("読める");
+        assert!(
+            restored.tasks[0]
+                .step(departed)
+                .expect("ある")
+                .is_completed(),
+            "完了が付いている"
+        );
+        assert_eq!(
+            restored.tasks[0]
+                .step(departed)
+                .expect("ある")
+                .interruption_note()
+                .map(InterruptionNote::text),
+            Some("3 段落目まで"),
+            "メモが残っている"
+        );
+        assert_eq!(
+            restored.current_position.step_id(),
+            Some(destination),
+            "現在地が移動している"
+        );
+        assert_eq!(count_switch_records(&storage), 1, "履歴が 1 行増えている");
+    }
+
+    /// **失敗したコミットは履歴も残さない。** 三者が同時に成立するか、何も起きないか
+    /// のどちらかである。
+    #[test]
+    fn a_failed_commit_leaves_no_switch_record_either() {
+        let storage = SqliteStorage::in_memory().expect("開ける");
+        let task = a_task();
+        let stranger = StepId::new(NOW);
+
+        let outcome = storage.apply(&Commit {
+            task: Some(task.clone()),
+            current_position: Some(CurrentPosition::rehydrate(task.id(), stranger, true, NOW)),
+            switch_record: Some(SwitchRecord::new(NOW, task.steps()[0].id(), true)),
+        });
+        assert!(outcome.is_err());
+        assert_eq!(count_switch_records(&storage), 0);
+    }
+
+    /// **履歴は追記され、書かれた値がそのまま残る。**
+    ///
+    /// 行数だけを見ていると、`note_written` を 1 に固定しても `occurred_at` を
+    /// ISO 8601 以外の形で書いても検査が通る。SM-C3 はこの二つの列だけで測るため、
+    /// どちらが壊れても測定基盤としては無価値になる。**列の値を見る。**
+    #[test]
+    fn switch_records_accumulate_with_the_values_that_were_written() {
+        let storage = SqliteStorage::in_memory().expect("開ける");
+        let task = a_task();
+        let departed = task.steps()[0].id();
+        let later = Timestamp::from_unix_millis(NOW.unix_millis() + 60_000);
+        storage
+            .apply(&Commit::of_task(task.clone()))
+            .expect("書ける");
+
+        for (at, note_written) in [(NOW, true), (later, false)] {
+            storage
+                .apply(&Commit {
+                    task: None,
+                    current_position: None,
+                    switch_record: Some(SwitchRecord::new(at, departed, note_written)),
+                })
+                .expect("書ける");
+        }
+
+        assert_eq!(
+            switch_records(&storage),
+            vec![
+                (
+                    departed.to_string(),
+                    "2026-09-10T00:26:40.000Z".to_string(),
+                    1
+                ),
+                (
+                    departed.to_string(),
+                    "2026-09-10T00:27:40.000Z".to_string(),
+                    0
+                ),
+            ],
+            "離脱元・発生時刻 (UTC の ISO 8601)・記入の有無がそのまま残る"
+        );
+        // 書いた値そのものと照合する。上のリテラルが「読める形」であることの担保。
+        assert_eq!(switch_records(&storage)[0].1, NOW.to_iso8601());
+        assert_eq!(switch_records(&storage)[1].1, later.to_iso8601());
+    }
+
+    /// **履歴に本文の列が無い。** スキーマの側で AD-15 を担保していることを見る。
+    #[test]
+    fn the_switch_record_table_has_no_column_for_the_note_text() {
+        let storage = SqliteStorage::in_memory().expect("開ける");
+        let connection = storage.lock();
+        let mut statement = connection
+            .prepare("SELECT name FROM pragma_table_info('switch_record') ORDER BY name")
+            .expect("問い合わせは組み立てられる");
+        let columns: Vec<String> = statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .expect("実行できる")
+            .map(|row| row.expect("行は読める"))
+            .collect();
+
+        assert_eq!(
+            columns,
+            vec!["departed_step_id", "id", "note_written", "occurred_at"],
+            "本文を持つ列を足さない (AD-15)"
+        );
+    }
+
+    /// 受け入れ条件「メモを書いて確定した → 再起動してもメモが残り、現在地は移動後の
+    /// ステップである」。および「完了を伴う切り替え → 離脱側に `completed_at` が付き、
+    /// 現在地が移動し、履歴が 1 行増えている (三者が同時に成立)」。
+    ///
+    /// **コアから実ファイルまでを通す。** 同じファイルを閉じて開き直し、プロセスを
+    /// またぐ経路を実際に歩く。
+    #[test]
+    fn a_switch_survives_a_restart_with_all_three_effects() {
+        let directory = std::env::temp_dir().join(format!(
+            "my-task-manager-switch-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let path = SqliteStorage::database_path(&directory);
+        let _ = std::fs::remove_dir_all(&directory);
+
+        let task_id;
+        let departed;
+        let destination;
+        {
+            let core = Core::restore(
+                Box::new(FixedClock::at(NOW.unix_millis())),
+                Box::new(SqliteStorage::open(&path).expect("初回起動で作られる")),
+            )
+            .expect("復元できる");
+            task_id = core
+                .create_task("原稿", contents(&["下書き", "推敲", "投稿"]))
+                .expect("作れる");
+            let snapshot = core.snapshot();
+            let steps = snapshot.task(task_id).expect("ある").steps();
+            departed = steps[0].id();
+            destination = steps[1].id();
+            core.move_current_position(departed).expect("移せる");
+
+            core.switch_current_position(Some(InterruptionNote::new("3 段落目まで")), true)
+                .expect("切り替えられる");
+        }
+
+        // ここで前の接続は落ちている。確定済みのコミットだけが残る。
+        let storage = SqliteStorage::open(&path).expect("再起動で開ける");
+        assert_eq!(
+            switch_records(&storage),
+            vec![(departed.to_string(), NOW.to_iso8601(), 1)],
+            "履歴が 1 行増えており、離脱元・時刻・記入の有無が残っている"
+        );
+        let core = Core::restore(
+            Box::new(FixedClock::at(NOW.unix_millis())),
+            Box::new(storage),
+        )
+        .expect("復元できる");
+
+        assert_eq!(
+            core.current_position().step_id(),
+            Some(destination),
+            "現在地は移動後のステップである"
+        );
+        let snapshot = core.snapshot();
+        let step = snapshot
+            .task(task_id)
+            .expect("ある")
+            .step(departed)
+            .expect("ある");
+        assert_eq!(
+            step.interruption_note().map(InterruptionNote::text),
+            Some("3 段落目まで"),
+            "メモが残っている"
+        );
+        assert!(step.is_completed(), "離脱側に completed_at が付いている");
+
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    /// 履歴の行数を数える。**製品コードにはこの経路を置かない** (書くだけ / AD-15)。
+    fn count_switch_records(storage: &SqliteStorage) -> i64 {
+        storage
+            .lock()
+            .query_row("SELECT count(*) FROM switch_record", [], |row| row.get(0))
+            .expect("数えられる")
+    }
+
+    /// 履歴を (離脱元, 発生時刻, 記入の有無) の形で発生順に読む。
+    ///
+    /// **測定のときに SQL で数える形そのものである** (spec Design Notes)。製品コードには
+    /// 置かない — コアが読み戻せば、表示されうる値をメモリに置くことになる (AD-15)。
+    fn switch_records(storage: &SqliteStorage) -> Vec<(String, String, i64)> {
+        let connection = storage.lock();
+        let mut statement = connection
+            .prepare(
+                "SELECT departed_step_id, occurred_at, note_written \
+                 FROM switch_record ORDER BY occurred_at, id",
+            )
+            .expect("問い合わせは組み立てられる");
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            })
+            .expect("実行できる");
+        rows.map(|row| row.expect("行は読める")).collect()
     }
 
     /// DB ファイルのパスはアプリデータディレクトリ配下に組み立てられる。

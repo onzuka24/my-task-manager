@@ -9,6 +9,26 @@
 //! 状態は `Builder::manage` で**起動前に**預ける。webview は常駐プロセスの `setup` が
 //! 終わる前にもコマンドを呼びうるため、state そのものが未管理という状態を作らない。
 //! 中身がまだ確定していないことは `Err` として表現し、フロントが再試行できるようにする。
+//!
+//! # コアの不在は既定値で埋めない
+//!
+//! [`Core`] は永続化の復元に成功したときにだけ `manage` される (`lib.rs`)。不在を既定値で
+//! 埋めたコアに置き換えると、**現在地**が失われた事実が「未着手」として静かに上書きされ、
+//! 次の書き込みで確定してしまう。[`tauri::Manager::try_state`] の `None` は、**状態を
+//! 書き換える側**では明示的なエラーに、**表示する側**では [`OverlaySnapshot::state_error`]
+//! に変換する。表示側でコマンドごと失敗させないのは、ホットキーの登録結果まで道連れに
+//! なるためである — DB が開けずホットキーも死んでいるとき、唯一の呼び出し経路が死んで
+//! いる事実が誰にも伝わらなくなる (spec Never「`hotkey` を失わせない」)。
+//!
+//! # 判断は純粋関数へ切り出す
+//!
+//! [`require_core`] と [`snapshot_of`] は `AppHandle` を取らない。呼び出し側に埋め込んだ
+//! ままでは、生きた Tauri アプリを起動しない限り一行も検証できない
+//! (`adapters/presentation` の `toggle_action` と同じ流儀)。
+//!
+//! # 中断メモの本文をログに書かない
+//!
+//! スパイン「一貫性の規約」。**切り替え**の成否は記録してよいが、本文は決して残さない。
 
 use std::sync::Mutex;
 
@@ -16,6 +36,23 @@ use tauri::{AppHandle, Manager, Runtime, State};
 
 use crate::adapters::hotkey::HotkeyStatus;
 use crate::adapters::presentation;
+use crate::domain::state::{Core, CoreState};
+use crate::domain::task::{InterruptionNote, StepId};
+
+/// コアが `manage` されていないときに示す理由。
+///
+/// 利用者に示す文であり、ログではない。復元に失敗したことがログにしか出ないと、
+/// **現在地**の喪失に気づく手段がログファイルを開くことだけになる。
+const CORE_MISSING: &str =
+    "保存された状態を読み込めていない。現在地と中断メモを表示できず、切り替えも記録できない。";
+
+/// **`Core` の不在を明示的なエラーへ変換する純粋関数** (I/O マトリクス「コア不在」)。
+///
+/// **状態を書き換える経路が使う。** 表示する経路は [`snapshot_of`] を通り、コマンドごと
+/// 失敗させずに [`OverlaySnapshot::state_error`] として運ぶ。
+fn require_core<T>(core: Option<T>) -> Result<T, String> {
+    core.ok_or_else(|| CORE_MISSING.to_string())
+}
 
 /// 常駐プロセスが保持する、ドメインに属さない起動時の状態。
 #[derive(Default)]
@@ -49,20 +86,200 @@ impl ResidentStatus {
 /// フィールド名は `src/overlay/Overlay.svelte` の `OverlaySnapshot` 型と 1:1 で
 /// 対応する。`invoke<T>` は実行時検査を行わないため、ここを変えると警告が無言で
 /// 出なくなる。契約は `tests::the_snapshot_keeps_its_wire_contract` で固定する。
+///
+/// # なぜ**次の一手**の型を作らないのか
+///
+/// 用語集は `NextAction` を「**現在地**が指す**ステップ**の表示上の呼称」と定め、
+/// **v1 では型を持たない**と明記している (AD-10)。ここで入れ子の型を起こせば、
+/// 「独立したエンティティとして実装してはならない」に反する。欄を平らに並べる。
+///
+/// # **切り替え履歴**に由来する欄が一つも無い
+///
+/// 履歴は SM-C3 の測定基盤であって表示物ではない (AD-15)。境界に欄が無いため、
+/// フロントが描画しようとしても運ぶ値が存在しない。
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct OverlaySnapshot {
+    /// ホットキーの登録結果。
+    ///
+    /// **コアが読めなくてもここは必ず埋まる。** ホットキーは唯一の呼び出し経路であり、
+    /// それが死んでいることは他の失敗に巻き込まれて消えてはならない。
     pub hotkey: HotkeyStatus,
+    /// コアが `manage` されていないときの理由。読めていれば `None`。
+    ///
+    /// **`stepContent` が `None` である理由を、未着手と区別するために要る。**
+    /// 区別しなければ、状態を読めていないことが「未着手」として描かれる。
+    pub state_error: Option<String>,
+    /// **現在地**が指す**ステップ**の内容 — **次の一手**。**未着手**なら `None`。
+    pub step_content: Option<String>,
+    /// 「第 N ステップ」の N。**未着手**なら `None`。
+    pub step_ordinal: Option<u32>,
+    /// 「全 M ステップ」の M。**未着手**なら `None`。
+    ///
+    /// N と M は**位置情報**であって進捗の可視化ではない。比率を運ばないのは意図で
+    /// ある (AD-15) — 割り算をフロントで起こさせないため、両方を数のまま渡す。
+    pub step_count: Option<u32>,
+    /// 記録済みの**中断メモ**。無ければ `None`。
+    ///
+    /// **入力欄の初期値でもある。** 既存のメモで初期化することが、FR-7 の
+    /// 「上書き前の内容の提示」と「追記の形を選べる」を同時に満たす。
+    pub interruption_note: Option<String>,
+}
+
+/// **コア状態を描画用のスナップショットへ落とす純粋関数。**
+///
+/// `state` が `None` なのはコアが `manage` されていない場合である (I/O マトリクス
+/// 「コア不在」)。そのときも `hotkey` は必ず運ぶ。
+///
+/// # 引き当ては一度だけ
+///
+/// **ステップ**と、それを含む**タスク**を別々に引かない。二度引けば、二度目が外れた
+/// ときに「内容は出ているが全体数だけ空」という組み合わせが生まれ、位置情報が
+/// 「第 3 ステップ / 全 — ステップ」として描かれる。一度の引き当てから四つを同時に
+/// 決めることで、その組み合わせを存在させない。
+fn snapshot_of(hotkey: HotkeyStatus, state: Option<&CoreState>) -> OverlaySnapshot {
+    let empty = OverlaySnapshot {
+        hotkey,
+        state_error: None,
+        step_content: None,
+        step_ordinal: None,
+        step_count: None,
+        interruption_note: None,
+    };
+
+    let Some(state) = state else {
+        return OverlaySnapshot {
+            state_error: Some(CORE_MISSING.to_string()),
+            ..empty
+        };
+    };
+
+    let shown = state.current_position().step_id().and_then(|step_id| {
+        let task = state.task_of_step(step_id)?;
+        Some((task.step(step_id)?, task.steps().len()))
+    });
+    // **未着手**。空欄にせず、そうと分かる形で返す (I/O マトリクス「未着手」)。
+    let Some((step, count)) = shown else {
+        return empty;
+    };
+
+    OverlaySnapshot {
+        step_content: Some(step.content().to_string()),
+        step_ordinal: Some(step.ordinal()),
+        step_count: Some(u32::try_from(count).unwrap_or(u32::MAX)),
+        interruption_note: step.interruption_note().map(|note| note.text().to_string()),
+        ..empty
+    }
+}
+
+/// `switch_current_position` が受け取る要求。**これがコマンドの引数型そのものである。**
+///
+/// フロントは `invoke('switch_current_position', { request: { note, declareCompletion } })`
+/// と呼ぶ。平らな引数にすると、コマンドの仮引数名が唯一の契約になり、Tauri を起動せずに
+/// 検証できる型が一つも残らない — 仮引数を改名しても両方の検査が通ったまま、実行時に
+/// 毎回の Enter が引数の復元で落ちる。型として持てば
+/// `tests::the_request_keeps_its_wire_contract` が形を固定できる。
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SwitchRequest {
+    /// 確定する**中断メモ**。`null` および空欄は**省略**であり、既存のメモを変えない。
+    ///
+    /// **提示された既存メモをそのまま送り返してはならない。** 送り返せば、読み返した
+    /// だけの**切り替え**が「メモを書いた」として記録され、SM-C3 の記入率が膨らむ。
+    /// 判定はフロント側 (`Overlay.svelte`) が持つ — 何が「今回書かれた」かを知って
+    /// いるのは入力欄だけである。
+    pub note: Option<String>,
+    /// **完了**を宣言するか。宣言しない**切り替え**も同じく成立する (FR-4 / AD-2)。
+    pub declare_completion: bool,
+}
+
+/// **切り替え**の結末。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SwitchOutcome {
+    /// **現在地**が次の**ステップ**へ移ったか。
+    ///
+    /// 最終**ステップ**からの**切り替え**では偽である。そのときもメモ・**完了**・
+    /// 履歴は確定しており、**現在地**だけが動かない。
+    pub moved: bool,
+}
+
+/// コアが返した移動先から結末を決める純粋関数。
+const fn outcome_of(destination: Option<StepId>) -> SwitchOutcome {
+    SwitchOutcome {
+        moved: destination.is_some(),
+    }
 }
 
 /// 表示のたびに呼ばれ、描画に必要な完全なスナップショットを返す。
+///
+/// **コアが読めなくても失敗しない。** 失敗させるとホットキーの登録結果まで道連れになり、
+/// 唯一の呼び出し経路が死んでいる事実が伝わらなくなる。読めないことは
+/// [`OverlaySnapshot::state_error`] として運ぶ。
+///
+/// # Errors
+///
+/// 起動処理が終わっていないとき。既定値で埋めない — 埋めればホットキーの登録失敗が
+/// 「成功」として描画される。フロントは短い間隔で再試行する。
 #[tauri::command]
-pub fn get_overlay_snapshot(status: State<'_, ResidentStatus>) -> Result<OverlaySnapshot, String> {
-    match status.hotkey() {
-        Some(hotkey) => Ok(OverlaySnapshot { hotkey }),
-        // 起動処理の途中。フロントは短い間隔で再試行する。
-        None => Err("常駐プロセスの起動処理がまだ完了していない".to_string()),
+pub fn get_overlay_snapshot<R: Runtime>(
+    app: AppHandle<R>,
+    status: State<'_, ResidentStatus>,
+) -> Result<OverlaySnapshot, String> {
+    let hotkey = status
+        .hotkey()
+        .ok_or_else(|| "常駐プロセスの起動処理がまだ完了していない".to_string())?;
+
+    let state = app.try_state::<Core>().map(|core| core.snapshot());
+    Ok(snapshot_of(hotkey, state.as_ref()))
+}
+
+/// **切り替え** — 離脱側の**中断メモ**の確定・**完了**の宣言 (任意)・**現在地**の移動・
+/// **切り替え履歴**の追記を、コア側の単一のトランザクションで確定させる (CAP-7 / AD-5)。
+///
+/// # Errors
+///
+/// コアが `manage` されていないとき、**現在地**が**未着手**のとき、または永続化に
+/// 失敗したとき。いずれの場合も状態は変わっていない。
+#[tauri::command]
+pub fn switch_current_position<R: Runtime>(
+    app: AppHandle<R>,
+    request: SwitchRequest,
+) -> Result<SwitchOutcome, String> {
+    let core = require_core(app.try_state::<Core>())?;
+
+    let destination = core
+        .switch_current_position(
+            as_interruption_note(request.note),
+            request.declare_completion,
+        )
+        .map_err(|error| error.to_string())?;
+    let outcome = outcome_of(destination);
+
+    // **動いたときだけ発行する。** 最終**ステップ**からの**切り替え**は**現在地**を
+    // 動かさないため、そこで発行すれば起きていない変化を主張することになる。その経路で
+    // 再描画が落ちることもない — 呼び出し側は戻り値を受け取った時点でスナップショットを
+    // 取り直すためである (AD-3 鮮度規則)。
+    if outcome.moved {
+        crate::announce_current_position_changed(&app);
     }
+
+    // 本文は書かない。書いてよいのは「起きた」という事実だけである。
+    log::info!("a switch was committed (moved={})", outcome.moved);
+    Ok(outcome)
+}
+
+/// 入力欄の文字列を**中断メモ**に変える。**空欄は省略である** (FR-7)。
+///
+/// 空白のみの入力を「メモを書いた」として記録すると、SM-C3 の記入率が中身のない
+/// 打鍵で膨らむ。逆に本文はそのまま渡す — 前後の空白を削ると、利用者が書いた形を
+/// こちらの都合で書き換えることになる。
+fn as_interruption_note(note: Option<String>) -> Option<InterruptionNote> {
+    let text = note?;
+    if text.trim().is_empty() {
+        return None;
+    }
+    Some(InterruptionNote::new(text))
 }
 
 /// オーバーレイを閉じる (Esc・フォーカス離脱)。隠した上で直前に最前面だったアプリへ
@@ -95,6 +312,45 @@ pub fn publish_hotkey_status<R: Runtime>(app: &AppHandle<R>, status: HotkeyStatu
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domain::FixedClock;
+    use crate::ports::storage::{Commit, RestoredState, Storage, StorageError};
+
+    /// 何でも受け付けるストレージ。**コア状態を組み立てるためだけに使う。**
+    struct AcceptingStorage;
+
+    impl Storage for AcceptingStorage {
+        fn restore(&self) -> Result<RestoredState, StorageError> {
+            Ok(RestoredState::default())
+        }
+
+        fn apply(&self, _commit: &Commit) -> Result<(), StorageError> {
+            Ok(())
+        }
+    }
+
+    fn contents(items: &[&str]) -> Vec<String> {
+        items.iter().map(|item| (*item).to_string()).collect()
+    }
+
+    /// 第 3/全 6 を指すコア状態を作る。
+    fn a_state_at_the_third_of_six() -> CoreState {
+        let core = Core::restore(
+            Box::new(FixedClock::at(1_789_000_000_000)),
+            Box::new(AcceptingStorage),
+        )
+        .expect("空の状態は復元できる");
+        let task_id = core
+            .create_task(
+                "原稿",
+                contents(&["一", "二", "3 段落目を書き直す", "四", "五", "六"]),
+            )
+            .expect("作れる");
+        let third = core.snapshot().task(task_id).expect("ある").steps()[2].id();
+        core.move_current_position(third).expect("移せる");
+        core.set_interruption_note(third, Some(InterruptionNote::new("接続詞を整える途中")))
+            .expect("メモを置ける");
+        core.snapshot()
+    }
 
     /// スナップショットがまだ確定していない間は成功を返さない。
     ///
@@ -117,12 +373,103 @@ mod tests {
         assert!(hotkey.error.is_some());
     }
 
+    /// I/O マトリクス「コア不在」— 状態を書き換える経路では明示的なエラーになる。
+    ///
+    /// 文面まで固定するのは、これが利用者に示される唯一の手がかりだからである
+    /// (復元の失敗は他にログしか経路を持たない)。
+    #[test]
+    fn a_missing_core_becomes_an_explicit_error() {
+        let outcome = require_core::<&Core>(None);
+        assert_eq!(outcome.err().as_deref(), Some(CORE_MISSING));
+        assert!(
+            CORE_MISSING.contains("現在地"),
+            "何が失われているかを利用者に示す文であること"
+        );
+    }
+
+    /// `manage` されていれば、そのまま通す。不在の扱いが常時エラーになっていない。
+    #[test]
+    fn a_present_core_passes_through() {
+        assert_eq!(require_core(Some("core")), Ok("core"));
+    }
+
+    /// I/O マトリクス「コア不在」— **表示する経路ではホットキーを道連れにしない。**
+    ///
+    /// DB が開けずホットキーの登録も失敗している状況で、コマンドごと失敗させると
+    /// 「唯一の呼び出し経路が死んでいる」という事実が誰にも伝わらない
+    /// (spec Never「`hotkey` を失わせない」)。
+    #[test]
+    fn a_missing_core_still_reports_the_hotkey() {
+        let snapshot = snapshot_of(HotkeyStatus::failed("衝突".to_string()), None);
+
+        assert!(!snapshot.hotkey.registered, "ホットキーの失敗が残っている");
+        assert_eq!(snapshot.state_error.as_deref(), Some(CORE_MISSING));
+        assert_eq!(snapshot.step_content, None);
+    }
+
+    /// I/O マトリクス「既定表示」— 第 3/全 6 が、位置情報とメモごと取り出される。
+    ///
+    /// **`stepOrdinal` と `stepCount` の取り違えをここで落とす。** 両方とも数であり、
+    /// 入れ替わっても型では気づけない。
+    #[test]
+    fn the_third_of_six_projects_its_content_position_and_note() {
+        let snapshot = snapshot_of(
+            HotkeyStatus::registered(),
+            Some(&a_state_at_the_third_of_six()),
+        );
+
+        assert_eq!(snapshot.state_error, None);
+        assert_eq!(snapshot.step_content.as_deref(), Some("3 段落目を書き直す"));
+        assert_eq!(snapshot.step_ordinal, Some(3), "第 N の N");
+        assert_eq!(snapshot.step_count, Some(6), "全 M の M");
+        assert_eq!(
+            snapshot.interruption_note.as_deref(),
+            Some("接続詞を整える途中")
+        );
+    }
+
+    /// **内容が出るなら全体数も必ず出る。** 片方だけ空の組み合わせを作らない。
+    #[test]
+    fn a_shown_step_always_carries_its_count() {
+        let snapshot = snapshot_of(
+            HotkeyStatus::registered(),
+            Some(&a_state_at_the_third_of_six()),
+        );
+
+        assert_eq!(
+            snapshot.step_content.is_some(),
+            snapshot.step_count.is_some(),
+            "内容と全体数は同時に決まる"
+        );
+        assert_eq!(
+            snapshot.step_content.is_some(),
+            snapshot.step_ordinal.is_some()
+        );
+    }
+
+    /// I/O マトリクス「未着手」— 空欄ではなく、未着手と分かる形で返る。
+    #[test]
+    fn a_not_started_position_projects_as_nothing_shown() {
+        let snapshot = snapshot_of(HotkeyStatus::registered(), Some(&CoreState::default()));
+
+        assert_eq!(snapshot.state_error, None, "読めてはいる");
+        assert_eq!(snapshot.step_content, None);
+        assert_eq!(snapshot.step_ordinal, None);
+        assert_eq!(snapshot.step_count, None);
+        assert_eq!(snapshot.interruption_note, None);
+    }
+
     /// Rust → TS の契約。フィールド名を変えるとフロントの警告が無言で消えるため、
     /// 実際に送られる JSON の形をここで固定する。
     #[test]
     fn the_snapshot_keeps_its_wire_contract() {
         let snapshot = OverlaySnapshot {
             hotkey: HotkeyStatus::failed("衝突".to_string()),
+            state_error: None,
+            step_content: Some("下書きを 3 段落まで書く".to_string()),
+            step_ordinal: Some(3),
+            step_count: Some(6),
+            interruption_note: Some("3 段落目の途中".to_string()),
         };
         let json: serde_json::Value =
             serde_json::to_value(&snapshot).expect("スナップショットは直列化できる");
@@ -134,13 +481,142 @@ mod tests {
         assert!(hotkey.get("registered").is_some_and(|v| v.is_boolean()));
         assert!(hotkey.get("error").is_some_and(|v| v.is_string()));
 
+        // **既存の 3 コマンドと `hotkey` 欄を壊さないことが本スライスの制約である。**
+        assert!(json.get("stepContent").is_some_and(|v| v.is_string()));
+        assert!(json.get("stepOrdinal").is_some_and(|v| v.is_u64()));
+        assert!(json.get("stepCount").is_some_and(|v| v.is_u64()));
+        assert!(json.get("interruptionNote").is_some_and(|v| v.is_string()));
+
         let ok = serde_json::to_value(OverlaySnapshot {
             hotkey: HotkeyStatus::registered(),
+            state_error: None,
+            step_content: None,
+            step_ordinal: None,
+            step_count: None,
+            interruption_note: None,
         })
         .expect("成功時も直列化できる");
         assert!(
             ok["hotkey"]["error"].is_null(),
             "成功時の error は null であり、フロントの `string | null` と一致する"
+        );
+        // **未着手**は空欄ではなく null として運ばれる。フロントはこれを見て
+        // 「未着手である旨の 1 行」を出す。
+        assert!(ok["stateError"].is_null());
+        assert!(ok["stepContent"].is_null());
+        assert!(ok["stepOrdinal"].is_null());
+        assert!(ok["stepCount"].is_null());
+        assert!(ok["interruptionNote"].is_null());
+    }
+
+    /// **切り替え履歴に由来する欄が境界に一つも無い** (AD-15)。
+    ///
+    /// 欄が無ければ、フロントがどう書こうと表示できる値が存在しない。
+    #[test]
+    fn the_snapshot_carries_nothing_from_the_switch_record() {
+        let json: serde_json::Value = serde_json::to_value(OverlaySnapshot {
+            hotkey: HotkeyStatus::registered(),
+            state_error: None,
+            step_content: Some("下書き".to_string()),
+            step_ordinal: Some(1),
+            step_count: Some(2),
+            interruption_note: None,
+        })
+        .expect("直列化できる");
+
+        // `serde_json` のオブジェクトは辞書順で並ぶ。順序ではなく**集合**を固定する。
+        let fields: Vec<&String> = json
+            .as_object()
+            .expect("オブジェクトである")
+            .keys()
+            .collect();
+        assert_eq!(
+            fields,
+            vec![
+                "hotkey",
+                "interruptionNote",
+                "stateError",
+                "stepContent",
+                "stepCount",
+                "stepOrdinal"
+            ],
+            "履歴・件数・記入率に由来する欄を足さない (AD-15)"
+        );
+    }
+
+    /// **TS → Rust の契約。** フロントが送る JSON が、コマンドの引数型へそのまま復元
+    /// できることを固定する。ここが合っていなければ、毎回の Enter が実行時に引数の
+    /// 復元で落ちる — 両方の検査が緑のままで。
+    #[test]
+    fn the_request_keeps_its_wire_contract() {
+        let written: SwitchRequest =
+            serde_json::from_str(r#"{"note":"3 段落目の途中","declareCompletion":true}"#)
+                .expect("フロントが送る形で復元できる");
+        assert_eq!(
+            written,
+            SwitchRequest {
+                note: Some("3 段落目の途中".to_string()),
+                declare_completion: true,
+            }
+        );
+
+        // メモの省略は `null` で運ばれる。
+        let omitted: SwitchRequest =
+            serde_json::from_str(r#"{"note":null,"declareCompletion":false}"#)
+                .expect("省略した形でも復元できる");
+        assert_eq!(
+            omitted,
+            SwitchRequest {
+                note: None,
+                declare_completion: false,
+            }
+        );
+
+        // `declareCompletion` を snake_case で送っても復元できてはならない。
+        assert!(
+            serde_json::from_str::<SwitchRequest>(r#"{"note":null,"declare_completion":true}"#)
+                .is_err(),
+            "受け付ける綴りは camelCase の一つだけである"
+        );
+    }
+
+    /// **切り替え**の結末も TS 側と 1:1 である。移動の有無が `moved` に写る。
+    #[test]
+    fn the_switch_outcome_keeps_its_wire_contract() {
+        let moved = outcome_of(Some(StepId::new(
+            crate::domain::Timestamp::from_unix_millis(0),
+        )));
+        assert!(moved.moved, "移動先があれば真");
+        assert_eq!(
+            serde_json::to_value(moved).expect("直列化できる"),
+            serde_json::json!({ "moved": true })
+        );
+
+        // 最終ステップ。メモと完了は確定しているが現在地は動かない。
+        let stayed = outcome_of(None);
+        assert!(!stayed.moved);
+        assert_eq!(
+            serde_json::to_value(stayed).expect("直列化できる"),
+            serde_json::json!({ "moved": false })
+        );
+    }
+
+    /// 空欄は**省略**である。既存のメモを消さないための唯一の判定点 (FR-7)。
+    #[test]
+    fn an_empty_input_is_an_omission_not_an_empty_note() {
+        assert_eq!(as_interruption_note(None), None);
+        assert_eq!(as_interruption_note(Some(String::new())), None);
+        assert_eq!(as_interruption_note(Some("   \n\t ".to_string())), None);
+    }
+
+    /// 本文はそのまま渡す。前後の空白も利用者が書いた形である。
+    #[test]
+    fn a_written_note_is_passed_through_unchanged() {
+        assert_eq!(
+            as_interruption_note(Some(" 3 段落目の途中 ".to_string()))
+                .as_ref()
+                .map(InterruptionNote::text),
+            Some(" 3 段落目の途中 ")
         );
     }
 }

@@ -28,7 +28,7 @@ pub struct StepId(Uuid);
 /// 「計時はコアが所有する」を迂回し、テストから決定的に検証できなくなる。
 /// カウンタを持たせず乱数部を最大に取るのは、順序を `ordinal` が単独で負うため
 /// 生成順の単調性に依存しないからである (Design Notes)。
-fn new_v7(now: Timestamp) -> Uuid {
+pub(crate) fn new_v7(now: Timestamp) -> Uuid {
     // UUID v7 の時刻欄は符号なしであり、epoch より前を表せない。**秒と小数部を同じ値から
     // 導く。** 秒だけを 0 で止めて小数部を `rem_euclid` で取ると、epoch の 1 ミリ秒前が
     // `+999ms` という未来の時刻欄になる。丸めるなら両方を epoch へ丸める。
@@ -67,6 +67,10 @@ macro_rules! id_newtype {
         }
     };
 }
+
+// **切り替え履歴**の ID も同じ規約に従う (`domain/switch.rs`)。ID の作法を 1 か所に
+// 保つため、マクロと発行関数をモジュール内へ公開する。
+pub(crate) use id_newtype;
 
 id_newtype!(TaskId);
 id_newtype!(StepId);
