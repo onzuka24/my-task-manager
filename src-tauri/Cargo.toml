@@ -26,6 +26,14 @@ serde = { version = "=1.0.229", features = ["derive"] }
 log = "=0.4.34"
 tauri = { version = "=2.11.5", features = ["tray-icon", "image-png"] }
 tauri-plugin-log = "=2.9.1"
+# SQLite。`bundled` は SQLite 自体をソースから同梱してビルドする — システム同梱版の
+# バージョン差 (macOS のリリースごとに異なる) を排除し、WAL や upsert の挙動を固定
+# するため。`tauri-plugin-sql` と sqlx は使わない (AD-4: SQL はストレージアダプタに
+# 閉じる / sqlx は async ランタイムをコアへ持ち込む)。
+rusqlite = { version = "=0.40.2", features = ["bundled"] }
+# ID は UUID v7 (スパイン「一貫性の規約」)。`v7` は生成器、`serde` は将来のコマンド
+# 境界 (AD-3) で ID をそのまま運ぶため。
+uuid = { version = "=1.26.1", features = ["v7", "serde"] }
 
 [target."cfg(not(any(target_os = \"android\", target_os = \"ios\")))".dependencies]
 tauri-plugin-global-shortcut = "=2.3.2"
