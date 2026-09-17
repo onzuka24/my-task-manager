@@ -16,6 +16,7 @@
 use std::sync::{Mutex, MutexGuard};
 
 use super::position::CurrentPosition;
+use super::switch::SwitchRecord;
 use super::task::{InterruptionNote, Step, StepId, Task, TaskId};
 use super::{Clock, DomainError};
 use crate::ports::storage::{Commit, RestoredState, Storage, StorageError};
@@ -305,6 +306,103 @@ impl Core {
         Ok(())
     }
 
+    /// **切り替え** — 離脱側の**中断メモ**の確定・**完了**の宣言 (任意)・同一**タスク**
+    /// 内の次の**ステップ**への**現在地**の移動・**切り替え履歴**の追記を、**単一の
+    /// トランザクション**で確定させる (CAP-7 / AD-5)。
+    ///
+    /// # なぜ既存の操作を順に呼ばないのか
+    ///
+    /// [`Self::set_interruption_note`] と [`Self::move_current_position`] はそれぞれ
+    /// 独立した [`Commit`] を書く。順に呼べば書き込みは二つのトランザクションに割れ、
+    /// その間の異常終了が「メモは残ったが**現在地**が動いていない」あるいはその逆を
+    /// 残す。AD-5 が単一トランザクションを要求しているのは、まさにこの状態を禁じる
+    /// ためである。
+    ///
+    /// # 引数
+    ///
+    /// - `note` — 離脱側に残す**中断メモ**。`None` は**省略**であり、**既存のメモを
+    ///   消さない** (FR-7「省略しても切り替えは完了する」)。`Some` は「**今回**書かれた」
+    ///   を意味し、**切り替え履歴**の `note_written` に写る。提示した既存のメモをその
+    ///   まま送り返すのは「今回書いた」ではない — 呼び出し側 (コマンド境界とオーバー
+    ///   レイ) が区別する責務を負う。読み返しただけの**切り替え**を記入として数えれば、
+    ///   SM-C3 の記入率が膨らみ、偽陽性を排除するための指標が機能しなくなる。
+    /// - `declare_completion` — **完了**を宣言するか。宣言しない**切り替え**も同じく
+    ///   成立する。**完了**は**現在地**の移動から導出しない (FR-4 / AD-2)。
+    ///
+    /// # 戻り値
+    ///
+    /// 移動先の**ステップ**。最終**ステップ**からの**切り替え**では `None` であり、
+    /// **現在地**は動かない — ただしメモ・**完了**・履歴は同じ 1 トランザクションで
+    /// 確定する (I/O マトリクス「最終ステップからの切り替え」)。
+    ///
+    /// **連続作業時間はリセットされない。** 活性のまま移るため
+    /// [`CurrentPosition::move_to`] が `activated_at` を保つ (AD-8)。
+    ///
+    /// # Errors
+    ///
+    /// **現在地**が**未着手**のとき [`DomainError::NoCurrentPosition`]、指し先が
+    /// 見つからないとき [`DomainError::UnknownStep`]、永続化に失敗したとき
+    /// [`CoreError::Storage`]。いずれの場合もメモリ上の状態は変わらない。
+    pub fn switch_current_position(
+        &self,
+        note: Option<InterruptionNote>,
+        declare_completion: bool,
+    ) -> Result<Option<StepId>, CoreError> {
+        let mut state = self.lock();
+        let now = self.clock.now();
+
+        let departed = state
+            .current_position
+            .step_id()
+            .ok_or(DomainError::NoCurrentPosition)?;
+        let index = state
+            .tasks
+            .iter()
+            .position(|task| task.step(departed).is_some())
+            .ok_or(DomainError::UnknownStep)?;
+
+        // 判断は複製の上で行う。永続化が成功したときにだけメモリへ反映する
+        // (`commit_task` と同じ順序)。
+        let mut draft = state.tasks[index].clone();
+        let note_written = note.is_some();
+        if note_written {
+            draft.set_interruption_note(departed, note)?;
+        }
+        if declare_completion {
+            draft.declare_completion(now, departed)?;
+        }
+
+        // 移動先は同一**タスク**内の次の**ステップ**に限る。任意の**ステップ**への
+        // 移動は CAP-9 の**開示面**に属する。
+        let destination = next_step_of(&draft, departed);
+        let moved = destination.map(|next| state.current_position.move_to(draft.id(), next, now));
+
+        // **何も変わらないなら履歴も残さない。** 最終**ステップ**で Enter を繰り返す
+        // だけで 1 行ずつ積めば、SM-C3 の分母が空の打鍵で膨らみ、記入率が下がった
+        // ように見える。逆に、移動先が無くてもメモや**完了**が変わったなら残す —
+        // 最終**ステップ**で書いたメモだけが分子から落ちるほうも同じく歪みである。
+        let task_changed = draft != state.tasks[index];
+        if !task_changed && moved.is_none() {
+            return Ok(destination);
+        }
+
+        self.storage.apply(&Commit {
+            // 変わっていない**タスク**を書き直さない。書けば失敗しうる I/O が増える
+            // だけで、確定するものが一つも増えない。
+            task: task_changed.then(|| draft.clone()),
+            current_position: moved,
+            switch_record: Some(SwitchRecord::new(now, departed, note_written)),
+        })?;
+
+        if task_changed {
+            state.tasks[index] = draft;
+        }
+        if let Some(position) = moved {
+            state.current_position = position;
+        }
+        Ok(destination)
+    }
+
     /// **現在地**を**活性**にする (**休息**からの復帰など / CAP-6)。
     ///
     /// # Errors
@@ -411,6 +509,16 @@ impl Core {
     fn lock(&self) -> MutexGuard<'_, CoreState> {
         self.state.lock().unwrap_or_else(|error| error.into_inner())
     }
+}
+
+/// 同一**タスク**内で、指定の**ステップ**の次に来る**ステップ**。
+///
+/// 並びは `ordinal` 昇順であり ([`Task::steps`])、次とは「一つ後ろの要素」である。
+/// **完了**済みを読み飛ばさない — 読み飛ばせば**完了**が**現在地**の移動先を決める
+/// ことになり、「**完了**を**現在地**から導出しない」の裏返しが起きる (FR-4 / AD-2)。
+fn next_step_of(task: &Task, step_id: StepId) -> Option<StepId> {
+    let index = task.steps().iter().position(|step| step.id() == step_id)?;
+    task.steps().get(index + 1).map(Step::id)
 }
 
 #[cfg(test)]
@@ -838,6 +946,398 @@ mod tests {
 
         let outcome = Core::restore(Box::new(clock), Box::new(storage));
         assert!(matches!(outcome, Err(StorageError::Corrupted(_))));
+    }
+
+    /// 受け入れ条件「メモを書いて確定 → 現在地は次へ・履歴の `note_written` は真」。
+    ///
+    /// **三者が一つのコミットに載ることが本スライスの核心である** (AD-5)。
+    #[test]
+    fn a_switch_commits_the_note_the_move_and_the_record_together() {
+        let (core, storage, _) = a_core();
+        let task_id = core
+            .create_task("原稿", contents(&["下書き", "推敲", "投稿"]))
+            .expect("作れる");
+        let snapshot = core.snapshot();
+        let task = snapshot.task(task_id).expect("ある");
+        let (first, second) = (task.steps()[0].id(), task.steps()[1].id());
+        core.move_current_position(first).expect("移せる");
+        let before = storage.commits().len();
+
+        let destination = core
+            .switch_current_position(Some(InterruptionNote::new("3 段落目まで")), false)
+            .expect("切り替えられる");
+
+        assert_eq!(
+            destination,
+            Some(second),
+            "移動先は同一タスク内の次のステップ"
+        );
+        let commits = storage.commits();
+        assert_eq!(
+            commits.len(),
+            before + 1,
+            "離脱側のメモ・現在地の移動・履歴の追記で 1 トランザクション (AD-5)"
+        );
+        let commit = commits.last().expect("ある");
+        assert!(
+            commit.task.is_some(),
+            "メモを載せたタスクが同じコミットにある"
+        );
+        assert_eq!(
+            commit.current_position.and_then(|p| p.step_id()),
+            Some(second),
+            "現在地も同じコミットにある"
+        );
+        let record = commit
+            .switch_record
+            .as_ref()
+            .expect("履歴も同じコミットにある");
+        assert_eq!(record.departed_step_id(), first, "離脱元を記録する");
+        assert!(record.note_written(), "メモを書いた事実が残る");
+
+        assert_eq!(core.current_position().step_id(), Some(second));
+        let snapshot = core.snapshot();
+        assert_eq!(
+            snapshot
+                .task(task_id)
+                .expect("ある")
+                .step(first)
+                .expect("ある")
+                .interruption_note()
+                .map(InterruptionNote::text),
+            Some("3 段落目まで")
+        );
+    }
+
+    /// 受け入れ条件「メモを空のまま確定 → 現在地は次へ・`note_written` は偽」。
+    ///
+    /// **省略は既存のメモを消さない。** 消すなら「省略」ではなく「削除」であり、
+    /// FR-7 の「省略しても切り替えは完了する」とは別の操作になる。
+    #[test]
+    fn omitting_the_note_still_completes_the_switch_and_keeps_the_previous_note() {
+        let (core, storage, _) = a_core();
+        let task_id = core
+            .create_task("原稿", contents(&["下書き", "推敲"]))
+            .expect("作れる");
+        let snapshot = core.snapshot();
+        let task = snapshot.task(task_id).expect("ある");
+        let (first, second) = (task.steps()[0].id(), task.steps()[1].id());
+        core.move_current_position(first).expect("移せる");
+        core.set_interruption_note(first, Some(InterruptionNote::new("前に書いた")))
+            .expect("メモを置ける");
+
+        let destination = core
+            .switch_current_position(None, false)
+            .expect("メモを省いても切り替えられる");
+
+        assert_eq!(destination, Some(second));
+        assert_eq!(core.current_position().step_id(), Some(second));
+        let record = storage
+            .commits()
+            .last()
+            .expect("ある")
+            .switch_record
+            .clone()
+            .expect("履歴がある");
+        assert!(!record.note_written(), "省略は記入なしとして記録される");
+        assert_eq!(
+            core.snapshot()
+                .task(task_id)
+                .expect("ある")
+                .step(first)
+                .expect("ある")
+                .interruption_note()
+                .map(InterruptionNote::text),
+            Some("前に書いた"),
+            "省略は既存のメモを消さない"
+        );
+    }
+
+    /// I/O マトリクス「二度目の切り替え」— 確定内容が既存のメモを置き換える。
+    #[test]
+    fn a_second_switch_replaces_the_previous_note() {
+        let (core, _, _) = a_core();
+        let task_id = core
+            .create_task("原稿", contents(&["下書き", "推敲", "投稿"]))
+            .expect("作れる");
+        let snapshot = core.snapshot();
+        let task = snapshot.task(task_id).expect("ある");
+        let (first, second) = (task.steps()[0].id(), task.steps()[1].id());
+        core.move_current_position(first).expect("移せる");
+        core.switch_current_position(Some(InterruptionNote::new("一度目")), false)
+            .expect("切り替えられる");
+        core.move_current_position(first).expect("戻せる");
+
+        core.switch_current_position(Some(InterruptionNote::new("一度目 / 二度目")), false)
+            .expect("切り替えられる");
+
+        assert_eq!(
+            core.snapshot()
+                .task(task_id)
+                .expect("ある")
+                .step(first)
+                .expect("ある")
+                .interruption_note()
+                .map(InterruptionNote::text),
+            Some("一度目 / 二度目")
+        );
+        assert_eq!(core.current_position().step_id(), Some(second));
+    }
+
+    /// 受け入れ条件「完了を伴う切り替え → 離脱側に `completed_at`・現在地が移動・
+    /// 履歴が 1 行。三者が同時に成立」。
+    #[test]
+    fn a_switch_can_declare_the_completion_in_the_same_transaction() {
+        let (core, storage, _) = a_core();
+        let task_id = core
+            .create_task("原稿", contents(&["下書き", "推敲"]))
+            .expect("作れる");
+        let snapshot = core.snapshot();
+        let task = snapshot.task(task_id).expect("ある");
+        let (first, second) = (task.steps()[0].id(), task.steps()[1].id());
+        core.move_current_position(first).expect("移せる");
+        let before = storage.commits().len();
+
+        core.switch_current_position(Some(InterruptionNote::new("ここまで")), true)
+            .expect("切り替えられる");
+
+        assert_eq!(storage.commits().len(), before + 1, "1 トランザクション");
+        let commit = storage.commits().last().expect("ある").clone();
+        let committed = commit.task.expect("タスクが載っている");
+        assert!(
+            committed.step(first).expect("ある").is_completed(),
+            "完了も同じコミットに載る"
+        );
+        assert_eq!(
+            commit.current_position.and_then(|p| p.step_id()),
+            Some(second)
+        );
+        assert!(commit.switch_record.is_some());
+        assert_eq!(core.current_position().step_id(), Some(second));
+    }
+
+    /// **完了を宣言しない切り替えも同じく成立する** (FR-4 / AD-2)。
+    ///
+    /// 完了は現在地の移動から導出しない。
+    #[test]
+    fn a_switch_without_a_declaration_leaves_the_step_incomplete() {
+        let (core, _, _) = a_core();
+        let task_id = core
+            .create_task("原稿", contents(&["下書き", "推敲"]))
+            .expect("作れる");
+        let first = core.snapshot().task(task_id).expect("ある").steps()[0].id();
+        core.move_current_position(first).expect("移せる");
+
+        core.switch_current_position(None, false)
+            .expect("切り替えられる");
+
+        assert!(
+            !core
+                .snapshot()
+                .task(task_id)
+                .expect("ある")
+                .step(first)
+                .expect("ある")
+                .is_completed(),
+            "宣言しなければ完了は付かない (FR-4)"
+        );
+    }
+
+    /// I/O マトリクス「最終ステップからの切り替え」— 現在地は動かないが、メモと完了は
+    /// 成立し、履歴も残る。
+    #[test]
+    fn a_switch_from_the_last_step_records_but_does_not_move() {
+        let (core, storage, _) = a_core();
+        let task_id = core
+            .create_task("原稿", contents(&["下書き", "推敲"]))
+            .expect("作れる");
+        let second = core.snapshot().task(task_id).expect("ある").steps()[1].id();
+        core.move_current_position(second).expect("移せる");
+        let before = storage.commits().len();
+
+        let destination = core
+            .switch_current_position(Some(InterruptionNote::new("続きは明日")), true)
+            .expect("メモと完了は成立する");
+
+        assert_eq!(destination, None, "移動先が無い");
+        assert_eq!(
+            core.current_position().step_id(),
+            Some(second),
+            "現在地は動かない"
+        );
+        let commit = storage.commits().last().expect("ある").clone();
+        assert_eq!(storage.commits().len(), before + 1);
+        assert!(
+            commit.current_position.is_none(),
+            "動かない現在地を書き直さない"
+        );
+        assert!(commit.switch_record.is_some(), "履歴は残る (SM-C3 の分母)");
+        let snapshot = core.snapshot();
+        let step = snapshot
+            .task(task_id)
+            .expect("ある")
+            .step(second)
+            .expect("ある");
+        assert!(step.is_completed());
+        assert_eq!(
+            step.interruption_note().map(InterruptionNote::text),
+            Some("続きは明日")
+        );
+    }
+
+    /// **何も変わらない切り替えは履歴を残さない。**
+    ///
+    /// 最終**ステップ**で Enter を繰り返すだけで 1 行ずつ積めば、SM-C3 の分母が空の
+    /// 打鍵で膨らみ、記入率が下がったように見える。
+    #[test]
+    fn a_switch_that_changes_nothing_writes_no_record() {
+        let (core, storage, _) = a_core();
+        let task_id = core
+            .create_task("原稿", contents(&["下書き", "推敲"]))
+            .expect("作れる");
+        let second = core.snapshot().task(task_id).expect("ある").steps()[1].id();
+        core.move_current_position(second).expect("移せる");
+        let before = storage.commits().len();
+
+        for _ in 0..3 {
+            assert_eq!(
+                core.switch_current_position(None, false),
+                Ok(None),
+                "最終ステップでは移動先が無い"
+            );
+        }
+
+        assert_eq!(storage.commits().len(), before, "何も書かない");
+    }
+
+    /// **最終ステップでも、メモが書かれたなら履歴を残す。**
+    ///
+    /// 分子から落とせば「最終ステップで書いたメモだけ数えない」という逆の歪みになる。
+    #[test]
+    fn a_switch_from_the_last_step_records_when_a_note_was_written() {
+        let (core, storage, _) = a_core();
+        let task_id = core
+            .create_task("原稿", contents(&["下書き", "推敲"]))
+            .expect("作れる");
+        let second = core.snapshot().task(task_id).expect("ある").steps()[1].id();
+        core.move_current_position(second).expect("移せる");
+        let before = storage.commits().len();
+
+        core.switch_current_position(Some(InterruptionNote::new("続きは明日")), false)
+            .expect("成立する");
+
+        assert_eq!(storage.commits().len(), before + 1);
+        let record = storage
+            .commits()
+            .last()
+            .expect("ある")
+            .switch_record
+            .clone()
+            .expect("履歴がある");
+        assert!(record.note_written());
+    }
+
+    /// **切り替えでは連続作業時間をリセットしない** (AD-8)。
+    #[test]
+    fn a_switch_does_not_reset_the_work_clock() {
+        let (core, _, clock) = a_core();
+        let task_id = core
+            .create_task("原稿", contents(&["下書き", "推敲"]))
+            .expect("作れる");
+        let first = core.snapshot().task(task_id).expect("ある").steps()[0].id();
+        let started = clock.now();
+        core.move_current_position(first).expect("移せる");
+
+        clock.advance(600_000);
+        core.switch_current_position(None, false)
+            .expect("切り替えられる");
+
+        assert_eq!(
+            core.current_position().activated_at(),
+            Some(started),
+            "切り替えは非活性→活性の遷移ではない (AD-8)"
+        );
+    }
+
+    /// **未着手からは切り替えられない。** 離れるべき場所が無い。
+    #[test]
+    fn switching_from_not_started_is_an_error() {
+        let (core, storage, _) = a_core();
+        assert_eq!(
+            core.switch_current_position(None, false),
+            Err(CoreError::Domain(DomainError::NoCurrentPosition))
+        );
+        assert!(storage.commits().is_empty(), "拒否は何も書かない");
+    }
+
+    /// I/O マトリクス「書き込み失敗」— 状態を変えず失敗を返す。
+    ///
+    /// **三者のどれ一つもメモリに残さない。** 一部だけ残れば、次の起動で黙って消える。
+    #[test]
+    fn a_failed_switch_changes_nothing_in_memory() {
+        let (core, storage, _) = a_core();
+        let task_id = core
+            .create_task("原稿", contents(&["下書き", "推敲"]))
+            .expect("作れる");
+        let first = core.snapshot().task(task_id).expect("ある").steps()[0].id();
+        core.move_current_position(first).expect("移せる");
+
+        storage.set_failing(true);
+        let outcome =
+            core.switch_current_position(Some(InterruptionNote::new("書けないはず")), true);
+
+        assert!(matches!(outcome, Err(CoreError::Storage(_))));
+        assert_eq!(
+            core.current_position().step_id(),
+            Some(first),
+            "現在地は動かない"
+        );
+        let snapshot = core.snapshot();
+        let step = snapshot
+            .task(task_id)
+            .expect("ある")
+            .step(first)
+            .expect("ある");
+        assert_eq!(step.interruption_note(), None, "メモも残らない");
+        assert!(!step.is_completed(), "完了も付かない");
+    }
+
+    /// **移動先は同一タスク内の次のステップに限る。** 別タスクへは飛ばない
+    /// (任意のステップへの移動は CAP-9 の開示面に属する)。
+    #[test]
+    fn a_switch_never_crosses_into_another_task() {
+        let (core, _, _) = a_core();
+        let first_task = core
+            .create_task("一つ目", contents(&["a"]))
+            .expect("作れる");
+        core.create_task("二つ目", contents(&["b", "c"]))
+            .expect("作れる");
+        let only_step = core.snapshot().task(first_task).expect("ある").steps()[0].id();
+        core.move_current_position(only_step).expect("移せる");
+
+        let destination = core.switch_current_position(None, false).expect("成立する");
+
+        assert_eq!(destination, None, "別タスクの先頭へは飛ばない");
+        assert_eq!(core.current_position().task_id(), Some(first_task));
+    }
+
+    /// 完了済みのステップを読み飛ばさない。読み飛ばせば完了が移動先を決めることに
+    /// なり、「完了を現在地から導出しない」の裏返しが起きる (FR-4 / AD-2)。
+    #[test]
+    fn the_destination_is_the_next_step_even_when_it_is_already_completed() {
+        let (core, _, _) = a_core();
+        let task_id = core
+            .create_task("原稿", contents(&["下書き", "推敲", "投稿"]))
+            .expect("作れる");
+        let snapshot = core.snapshot();
+        let task = snapshot.task(task_id).expect("ある");
+        let (first, second) = (task.steps()[0].id(), task.steps()[1].id());
+        core.declare_completion(second).expect("宣言できる");
+        core.move_current_position(first).expect("移せる");
+
+        let destination = core.switch_current_position(None, false).expect("成立する");
+
+        assert_eq!(destination, Some(second));
     }
 
     /// 状態を変えうる操作が交錯しても、現在地は常に一つである (AD-5)。

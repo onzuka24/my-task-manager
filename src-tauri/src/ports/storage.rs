@@ -14,6 +14,7 @@
 //! **完了**が落ちた状態が残りうる — AD-5 が禁じているのはまさにそれである。
 
 use crate::domain::position::CurrentPosition;
+use crate::domain::switch::SwitchRecord;
 use crate::domain::task::Task;
 
 use std::fmt;
@@ -47,12 +48,22 @@ impl Default for RestoredState {
 /// **行を消す変更が存在しない。** v1 は**タスク**も**ステップ**も削除しない (消滅の
 /// 経路は CAP-20 にのみ属する)。削除を表現する値を置かないことで、それを構造として
 /// 保証する。
+///
+/// **欄が三つあるのは AD-5 のためである。** 一度の**切り替え**は、離脱側の
+/// **中断メモ**の確定 (と任意の**完了**宣言) ・**現在地**の移動・**切り替え履歴**の
+/// 追記を同時に確定させなければならない。三つを別々の [`Storage::apply`] に分ければ
+/// 書き込みは三つのトランザクションに割れ、その隙間の異常終了が「メモは残ったが
+/// **現在地**が動いていない」状態を残す。
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Commit {
     /// 書き直す**タスク** (**ステップ**を含む)。変更が無ければ `None`。
     pub task: Option<Task>,
     /// 置き換える**現在地**。変更が無ければ `None`。
     pub current_position: Option<CurrentPosition>,
+    /// 追記する**切り替え履歴**。**切り替え**以外の操作では `None`。
+    ///
+    /// 追記専用であり、置き換えも削除もしない。読み戻す経路も持たない (AD-15)。
+    pub switch_record: Option<SwitchRecord>,
 }
 
 impl Commit {
@@ -62,6 +73,7 @@ impl Commit {
         Self {
             task: Some(task),
             current_position: None,
+            switch_record: None,
         }
     }
 
@@ -71,13 +83,14 @@ impl Commit {
         Self {
             task: None,
             current_position: Some(current_position),
+            switch_record: None,
         }
     }
 
     /// 書き込むものが何も無いか。
     #[must_use]
     pub const fn is_empty(&self) -> bool {
-        self.task.is_none() && self.current_position.is_none()
+        self.task.is_none() && self.current_position.is_none() && self.switch_record.is_none()
     }
 }
 

@@ -60,8 +60,33 @@ CREATE TABLE setting (
 ) STRICT;
 ";
 
+/// 版 2 — **切り替え履歴** (CAP-7 / SM-C3)。
+///
+/// **V1 を書き換えて列を足すことはできない。** 既に走っているインストールでは V1 が
+/// 適用済みであり、書き換えた SQL は二度と実行されない — 手元の DB とコードだけが
+/// 一致し、実際に使われている DB は古いままになる。表を足すときは必ず新しい版を
+/// [`MIGRATIONS`] へ**追記**する。
+///
+/// `note_written` は**中断メモ**記入の有無であり、**本文ではない**。本文の列を持たない
+/// ことが AD-15 (履歴を利用者に見せない) をスキーマの側で担保する。
+///
+/// **読み出す経路をどこにも作っていない。** この表は書くだけで、コアは起動時に読まない
+/// (spec Design Notes)。測定が必要になった時点で SQL から直接数える。
+///
+/// **索引を張らない。** 読み手が製品コードに一つも無い以上、索引は**切り替え**のたびの
+/// 書き込みを重くするだけである。SM-C3 の測定は数か月に一度の全走査であり、数千行の
+/// 全走査に索引は要らない。
+const V2: &str = "\
+CREATE TABLE switch_record (
+    id               TEXT PRIMARY KEY NOT NULL,
+    departed_step_id TEXT NOT NULL REFERENCES step(id),
+    occurred_at      TEXT NOT NULL,
+    note_written     INTEGER NOT NULL CHECK (note_written IN (0, 1))
+) STRICT;
+";
+
 /// 版の順序。**追記のみ。** 添字 + 1 が `PRAGMA user_version` の値になる。
-const MIGRATIONS: &[&str] = &[V1];
+const MIGRATIONS: &[&str] = &[V1, V2];
 
 /// コードが期待するスキーマの版。
 pub const LATEST_VERSION: i64 = MIGRATIONS.len() as i64;
@@ -220,8 +245,57 @@ mod tests {
         assert!(version_of(&connection) >= 1);
         assert_eq!(
             tables(&connection),
-            vec!["current_position", "setting", "step", "task"]
+            vec![
+                "current_position",
+                "setting",
+                "step",
+                "switch_record",
+                "task"
+            ]
         );
+    }
+
+    /// **V1 を書き換えず V2 を追記した。** 既存インストールは V1 適用済みのまま
+    /// V2 だけを受け取る — その一段だけが走ることを確かめる。
+    #[test]
+    fn an_existing_installation_only_receives_the_new_version() {
+        assert_eq!(LATEST_VERSION, 2);
+        assert_eq!(pending(1), &[V2]);
+        assert!(V1.contains("CREATE TABLE task"));
+        assert!(!V1.contains("switch_record"), "V1 は書き換えない");
+    }
+
+    /// 版 1 の DB を開くと**切り替え履歴**の表だけが増える。
+    #[test]
+    fn migrating_from_version_one_adds_the_switch_record_table() {
+        let mut connection = Connection::open_in_memory().expect("メモリ DB は開ける");
+        configure(&connection).expect("PRAGMA を設定できる");
+        // 版 1 までを適用した状態を作る。
+        connection.execute_batch(V1).expect("版 1 は適用できる");
+        connection
+            .pragma_update(None, "user_version", 1)
+            .expect("版番号は書ける");
+        assert!(!tables(&connection).contains(&"switch_record".to_string()));
+
+        migrate(&mut connection).expect("残りが適用できる");
+
+        assert_eq!(version_of(&connection), LATEST_VERSION);
+        assert!(tables(&connection).contains(&"switch_record".to_string()));
+    }
+
+    /// **切り替え履歴**は実在する**ステップ**しか離脱元にできない。
+    #[test]
+    fn a_switch_record_must_point_at_a_real_step() {
+        let mut connection = Connection::open_in_memory().expect("メモリ DB は開ける");
+        configure(&connection).expect("PRAGMA を設定できる");
+        migrate(&mut connection).expect("適用できる");
+
+        let outcome = connection.execute(
+            "INSERT INTO switch_record (id, departed_step_id, occurred_at, note_written) \
+             VALUES ('r', 'missing', '2026-09-17T00:00:00.000Z', 0)",
+            [],
+        );
+        assert!(outcome.is_err(), "存在しないステップを離脱元にできない");
     }
 
     /// 二度目の適用は何もしない (冪等)。

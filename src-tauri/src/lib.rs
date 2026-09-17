@@ -29,7 +29,7 @@ pub mod commands;
 pub mod domain;
 pub mod ports;
 
-use tauri::Manager;
+use tauri::{Emitter, Manager};
 
 use adapters::hotkey::HotkeyStatus;
 use adapters::storage::SqliteStorage;
@@ -43,6 +43,28 @@ use domain::state::Core;
 /// [`tauri::AppHandle::exit`] / `restart` から来る明示的な終了であり、通す。
 pub const fn should_prevent_exit(code: Option<i32>) -> bool {
     code.is_none()
+}
+
+/// **現在地**が変わったことを伝えるイベントの名前 (AD-3)。
+///
+/// event は `名詞_過去分詞` (スパイン「一貫性の規約」)。
+pub const CURRENT_POSITION_CHANGED: &str = "current_position_changed";
+
+/// **切り替え**が確定したことを提示層へ伝える (AD-3)。
+///
+/// # ペイロードを持たない理由
+///
+/// AD-3 の鮮度規則により、オーバーレイは表示のたびにコマンドでスナップショットを
+/// 取り直す。イベントが状態を運べば「イベント経由の状態」と「スナップショット経由の
+/// 状態」という二つの真実が生まれる。**変化したという事実だけを伝え、受け手は必ず
+/// スナップショットを取り直す。** 取りこぼしても次の表示で正しくなる。
+///
+/// **発行は失敗しても常駐を止めない。** 配送は保証されておらず、取りこぼしは鮮度規則が
+/// 既に吸収している。
+pub fn announce_current_position_changed<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
+    if let Err(error) = app.emit(CURRENT_POSITION_CHANGED, ()) {
+        log::error!("failed to announce that the current position changed: {error}");
+    }
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -78,6 +100,7 @@ pub fn run() {
         .manage(commands::ResidentStatus::default())
         .invoke_handler(tauri::generate_handler![
             commands::get_overlay_snapshot,
+            commands::switch_current_position,
             commands::hide_overlay,
             commands::mark_overlay_hidden
         ])
@@ -159,6 +182,16 @@ pub fn run() {
                 handle.exit(1);
             }
 
+            // 最後にコミットされた状態へ復帰する (AD-5)。DB は自動起動の印と同じ
+            // アプリデータディレクトリに置く。
+            //
+            // **オーバーレイを出しうる経路より先に済ませる。** オーバーレイは表示の
+            // たびにコマンドで完全なスナップショットを取得する (AD-3 鮮度規則) が、
+            // その中身はここで `manage` されるコアから来る。後回しにすると、下の
+            // ホットキー失敗の報せが「状態を読み込めていない」という別の失敗を
+            // 被せた形で出かねない。
+            restore_core(&handle);
+
             // ホットキーが唯一の呼び出し経路である以上、それが死んでいることは確実に
             // 伝わらなければならない。起動時にオーバーレイを出して理由を示す。
             // 以後はメニューバー項目の状態行が副の経路となる。
@@ -169,10 +202,6 @@ pub fn run() {
             }
 
             autostart::enable(&handle);
-
-            // 最後にコミットされた状態へ復帰する (AD-5)。DB は自動起動の印と同じ
-            // アプリデータディレクトリに置く。
-            restore_core(&handle);
 
             Ok(())
         })
@@ -258,5 +287,12 @@ mod tests {
         assert!(!should_prevent_exit(Some(0)));
         assert!(!should_prevent_exit(Some(1)));
         assert!(!should_prevent_exit(Some(tauri::RESTART_EXIT_CODE)));
+    }
+
+    /// event は `名詞_過去分詞` である (スパイン「一貫性の規約」)。名前を変えると
+    /// オーバーレイの購読が無言で外れ、切り替え後の再描画が起きなくなる。
+    #[test]
+    fn the_event_name_follows_the_naming_rule() {
+        assert_eq!(CURRENT_POSITION_CHANGED, "current_position_changed");
     }
 }
