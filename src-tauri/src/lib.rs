@@ -1,8 +1,8 @@
 //! 常駐の骨格 — 常駐プロセス・自動起動・ホットキー呼び出し (CAP-1, CAP-3)。
 //!
 //! 層の分割は ports and adapters (AD-1) に従う。
-//! - [`domain`] — OS を知らないドメインコア (本スライスでは空)
-//! - [`ports`] — コアが外界に要求する契約 (本スライスでは空)
+//! - [`domain`] — OS を知らないドメインコア
+//! - [`ports`] — コアが外界に要求する契約
 //! - [`adapters`] — OS API を呼んでよい唯一の場所
 //! - [`commands`] — Tauri command 境界 (AD-3)
 //!
@@ -32,7 +32,9 @@ pub mod ports;
 use tauri::Manager;
 
 use adapters::hotkey::HotkeyStatus;
-use adapters::{autostart, hotkey, menubar, presentation};
+use adapters::storage::SqliteStorage;
+use adapters::{autostart, clock, hotkey, menubar, presentation};
+use domain::state::Core;
 
 /// 終了要求を拒むべきか決める純粋関数。
 ///
@@ -168,6 +170,10 @@ pub fn run() {
 
             autostart::enable(&handle);
 
+            // 最後にコミットされた状態へ復帰する (AD-5)。DB は自動起動の印と同じ
+            // アプリデータディレクトリに置く。
+            restore_core(&handle);
+
             Ok(())
         })
         .build(tauri::generate_context!())
@@ -181,6 +187,41 @@ pub fn run() {
                 }
             }
         });
+}
+
+/// 永続化された状態を読み戻し、コアを常駐プロセスへ預ける (AD-5)。
+///
+/// **失敗しても常駐を止めない。** I/O マトリクス「異常終了後の起動」は「破損時は
+/// `Err` を返し起動を止めない」と定めている。ホットキーによる呼び出しとメニューバー
+/// 項目からの終了は、状態が読めなくても働かなければならない — 読めないまま何も
+/// 立たないほうが、利用者にとって回復しようがない。
+///
+/// 失敗した場合、コアは `manage` されない。消費者 (CAP-7 以降のコマンド) は
+/// [`tauri::Manager::try_state`] で不在を扱うこと。既定値で埋めたコアを預けると、
+/// **現在地**が失われた事実が「未着手」として静かに上書きされ、次の書き込みで確定して
+/// しまう。
+fn restore_core<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
+    let Ok(app_data_dir) = app.path().app_data_dir() else {
+        log::error!("failed to resolve the application data directory; state is not restored");
+        return;
+    };
+
+    let path = SqliteStorage::database_path(&app_data_dir);
+    let storage = match SqliteStorage::open(&path) {
+        Ok(storage) => storage,
+        Err(error) => {
+            log::error!("failed to open the state database: {error}");
+            return;
+        }
+    };
+
+    match Core::restore(Box::new(clock::SystemClock), Box::new(storage)) {
+        Ok(core) => {
+            log::info!("the core state was restored from disk");
+            app.manage(core);
+        }
+        Err(error) => log::error!("failed to restore the core state: {error}"),
+    }
 }
 
 /// ログの出力先。ローカルファイルのみ (AD-12)。開発時は標準出力にも出す。
