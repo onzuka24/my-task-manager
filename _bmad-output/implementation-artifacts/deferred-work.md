@@ -51,3 +51,15 @@
 - source_spec: `_bmad-output/implementation-artifacts/spec-switch-and-resume.md`
   summary: `switch_record` に保持期間の方針が無く、`departed_step_id` の外部キーに `ON DELETE` の方針も無い。
   evidence: レビュー #20。今日は**ステップ**の削除経路が存在しないため無害だが、CAP-20 (腐敗による消滅の経路) が削除を導入した時点で衝突する。CAP-20 の設計と併せて決めるのが妥当。
+
+- source_spec: `_bmad-output/implementation-artifacts/spec-task-creation.md`
+  summary: 進行中の**タスク**への**ステップ**の追記と分割の到達経路 — CAP-5 の利用者に見える半分。ドメインには `insert_step` / `append_step` / `split_step` が既にあるが、そこへ到達する UI もコマンドも無い。
+  evidence: 作成 (CAP-4) と追記/分割 (CAP-5) はそれぞれ独立して出荷できる。作成だけで sqlite3 による種まきが終わり v1 の 1 か月の試用に入れるため、単一ゴールを保って作成を先に出した。FR-5 が対象とするのは「現在の**タスク**」であり、対象の選択に一覧を要さないため CAP-9 とは独立に実装できる。
+
+- source_spec: `_bmad-output/implementation-artifacts/spec-task-creation.md`
+  summary: 「作成して着手」で**現在地**を移すとき、離脱側に**中断メモ**の機会も**切り替え履歴**も無く、SM-C3 の記入率から漏れる。
+  evidence: レビュー #11。用語集は**切り替え**を「**現在地**をあるステップから別のステップへ移す操作」と定義しており、この移動もそれに当たる。ただし「機会を与えていない移動を記入率の分母に入れてよいか」は設計判断であり、CAP-9 が任意の**ステップ**への移動を導入するとき同じ問いに直面する。CAP-9 と併せて決める。
+
+- source_spec: `_bmad-output/implementation-artifacts/spec-task-creation.md`
+  summary: テキスト入力面で貼り付け・全選択・取り消し (⌘V / ⌘C / ⌘X / ⌘A / ⌘Z) が効かない見込みである。アプリのメニューが存在しないため。
+  evidence: レビュー #12。`enable_macos_default_menu(false)` かつ `Builder::menu()` 未設定であり、macOS ではこれらの打鍵はメニューの key equivalent 経由で WKWebView に届く。終了・閉じるを含まない編集メニューのみを足せば解決する見込みだが、既定メニューの無効化は slice 1 の誤終了阻止の第 1 層そのものであり、その層には自動検証が無い (既知の申し送り)。無検証のまま触れば、一打で常駐が死ぬ状態を再発させうる。誤終了阻止の自動検証と併せて扱う。

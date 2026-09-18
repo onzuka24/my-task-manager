@@ -10,5 +10,9 @@ export default defineConfig({
   test: {
     environment: 'jsdom',
     include: ['src/**/*.test.ts'],
+    // コンポーネントの `<style>` を jsdom に流し込む。固定サイズのウィンドウに
+    // 収まりきらない内容へ到達できること (`overflow-y`) は配線と同じく壊れうるが、
+    // これが無ければ `getComputedStyle` から一切見えない。
+    css: true,
   },
 })

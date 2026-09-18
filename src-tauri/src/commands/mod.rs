@@ -37,7 +37,7 @@ use tauri::{AppHandle, Manager, Runtime, State};
 use crate::adapters::hotkey::HotkeyStatus;
 use crate::adapters::presentation;
 use crate::domain::state::{Core, CoreState};
-use crate::domain::task::{InterruptionNote, StepId};
+use crate::domain::task::{InterruptionNote, Step, StepId, Task};
 
 /// コアが `manage` されていないときに示す理由。
 ///
@@ -193,6 +193,132 @@ pub struct SwitchRequest {
     pub declare_completion: bool,
 }
 
+/// `create_task` が受け取る要求。**これがコマンドの引数型そのものである。**
+///
+/// フロントは
+/// `invoke('create_task', { request: { title, steps, moveCurrentPosition } })` と呼ぶ。
+/// [`SwitchRequest`] と同じ理由で名前付きの型として持つ — 平らな引数にすると、コマンドの
+/// 仮引数名が唯一の契約になり、Tauri を起動せずに検証できる型が一つも残らない。
+///
+/// # なぜ**ステップ**を配列で受け取らないのか
+///
+/// 「1 行 = 1 **ステップ**」「前後の空白を除いて空になる行は落とす」という規則は
+/// **一箇所にしか無いべきである**。配列で受け取れば、行を切り分けて落とす判断がフロントへ
+/// 移り、[`as_task_definition`] の単体テストが守っているものが実際の経路から外れる。
+/// 入力欄の文字列をそのまま渡し、整えるのはコマンド境界の純粋関数だけとする。
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CreateTaskRequest {
+    /// **タスク**の題名。前後の空白を除いて空であってはならない (FR-4)。
+    pub title: String,
+    /// **ステップ**の入力欄の文字列そのもの。1 行 = 1 **ステップ**。
+    pub steps: String,
+    /// 作成に加えて**現在地**をその**タスク**の第 1 **ステップ**へ置くか。
+    ///
+    /// **書き留めることと着手することは別の行為である** (FR-18 と同じ原則)。既に
+    /// **現在地**があるときも、置き換えはこれが真のときにだけ起きる。
+    pub move_current_position: bool,
+}
+
+/// **タスク**の作成の結末。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CreateTaskOutcome {
+    /// **現在地**がその**タスク**の第 1 **ステップ**へ移ったか。
+    ///
+    /// **タスク**が生まれたことはこの欄に現れない — 作成が失敗したときにだけ `Err` が
+    /// 返るため、`Ok` が返った時点で作成は確定している。**逆に、作成が確定した後は
+    /// 決して `Err` を返さない**: 返せば「何も保存されていない」と示されたうえで同じ
+    /// 入力が再確定され、v1 では削除も到達もできない重複した**タスク**が生まれる。
+    /// 着手に失敗したことは `Err` ではなくこの欄の `false` として運ぶ。
+    pub moved: bool,
+}
+
+/// 入力から組み立てた、**タスク**の題名と**ステップ**の内容の列。
+///
+/// **`Task::create` は題名と内容の空白を素通しする** (`domain/task.rs`)。整えるのは
+/// この型を作る側の責務であり、ドメインへ渡る時点では既に整っている。
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TaskDefinition {
+    title: String,
+    step_contents: Vec<String>,
+}
+
+/// 題名が無いことを示す理由。**面を閉じずに提示される** (I/O マトリクス「題名が空」)。
+const TITLE_MISSING: &str = "題名が空である。タスクには題名が要る。";
+
+/// **ステップ**が 1 個も残らないことを示す理由 (I/O マトリクス「残る行が無い」)。
+const STEPS_MISSING: &str = "ステップが 1 個も無い。ステップを持たないタスクは作れない。";
+
+/// 1 行 = 1 **ステップ**を切り分ける区切り。
+///
+/// `\r\n` は空の断片を生むが、空行は落ちるため結果は変わらない。
+const STEP_SEPARATORS: [char; 4] = ['\n', '\r', '\u{2028}', '\u{2029}'];
+
+/// **入力を**タスク**の定義へ整える純粋関数** (I/O マトリクス「空行の混在」ほか)。
+///
+/// `AppHandle` を取らない。呼び出し側に埋め込んだままでは、生きた Tauri アプリを
+/// 起動しない限り一行も検証できない ([`as_interruption_note`] と同じ流儀)。
+///
+/// # 規則
+///
+/// - 題名は前後の空白を除く。除いて空なら作らない (FR-4)。
+/// - **ステップ**は 1 行 = 1 個。行の順がそのまま連番 1..N になる。
+/// - 前後の空白を除いて空になる行は落とす。落とした結果 1 個も残らなければ作らない。
+///
+/// # 行の区切り
+///
+/// `str::lines` は `\n` (と直前の `\r`) しか行と認めない。入力欄から来る文字列は
+/// 貼り付け元によって単独の `\r` や U+2028 / U+2029 を含みうるため、それらも区切りと
+/// して扱う。扱わなければ複数行が 1 個の**ステップ**に潰れ、内容に制御文字が残る。
+///
+/// # なぜ**中断メモ**と扱いが違うのか
+///
+/// [`as_interruption_note`] は本文をそのまま渡す — 利用者が書いた形をこちらの都合で
+/// 書き換えないためである。こちらは逆に整える。**行が区切りとして意味を持つ**入力では、
+/// 行頭の空白や空行は「書いた形」ではなく入力の都合であり、そのまま**ステップ**の内容に
+/// すると連番と内容の両方がずれる。
+fn as_task_definition(title: &str, steps: &str) -> Result<TaskDefinition, String> {
+    let title = title.trim();
+    if title.is_empty() {
+        return Err(TITLE_MISSING.to_string());
+    }
+
+    let step_contents: Vec<String> = steps
+        .split(STEP_SEPARATORS)
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(str::to_string)
+        .collect();
+    if step_contents.is_empty() {
+        return Err(STEPS_MISSING.to_string());
+    }
+
+    Ok(TaskDefinition {
+        title: title.to_string(),
+        step_contents,
+    })
+}
+
+/// **着手すべき**ステップ**を選ぶ純粋関数** — 第 1 **ステップ**、すなわち連番が 1 の
+/// もの (I/O マトリクス「作成して着手」)。
+///
+/// `AppHandle` を取らない。コマンドに埋め込んだままでは、並びの先頭と末尾を取り違えても
+/// 生きた Tauri アプリを起動しない限り誰も気づかない。
+///
+/// # なぜ並びの先頭ではなく連番で選ぶのか
+///
+/// 「第 1 **ステップ**」は連番 1 の**ステップ**であって、たまたま先頭に積まれたものでは
+/// ない。連番で選べば、並びと連番が食い違ったときに黙って別の**ステップ**へ着手する経路が
+/// 存在しなくなる。
+fn step_to_start_from(task: Option<&Task>) -> Option<StepId> {
+    task?
+        .steps()
+        .iter()
+        .find(|step| step.ordinal() == 1)
+        .map(Step::id)
+}
+
 /// **切り替え**の結末。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -267,6 +393,74 @@ pub fn switch_current_position<R: Runtime>(
     // 本文は書かない。書いてよいのは「起きた」という事実だけである。
     log::info!("a switch was committed (moved={})", outcome.moved);
     Ok(outcome)
+}
+
+/// **タスク**を作る (CAP-4 / FR-4)。
+///
+/// 題名と 1 行 = 1 **ステップ**の入力から**タスク**を生み、要求されていれば**現在地**を
+/// その第 1 **ステップ**へ置く。
+///
+/// # なぜ作成と**現在地**の移動が一つのトランザクションではないのか
+///
+/// AD-5 が単一トランザクションを要求しているのは**切り替え**である — 離脱側のメモ・
+/// **完了**・移動・履歴が割れると「メモは残ったが現在地が動いていない」という半端な状態が
+/// 残るためである。こちらで割れて残るのは「**タスク**は生まれたが**現在地**が動いて
+/// いない」であり、これは**作成のみの確定が正規に作る状態そのもの**である。半端な状態が
+/// 存在しないため、コアへ新しい経路を足してまで束ねる理由が無い。
+///
+/// # 作成が確定した後は決して失敗しない
+///
+/// **ステップ**の引き当てと**現在地**の移動はどちらも失敗しうるが、その時点で**タスク**は
+/// 既に永続化され `task_created` も発行されている。ここで `Err` を返すと、呼び出し側は
+/// 「何も保存されていない」と示したうえで入力を保持し、利用者は自然に再確定する —
+/// v1 には削除も、既存の**タスク**へ到達する経路 (CAP-9) も無いため、重複した**タスク**は
+/// 二度と始末できない。着手できなかったことは [`CreateTaskOutcome::moved`] の `false`
+/// として運び、記録はログに残す。
+///
+/// # Errors
+///
+/// 題名が空のとき、**ステップ**が 1 個も残らないとき、コアが `manage` されていないとき、
+/// または**タスク**の永続化そのものに失敗したとき。**いずれの場合も何も保存されておらず、
+/// 呼び出し側は面を閉じずに理由を提示して入力を保持する** (I/O マトリクス)。
+#[tauri::command]
+pub fn create_task<R: Runtime>(
+    app: AppHandle<R>,
+    request: CreateTaskRequest,
+) -> Result<CreateTaskOutcome, String> {
+    // **コアを要求する前に入力を検める。** 順を逆にすると、題名を書き忘れただけの利用者に
+    // 「状態を読み込めていない」という無関係な理由が返りうる。
+    let definition = as_task_definition(&request.title, &request.steps)?;
+    let core = require_core(app.try_state::<Core>())?;
+
+    let task_id = core
+        .create_task(definition.title, definition.step_contents)
+        .map_err(|error| error.to_string())?;
+    // 状態を変えた後は必ず event を発行する (AD-3)。ペイロードは持たない — 受け手は
+    // スナップショットを取り直す。
+    crate::announce_task_created(&app);
+
+    if !request.move_current_position {
+        // 題名も**ステップ**の内容も書かない。書いてよいのは「起きた」という事実だけである。
+        log::info!("a task was created (moved=false)");
+        return Ok(CreateTaskOutcome { moved: false });
+    }
+
+    // ここから先の失敗は `Err` にしない。**タスク**は既に確定している。
+    let state = core.snapshot();
+    let Some(first) = step_to_start_from(state.task(task_id)) else {
+        log::error!(
+            "the created task had no step with ordinal 1; the current position was left as it was"
+        );
+        return Ok(CreateTaskOutcome { moved: false });
+    };
+    if let Err(error) = core.move_current_position(first) {
+        log::error!("a task was created but the current position could not be moved: {error}");
+        return Ok(CreateTaskOutcome { moved: false });
+    }
+    crate::announce_current_position_changed(&app);
+
+    log::info!("a task was created (moved=true)");
+    Ok(CreateTaskOutcome { moved: true })
 }
 
 /// 入力欄の文字列を**中断メモ**に変える。**空欄は省略である** (FR-7)。
@@ -607,6 +801,262 @@ mod tests {
         assert_eq!(as_interruption_note(None), None);
         assert_eq!(as_interruption_note(Some(String::new())), None);
         assert_eq!(as_interruption_note(Some("   \n\t ".to_string())), None);
+    }
+
+    // --- タスクの作成 (CAP-4 / FR-4) -----------------------------------------
+
+    /// I/O マトリクス「作成のみ」— 題名と 3 行が、そのまま 1..3 の内容の列になる。
+    #[test]
+    fn a_title_and_three_lines_become_three_steps_in_order() {
+        let definition = as_task_definition("原稿", "構成を決める\n下書きを書く\n推敲する")
+            .expect("題名と行があれば作れる");
+
+        assert_eq!(definition.title, "原稿");
+        assert_eq!(
+            definition.step_contents,
+            contents(&["構成を決める", "下書きを書く", "推敲する"]),
+            "行の順がそのまま連番 1..N になる"
+        );
+    }
+
+    /// I/O マトリクス「空行の混在」— 行間と末尾の空行は落ち、残りの順序が保たれる。
+    #[test]
+    fn blank_lines_are_dropped_and_the_rest_keeps_its_order() {
+        let definition = as_task_definition(
+            "原稿",
+            "構成を決める\n\n   \n下書きを書く\n\t\n推敲する\n\n   \n",
+        )
+        .expect("空行を落としても残る");
+
+        assert_eq!(
+            definition.step_contents,
+            contents(&["構成を決める", "下書きを書く", "推敲する"]),
+            "落ちるのは空行だけであり、残りの順序は動かない"
+        );
+    }
+
+    /// 行ごとの前後の空白は除く。**行が区切りとして意味を持つ入力である。**
+    ///
+    /// 残したまま**ステップ**の内容にすると、字下げが内容の一部として保存される。
+    #[test]
+    fn each_line_is_trimmed() {
+        let definition =
+            as_task_definition("  原稿  ", "  構成を決める  \n\t下書きを書く\t").expect("作れる");
+
+        assert_eq!(definition.title, "原稿");
+        assert_eq!(
+            definition.step_contents,
+            contents(&["構成を決める", "下書きを書く"])
+        );
+    }
+
+    /// I/O マトリクス「題名が空」— 作らない。理由は利用者に示される文である。
+    #[test]
+    fn a_blank_title_is_refused_with_a_reason() {
+        assert_eq!(
+            as_task_definition("   \t ", "構成を決める")
+                .err()
+                .as_deref(),
+            Some(TITLE_MISSING)
+        );
+        assert_eq!(
+            as_task_definition("", "構成を決める").err().as_deref(),
+            Some(TITLE_MISSING)
+        );
+    }
+
+    /// I/O マトリクス「残る行が無い」— **ステップ**を持たない**タスク**は作れない (FR-4)。
+    ///
+    /// 空白のみの行は落ちるため、**落とした結果 0 個**という経路も同じ理由になる。
+    #[test]
+    fn a_task_without_any_step_is_refused_with_a_reason() {
+        assert_eq!(
+            as_task_definition("原稿", "").err().as_deref(),
+            Some(STEPS_MISSING)
+        );
+        assert_eq!(
+            as_task_definition("原稿", "\n   \n\t\n").err().as_deref(),
+            Some(STEPS_MISSING)
+        );
+    }
+
+    /// 改行の綴りが違っても行は行である。入力欄から来る文字列は貼り付け元で揺れうる。
+    ///
+    /// 単独の `\r` と U+2028 / U+2029 を区切りとして扱わないと、複数行が 1 個の
+    /// **ステップ**に潰れ、内容に制御文字が残ったまま保存される。
+    #[test]
+    fn every_line_separator_splits_steps() {
+        for separator in ["\r\n", "\r", "\n", "\u{2028}", "\u{2029}"] {
+            let steps = format!("構成を決める{separator}下書きを書く{separator}");
+            let definition = as_task_definition("原稿", &steps)
+                .unwrap_or_else(|_| panic!("{separator:?} は区切りである"));
+
+            assert_eq!(
+                definition.step_contents,
+                contents(&["構成を決める", "下書きを書く"]),
+                "区切り {separator:?} で 2 個に分かれる"
+            );
+        }
+    }
+
+    /// 区切りが混ざっていても、制御文字が内容に残らない。
+    #[test]
+    fn no_step_carries_a_line_separator() {
+        let definition =
+            as_task_definition("原稿", "一\r\n二\r三\u{2028}四\u{2029}五").expect("作れる");
+
+        assert_eq!(
+            definition.step_contents,
+            contents(&["一", "二", "三", "四", "五"])
+        );
+        for content in &definition.step_contents {
+            assert!(
+                !content.contains(STEP_SEPARATORS),
+                "内容に区切りが残っていない: {content:?}"
+            );
+        }
+    }
+
+    /// **着手先は連番 1 の**ステップ**である** (I/O マトリクス「作成して着手」)。
+    ///
+    /// 並びの先頭で選ぶ実装と結果が一致する状況でも、選んでいるのが連番であることを
+    /// 固定する — 末尾を選ぶ実装に変えたなら、ここが落ちる。
+    #[test]
+    fn the_step_to_start_from_is_the_one_numbered_one() {
+        let core = Core::restore(
+            Box::new(FixedClock::at(1_789_000_000_000)),
+            Box::new(AcceptingStorage),
+        )
+        .expect("空の状態は復元できる");
+        let task_id = core
+            .create_task(
+                "原稿",
+                contents(&["構成を決める", "下書きを書く", "推敲する"]),
+            )
+            .expect("作れる");
+
+        let state = core.snapshot();
+        let chosen = step_to_start_from(state.task(task_id)).expect("第 1 ステップがある");
+        let task = state.task(task_id).expect("ある");
+        assert_eq!(
+            task.step(chosen).expect("ある").ordinal(),
+            1,
+            "連番 1 である"
+        );
+        assert_eq!(task.step(chosen).expect("ある").content(), "構成を決める");
+        assert_ne!(
+            chosen,
+            task.steps().last().expect("ある").id(),
+            "末尾ではない"
+        );
+    }
+
+    /// 選んだ**ステップ**へ移した後、**現在地**は確かにそれを指す。
+    ///
+    /// **`move_current_position` の呼び出しを消しても `moved: true` を返せてしまう**
+    /// 経路をここで塞ぐ。
+    #[test]
+    fn starting_a_created_task_points_the_current_position_at_its_first_step() {
+        let core = Core::restore(
+            Box::new(FixedClock::at(1_789_000_000_000)),
+            Box::new(AcceptingStorage),
+        )
+        .expect("空の状態は復元できる");
+        let task_id = core
+            .create_task("原稿", contents(&["構成を決める", "下書きを書く"]))
+            .expect("作れる");
+        assert!(
+            core.current_position().step_id().is_none(),
+            "作成そのものは現在地に触れない"
+        );
+
+        let chosen = step_to_start_from(core.snapshot().task(task_id)).expect("ある");
+        core.move_current_position(chosen).expect("移せる");
+
+        assert_eq!(core.current_position().step_id(), Some(chosen));
+        assert_eq!(core.current_position().task_id(), Some(task_id));
+    }
+
+    /// **タスク**が引けなければ着手先も無い。ここが `None` を返すことが、コマンドが
+    /// `Err` ではなく `moved: false` を返す経路の入口である。
+    #[test]
+    fn a_missing_task_has_no_step_to_start_from() {
+        assert_eq!(step_to_start_from(None), None);
+    }
+
+    /// **TS → Rust の契約。** フロントが送る JSON がそのまま復元できる。
+    #[test]
+    fn the_creation_request_keeps_its_wire_contract() {
+        let request: CreateTaskRequest = serde_json::from_str(
+            r#"{"title":"原稿","steps":"構成を決める\n下書きを書く","moveCurrentPosition":true}"#,
+        )
+        .expect("フロントが送る形で復元できる");
+        assert_eq!(
+            request,
+            CreateTaskRequest {
+                title: "原稿".to_string(),
+                steps: "構成を決める\n下書きを書く".to_string(),
+                move_current_position: true,
+            }
+        );
+
+        // 作成のみの確定。**現在地**は動かない。
+        let only: CreateTaskRequest = serde_json::from_str(
+            r#"{"title":"原稿","steps":"構成を決める","moveCurrentPosition":false}"#,
+        )
+        .expect("作成のみの形でも復元できる");
+        assert!(!only.move_current_position);
+
+        // 受け付ける綴りは camelCase の一つだけである。
+        assert!(serde_json::from_str::<CreateTaskRequest>(
+            r#"{"title":"原稿","steps":"構成を決める","move_current_position":true}"#
+        )
+        .is_err());
+    }
+
+    /// 作成の結末も TS 側と 1:1 である。
+    ///
+    /// **欄は `moved` の一つだけである。** 件数・登録数に由来する欄を足さない —
+    /// SM-C1 は登録数の増加を目標にしてはならないと定めており、境界に欄が無ければ
+    /// フロントがどう書こうと描ける値が存在しない (AD-15)。
+    #[test]
+    fn the_creation_outcome_keeps_its_wire_contract() {
+        let json = serde_json::to_value(CreateTaskOutcome { moved: true }).expect("直列化できる");
+        assert_eq!(json, serde_json::json!({ "moved": true }));
+
+        let stayed =
+            serde_json::to_value(CreateTaskOutcome { moved: false }).expect("直列化できる");
+        assert_eq!(stayed, serde_json::json!({ "moved": false }));
+    }
+
+    /// 整えた定義はドメインがそのまま受け取れる。**空白は既にここで落ちている。**
+    ///
+    /// `Task::create` は題名と内容の空白を素通しする (`domain/task.rs`)。整える責務が
+    /// こちらにあることを、実際に**タスク**を作って確かめる。
+    #[test]
+    fn a_definition_reaches_the_domain_already_tidied() {
+        let core = Core::restore(
+            Box::new(FixedClock::at(1_789_000_000_000)),
+            Box::new(AcceptingStorage),
+        )
+        .expect("空の状態は復元できる");
+
+        let definition = as_task_definition("  原稿 ", " 構成を決める \n\n 下書きを書く \n")
+            .expect("整えられる");
+        let task_id = core
+            .create_task(definition.title, definition.step_contents)
+            .expect("作れる");
+
+        let state = core.snapshot();
+        let task = state.task(task_id).expect("ある");
+        assert_eq!(task.title(), "原稿");
+        assert_eq!(task.steps().len(), 2);
+        assert_eq!(task.steps()[0].content(), "構成を決める");
+        assert_eq!(task.steps()[0].ordinal(), 1, "連番は 1 から");
+        assert_eq!(task.steps()[1].content(), "下書きを書く");
+        assert_eq!(task.steps()[1].ordinal(), 2);
+        // **作成は現在地に触れない** (`domain/state.rs`)。着手は別の打鍵に属する。
+        assert!(core.current_position().step_id().is_none());
     }
 
     /// 本文はそのまま渡す。前後の空白も利用者が書いた形である。

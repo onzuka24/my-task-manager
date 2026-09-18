@@ -50,7 +50,26 @@ pub const fn should_prevent_exit(code: Option<i32>) -> bool {
 /// event は `名詞_過去分詞` (スパイン「一貫性の規約」)。
 pub const CURRENT_POSITION_CHANGED: &str = "current_position_changed";
 
+/// **タスク**が作られたことを伝えるイベントの名前 (AD-3)。
+///
+/// event は `名詞_過去分詞` (スパイン「一貫性の規約」)。
+pub const TASK_CREATED: &str = "task_created";
+
 /// **切り替え**が確定したことを提示層へ伝える (AD-3)。
+pub fn announce_current_position_changed<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
+    announce(app, CURRENT_POSITION_CHANGED);
+}
+
+/// **タスク**が生まれたことを提示層へ伝える (AD-3)。
+///
+/// **現在地**も動いた場合は [`announce_current_position_changed`] も併せて発行する。
+/// 一つのイベントに二つの意味を持たせない — 作成だけを行う確定も同じく正規の経路で
+/// あり、そこで**現在地**の変化を主張することになる。
+pub fn announce_task_created<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
+    announce(app, TASK_CREATED);
+}
+
+/// 状態が変わったという事実だけを提示層へ伝える (AD-3)。
 ///
 /// # ペイロードを持たない理由
 ///
@@ -61,9 +80,9 @@ pub const CURRENT_POSITION_CHANGED: &str = "current_position_changed";
 ///
 /// **発行は失敗しても常駐を止めない。** 配送は保証されておらず、取りこぼしは鮮度規則が
 /// 既に吸収している。
-pub fn announce_current_position_changed<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
-    if let Err(error) = app.emit(CURRENT_POSITION_CHANGED, ()) {
-        log::error!("failed to announce that the current position changed: {error}");
+fn announce<R: tauri::Runtime>(app: &tauri::AppHandle<R>, event: &str) {
+    if let Err(error) = app.emit(event, ()) {
+        log::error!("failed to announce `{event}`: {error}");
     }
 }
 
@@ -100,6 +119,7 @@ pub fn run() {
         .manage(commands::ResidentStatus::default())
         .invoke_handler(tauri::generate_handler![
             commands::get_overlay_snapshot,
+            commands::create_task,
             commands::switch_current_position,
             commands::hide_overlay,
             commands::mark_overlay_hidden
@@ -294,5 +314,15 @@ mod tests {
     #[test]
     fn the_event_name_follows_the_naming_rule() {
         assert_eq!(CURRENT_POSITION_CHANGED, "current_position_changed");
+    }
+
+    /// **タスク**の作成を伝えるイベントも `名詞_過去分詞` である。
+    ///
+    /// 作成と**現在地**の移動は別のイベントである。一つに束ねると、作成だけを行う確定が
+    /// 起きていない**現在地**の変化を主張することになる。
+    #[test]
+    fn the_creation_event_name_follows_the_naming_rule() {
+        assert_eq!(TASK_CREATED, "task_created");
+        assert_ne!(TASK_CREATED, CURRENT_POSITION_CHANGED);
     }
 }
