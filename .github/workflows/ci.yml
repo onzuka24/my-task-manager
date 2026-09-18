@@ -1,0 +1,107 @@
+# 検査を人の記憶から外す。`make lint` と `make test` を pull request と main への push で
+# 必ず走らせる。
+#
+# ここで**やらないこと** — 署名・公証・リリース成果物の作成 (v1 の対象外、AD-13)。
+# 実挙動 (Cmd+Q / Cmd+W / Cmd+V の効き) は AppKit を起動した実アプリでしか観測できず、
+# 本リポジトリは UI 自動化の基盤を持たない。CI が守るのは `make lint` と `make test` が
+# 見る範囲だけである。
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+# 同じ枝で走っている古い実行は畳む。main の実行は畳まない (履歴の各点を緑に保つため)。
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    # macOS でしか組めない。objc2-app-kit / tray-icon / Info.plist はいずれも
+    # macOS 前提であり、他の runner では依存解決の前に落ちる。
+    #
+    # 版は固定する — このリポジトリは他のすべての版を厳密に固定しており、runner だけ
+    # 追跡にする理由が無い。image が引退すれば失敗として見え、黙って環境が変わらない。
+    runs-on: macos-15
+    # 詰まった実行が macOS runner を既定の 6 時間占有しないようにする。
+    # 冷えたキャッシュからの一式ビルドでも 45 分には収まる。
+    timeout-minutes: 45
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # pnpm の版は package.json の packageManager (現在 11.24.0) から取る。
+      # ここに版を書くと Makefile の `--frozen-lockfile` と二重管理になる。
+      - name: pnpm を用意する
+        uses: pnpm/action-setup@v4
+
+      - name: Node を用意する
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: pnpm
+
+      # rust-toolchain.toml を唯一の正とする。channel / components / targets の
+      # いずれもあのファイルにしか書かない — ここに書けば二重管理になり、黙って
+      # ずれる。引数なしの `rustup toolchain install` が rust-toolchain.toml を読む。
+      - name: Rust ツールチェインを導入する
+        run: env -u RUSTUP_TOOLCHAIN rustup toolchain install
+
+      # ここは**版の固定そのものを検査する段**である。二つ見る。
+      #
+      # 1. `RUSTUP_TOOLCHAIN` が漏れていても rust-toolchain.toml が勝つこと。漏れると
+      #    rustup の優先順位で rust-toolchain.toml を上書きし、**黙って別の版で
+      #    ビルドされる**。runner は普段これを設定しないため、ここで**わざと誤った版を
+      #    設定して漏れを再現する** — そうしないと Makefile の `unexport` を消しても
+      #    CI は緑のままで、検査が何も守っていないことになる。`unexport` が失われれば、
+      #    1.81.0 が導入されていなければ rustup がそこで落ち、導入されていれば下の
+      #    版の比較が食い違う。どちらでも赤くなる (手元で両方を再現して確認済み)。
+      # 2. mise.toml と rust-toolchain.toml が同じ版を指していること。mise は
+      #    `RUSTUP_TOOLCHAIN` を export するため、**make を経由しない経路** (素の
+      #    `cargo` / エディタ / スクリプト) はすべて mise 側の版で走る。二つがずれた
+      #    まま気づかない状態を作らない。
+      - name: 版の固定が効いていることを確かめる
+        env:
+          RUSTUP_TOOLCHAIN: '1.81.0'
+        run: |
+          set -euo pipefail
+          expected="$(sed -n 's/^channel[[:space:]]*=[[:space:]]*"\(.*\)"/\1/p' rust-toolchain.toml)"
+          test -n "${expected}"
+
+          actual="$(make --no-print-directory toolchain | awk '{print $2}')"
+          echo "rust-toolchain.toml: ${expected} / make 経由の rustc: ${actual}"
+          test "${expected}" = "${actual}"
+
+          mise="$(sed -n 's/^rust[[:space:]]*=[[:space:]]*"\(.*\)"/\1/p' mise.toml)"
+          echo "mise.toml: ${mise}"
+          test "${expected}" = "${mise}"
+
+      # 依存が変わっていなければビルド成果物を再利用する。鍵は Cargo.lock と
+      # ツールチェインの両方で作る — 版が変われば成果物は使えない。
+      # キャッシュが無くても (初回・鍵の変化時) 検査はそのまま成功する。
+      - name: cargo のレジストリとビルド成果物を再利用する
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            src-tauri/target
+          key: cargo-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml') }}-${{ hashFiles('src-tauri/Cargo.lock') }}
+          restore-keys: |
+            cargo-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml') }}-
+
+      - name: make lint
+        run: make lint
+
+      # lint が落ちても走らせる。書式の誤り 1 件でその PR のテスト結果が丸ごと
+      # 見えなくなると、直して押し直すまで何も分からない。job は lint の失敗で
+      # 落ちたままである (`!cancelled()` は失敗を飲まない)。
+      - name: make test
+        if: ${{ !cancelled() }}
+        run: make test

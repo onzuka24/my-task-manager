@@ -21,13 +21,21 @@ AUTOSTART_MARKER := $(HOME)/Library/Application Support/$(BUNDLE_ID)/autostart-r
 APP_DATA_DIR := $(HOME)/Library/Application Support/$(BUNDLE_ID)
 LOG_DIR      := $(HOME)/Library/Logs/$(BUNDLE_ID)
 
+# 依存とフロントエンドは、phony ではなく実体のあるファイルで追う。lint と test は別々の
+# make 呼び出しで走る (CI は段を分け、片方が落ちても他方の結果を見たい) ため、phony の
+# ままだと pnpm install と vite build が呼び出しのたびに繰り返される。
+NODE_MODULES := node_modules/.modules.yaml
+FRONTEND_OUT := dist/index.html
+FRONTEND_SRC := index.html vite.config.ts svelte.config.js tsconfig.app.json \
+                $(shell find src -type f 2>/dev/null)
+
 # mise / ~/.tool-versions が RUSTUP_TOOLCHAIN を export していると rustup の優先順位で
 # rust-toolchain.toml より強くなり、このプロジェクトの固定が効かない。make の中では外し、
 # rust-toolchain.toml を正にする。利用者のグローバル既定は変更しない。
 unexport RUSTUP_TOOLCHAIN
 
 .DEFAULT_GOAL := install
-.PHONY: install build deps dev test lint measure open stop uninstall clean
+.PHONY: install build deps frontend dev test lint toolchain measure open stop uninstall clean
 
 ## make        — ビルドして /Applications に配置する
 install: build
@@ -44,20 +52,43 @@ install: build
 build: deps
 	pnpm tauri build
 
-deps:
+deps: $(NODE_MODULES)
+
+$(NODE_MODULES): package.json pnpm-lock.yaml
 	pnpm install --frozen-lockfile
+	@touch $@
+
+## フロントエンドの成果物 (dist/) を作る。
+##
+## dist/ は git 管理外であるため、新しいクローンには存在しない。一方 Rust 側は
+## generate_context! で frontendDist (= ../dist) を読む。いま debug ビルドは devUrl が
+## 設定されているぶん dist/ の不在を許しているが、それはこの 1 条件に寄りかかった
+## 成り立ち方であり、devUrl を外すか custom-protocol を立てた瞬間に検査そのものが
+## 落ちる。検査を走らせる前に作っておく。
+frontend: $(FRONTEND_OUT)
+
+$(FRONTEND_OUT): $(FRONTEND_SRC) $(NODE_MODULES)
+	pnpm build
 
 dev:
 	pnpm tauri dev
 
-test: deps
+test: $(FRONTEND_OUT)
 	cargo test --manifest-path src-tauri/Cargo.toml
 	pnpm check
 	pnpm test
 
-lint: deps
+lint: $(FRONTEND_OUT)
 	cargo fmt --manifest-path src-tauri/Cargo.toml --check
 	cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
+
+## test / lint が実際に使う Rust の版を表示する。
+##
+## 上の `unexport RUSTUP_TOOLCHAIN` を経た値であり、rust-toolchain.toml が効いていれば
+## そこに書いた channel と一致する。CI はこの出力と rust-toolchain.toml の一致を確かめる
+## — 黙って別の版でビルドされた緑は検査ではない。
+toolchain:
+	@rustc --version
 
 ## 待機時の資源予算を実測する (AD-14)。リリースビルドを起動した状態で実行すること。
 measure:

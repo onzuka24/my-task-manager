@@ -23,6 +23,25 @@
 //! 3. **暗黙の終了だけを拒む** ([`tauri::RunEvent::ExitRequested`])。`code` が `None`
 //!    のときだけ `prevent_exit` する。メニューバー項目からの `AppHandle::exit(0)` は
 //!    `code: Some(0)` で来るため通る。フラグは要らない。
+//!
+//! # 編集メニューを据えても第 1 層は弱まらない
+//!
+//! 既定メニューを消した代償として Cmd+V・Cmd+C・Cmd+A・Cmd+Z も死ぬ。入力が主役の面に
+//! 摩擦を掛けないため、**終了と閉じるの項目を持たない**アプリケーションメニューを
+//! [`adapters::appmenu`] が据える。項目が無ければ macOS はそれを補わないため、Cmd+Q と
+//! Cmd+W はどこにも束縛されないままであり、第 1 層の目的は保たれる。理由の全文は
+//! [`adapters::appmenu`] のモジュールドキュメントにある。
+//!
+//! 据えるのは [`tauri::Builder::menu`] ではなく `setup` 内の
+//! [`tauri::AppHandle::set_menu`] である。`Builder::menu` の閉包が `Err` を返すと
+//! `build()` ごと `Err` となり、**常駐そのものが立ち上がらない**。メニューの組み立ての
+//! 失敗は常駐を止めるほどのことではない (I/O マトリクス「メニューの構成」)。
+//!
+//! # 第 1 層と第 2 層の固定
+//!
+//! どちらも 1 行消しても実挙動の検査は落ちない — AppKit を起動した実アプリでしか観測
+//! できないためである。`tests` に置いたのは**行が黙って消えることを防ぐ仕掛け**であって、
+//! 挙動の証明ではない。
 
 pub mod adapters;
 pub mod commands;
@@ -157,6 +176,19 @@ pub fn run() {
                 log::error!("failed to keep the app out of the Dock: {error}");
             }
 
+            // 編集メニューを据える。終了と閉じるの項目を持たないため Cmd+Q / Cmd+W は
+            // どこにも束縛されず、第 1 層の目的は保たれる。据えられなくても常駐は続ける
+            // — Cmd+V が効かない状態は、常駐が立たない状態より軽い。
+            //
+            // macOS 限定である。他のデスクトップではアプリケーションメニューが
+            // `decorations: false` のウィンドウにメニューバーを生やしてしまい、
+            // 取り消し・やり直しはそもそも対応されていない。近傍の
+            // `set_activation_policy` / `allow_fullscreen_spaces` と同じ扱いとする。
+            #[cfg(target_os = "macos")]
+            if let Err(error) = adapters::appmenu::install(&handle) {
+                log::error!("failed to install the application menu: {error}");
+            }
+
             // ウィンドウは tauri.conf.json で起動時に生成され、隠されている。
             // 押下時に生成しないことが CAP-1 の 300ms 制約を満たす前提である。
             let overlay_missing = presentation::overlay(&handle).is_none();
@@ -289,6 +321,141 @@ fn log_targets() -> Vec<tauri_plugin_log::Target> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 本ファイル自身の本文。誤終了阻止の 3 層と、編集メニューを据える呼び出しの
+    /// **字面**を固定するために読む (`adapters::autostart` が Makefile を読む作法と同じ)。
+    const LIB_SOURCE: &str = include_str!("lib.rs");
+
+    /// 本文のうち、実行される側のコードだけを残したもの。
+    ///
+    /// 三つ落とす。落とさなければ、守るべき行を消しても別の場所が一致してしまう。
+    ///
+    /// - **`#[cfg(test)]` 以降** — 検査自身の字面。needle を組み立てる行がここにあり、
+    ///   検査の中に書いた文字列で検査が通ってしまう。
+    /// - **ブロックコメント** — `/* .. */` で囲めば任意の字面をコードの位置に残せる。
+    /// - **行コメント** — 行頭とは限らない。行末に書き足しても同じことができる。
+    fn executable_source() -> String {
+        let head = LIB_SOURCE
+            .split_once(concat!("#[cfg", "(test)]"))
+            .map_or(LIB_SOURCE, |(head, _)| head);
+
+        let mut without_blocks = String::with_capacity(head.len());
+        let mut rest = head;
+        while let Some(start) = rest.find("/*") {
+            without_blocks.push_str(&rest[..start]);
+            match rest[start..].find("*/") {
+                Some(end) => rest = &rest[start + end + 2..],
+                None => {
+                    rest = "";
+                    break;
+                }
+            }
+        }
+        without_blocks.push_str(rest);
+
+        without_blocks
+            .lines()
+            .map(|line| line.split("//").next().unwrap_or(""))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// `needle` が[実行される側のコード][`executable_source`]に**書かれている**か。
+    ///
+    /// # ここで言えること・言えないこと
+    ///
+    /// 言えるのは「その字面がコメントでも検査でもない位置に残っている」までである。
+    /// **呼ばれることは言えない** — `if cfg!(feature = "never") { .. }` で包んでも、
+    /// どこからも呼ばれない関数へ移しても、この検査は通る。**効いていることも言えない**
+    /// — 既定メニューが組み込まれないことや Cmd+Q がどこにも束縛されていないことは、
+    /// AppKit を起動した実アプリでしか観測できず、本リポジトリは UI 自動化の基盤を
+    /// 持たない。合成した打鍵は最前面のアプリに届くため、自動で Cmd+Q を押す検査は
+    /// 利用者のアプリを終了させうる。
+    ///
+    /// **防いでいるのは行が黙って消えることだけである。** 到達性と挙動の確認は spec の
+    /// 手動手順に残してある。
+    fn written_in_source(needle: &str) -> bool {
+        executable_source().contains(needle)
+    }
+
+    /// 誤終了阻止の第 1 層 — 既定メニューを組み込ませない呼び出しが書かれていること。
+    ///
+    /// 主張は[字面の存在][`written_in_source`]までであり、効いていることではない。
+    #[test]
+    fn the_first_layer_call_is_still_written_in_the_source() {
+        // needle をリテラルで書くと、その行自体が本文に現れて一致してしまう。
+        // `concat!` で組み立てれば、連結後の文字列は呼び出し箇所にしか存在しない。
+        let needle = concat!("enable_macos_default_menu", "(false)");
+
+        assert!(
+            written_in_source(needle),
+            "第 1 層 ({needle}) が lib.rs から消えている。\
+             これは Cmd+Q に対する唯一有効な防御であり、外すと反射的な一打で常駐が死ぬ"
+        );
+    }
+
+    /// 誤終了阻止の第 2 層 — 閉じる要求を破棄ではなく非表示へ変換する行が書かれていること。
+    ///
+    /// 主張は[字面の存在][`written_in_source`]までである。
+    ///
+    /// 3 つを個別に見るのは、どれか一つが欠けただけで意味が反転するためである。
+    /// `prevent_close` だけ消せばウィンドウが破棄され (300ms 制約の前提が崩れ、最後の
+    /// ウィンドウの消滅は第 3 層に暗黙の終了として届く)、`presentation::hide` だけ
+    /// 消せばオーバーレイが閉じられなくなる。
+    #[test]
+    fn the_second_layer_calls_are_still_written_in_the_source() {
+        for needle in [
+            concat!("WindowEvent::", "CloseRequested"),
+            concat!("api.", "prevent_close()"),
+            concat!("presentation::", "hide(window.app_handle())"),
+        ] {
+            assert!(
+                written_in_source(needle),
+                "第 2 層の {needle} が lib.rs から消えている。\
+                 閉じる要求は破棄ではなく非表示に変換されなければならない"
+            );
+        }
+    }
+
+    /// 誤終了阻止の第 3 層 — 暗黙の終了だけを拒む行が書かれていること。
+    ///
+    /// 主張は[字面の存在][`written_in_source`]までである。
+    ///
+    /// [`should_prevent_exit`] の単体検査は純粋関数の判断しか見ない。**`.run()` の
+    /// 閉包ごと消しても緑のままである** — 判断は正しいが誰もそれを問わない状態に
+    /// なる。判断と、それを呼ぶ場所は別々に固定する。
+    #[test]
+    fn the_third_layer_calls_are_still_written_in_the_source() {
+        for needle in [
+            concat!("RunEvent::", "ExitRequested"),
+            concat!("should_prevent_exit", "(code)"),
+            concat!("api.", "prevent_exit()"),
+        ] {
+            assert!(
+                written_in_source(needle),
+                "第 3 層の {needle} が lib.rs から消えている。\
+                 暗黙の終了要求を拒む者がいなくなる"
+            );
+        }
+    }
+
+    /// 編集メニューを据える呼び出しが書かれていること。
+    ///
+    /// [`adapters::appmenu`] の検査は「メニューに貼り付けの項目がある」ことしか見ない。
+    /// 据える呼び出しが消えれば、その項目はどこにも存在しないまま全テストが通る。
+    ///
+    /// 主張は[字面の存在][`written_in_source`]までである。Cmd+V が実際にクリップボードを
+    /// 入れることは実アプリでしか確かめられない。
+    #[test]
+    fn the_application_menu_call_is_still_written_in_the_source() {
+        let needle = concat!("appmenu::", "install(&handle)");
+
+        assert!(
+            written_in_source(needle),
+            "{needle} が lib.rs から消えている。\
+             メニューが無ければ Cmd+V を含む編集の打鍵をアクションへ変える者がいない"
+        );
+    }
 
     /// I/O マトリクス「誤終了の抑止」— 利用者が明示的に求めていない終了は拒む。
     ///
