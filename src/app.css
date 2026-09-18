@@ -27,6 +27,16 @@ body {
   overflow: hidden;
 }
 
+/*
+  入力欄でだけ選択を戻す。解除しないと選択もカーソル移動も効かない。
+  面ごとに書かず一度だけ置くのは、面を足すたびに書き忘れうる規則だからである。
+*/
+input,
+textarea {
+  user-select: text;
+  -webkit-user-select: text;
+}
+
 #app {
   height: 100%;
 }
