@@ -37,7 +37,7 @@ use tauri::{AppHandle, Manager, Runtime, State};
 use crate::adapters::hotkey::HotkeyStatus;
 use crate::adapters::presentation;
 use crate::domain::state::{Core, CoreState};
-use crate::domain::task::{InterruptionNote, Step, StepId, Task};
+use crate::domain::task::{InterruptionNote, Step, StepId, Task, TaskId};
 
 /// コアが `manage` されていないときに示す理由。
 ///
@@ -181,8 +181,22 @@ fn snapshot_of(hotkey: HotkeyStatus, state: Option<&CoreState>) -> OverlaySnapsh
 /// # 見出しに**完了**の欄が無い
 ///
 /// **タスク**は**完了**の状態を持たない (用語集: **完了**は**ステップ**に対して宣言
-/// される)。変種を分けることで、見出しに意味の無い欄が生まれず、見出しが選択の対象に
-/// なりえないことも形として決まる。
+/// される)。変種を分けることで、見出しに意味の無い欄が生まれない。
+///
+/// # 見出しは常にすべて現れ、**ステップ**は一度に一つの**タスク**の分だけ現れる
+///
+/// 設計上の賭け #1 (一度に見せるのは次の一手だけ) に従い、**全部の**ステップ**が同時に
+/// 見えてはならない** (spec Boundaries)。並べる**ステップ**を選ぶのはこの射影であり、
+/// フロントの描画条件ではない — 描画側で濾す形にすると、線に乗った時点で全体像が既に
+/// 渡っており、「見えていないだけ」になる。
+///
+/// # **現在地**は、その**タスク**が閉じていても分かる
+///
+/// spec Boundaries は「**現在地**が指す行がどれか分かること」を無条件に求める。**ステップ**
+/// の行だけがそれを負うと、別の**タスク**を開いた瞬間に**現在地**がどこにも現れなくなる。
+/// 見出しの側が「この**タスク**の中にある」を負い、**ステップ**の行が「この行である」を
+/// 負う。どちらも**位置情報**であって進捗の可視化ではない — AD-15 が「第 N / 全 M」に
+/// ついて認めているのと同じ類である。**件数・総数・割合・色のいずれも運ばない。**
 ///
 /// # 件数・進捗率に由来する欄が一つも無い
 ///
@@ -192,11 +206,29 @@ fn snapshot_of(hotkey: HotkeyStatus, state: Option<&CoreState>) -> OverlaySnapsh
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 #[serde(tag = "kind", rename_all = "camelCase")]
 pub enum DisclosureRow {
-    /// **タスク**の見出し。**選べない** — 選べるのは**ステップ**だけである。
+    /// **タスク**の見出し。**タスク**が在る限り必ず現れる。
+    ///
+    /// 確定すると開く**タスク**がこれに移り、直前に開いていた**タスク**は閉じる。
+    /// **確定しても**現在地**は動かず、**切り替え履歴**も増えない** (spec Boundaries)。
     #[serde(rename_all = "camelCase")]
     Task {
+        /// 開く**タスク**を指定するときに送り返す ID ([`DisclosureRequest`])。
+        task_id: String,
         /// **タスク**の題名。
         title: String,
+        /// この**タスク**の**ステップ**が続いているか。
+        ///
+        /// **一覧で真になる見出しは高々一つである。** 開いた状態を積み上げられない
+        /// ことが、一覧が全体像へ戻らないための条件である (spec Boundaries)。
+        open: bool,
+        /// **現在地**がこの**タスク**の中にあるか。
+        ///
+        /// **[`DisclosureRow::Step::current`] と別の欄である。** あちらは「この行が
+        /// **現在地**である」、こちらは「**現在地**はこの**タスク**の中にある」。
+        /// **[`DisclosureRow::Task::open`] とも別である** — 閉じている**タスク**が
+        /// **現在地**を抱えていることこそ、この欄が要る理由である。一覧で真になる見出しは
+        /// 高々一つであり (CAP-6 / FR-6)、**未着手**のときは一つも無い。
+        holds_current_position: bool,
     },
     /// **ステップ**の行。
     #[serde(rename_all = "camelCase")]
@@ -210,6 +242,35 @@ pub enum DisclosureRow {
         /// **現在地**が指す行か。
         current: bool,
     },
+}
+
+/// `get_disclosure_surface` が受け取る要求。**これがコマンドの引数型そのものである。**
+///
+/// フロントは `invoke('get_disclosure_surface', { request: { openTaskId } })` と呼ぶ。
+/// [`SwitchRequest`] と同じ理由で名前付きの型として持つ — 平らな引数にすると、コマンドの
+/// 仮引数名が唯一の契約になり、Tauri を起動せずに検証できる型が一つも残らない。
+///
+/// # なぜ開いている**タスク**をフロントが送るのか
+///
+/// 開閉は揮発ビュー状態であり、所有者は Svelte である (AD-2 の表「開示面の開閉状態」)。
+/// **コアに新しい状態を足さない** — 足せば、閉じた時点で破棄されるはずのものが永続化の
+/// 対象になる。コアが決めるのは「`null` のとき何が開くか」だけであり、それは**現在地**
+/// から一意に定まる。
+///
+/// # なぜ知らない欄を拒むのか
+///
+/// 唯一の欄が `Option` であり、**綴りを取り違えても復元は成功する** — 欄が欠けたものと
+/// して `None` になり、見出しを確定しても黙って**現在地**の**タスク**が開き続ける。
+/// [`SelectStepRequest`] は必須の欄を持つため取り違えが `Err` として現れるが、こちらは
+/// 拒まない限りどこにも現れない。
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct DisclosureRequest {
+    /// **ステップ**を並べる**タスク**の ID。[`DisclosureRow::Task`] が運んだ文字列そのもの。
+    ///
+    /// `null` は**現在地**の**タスク**である — 面を開いた時点の形がこれであり、
+    /// **未着手**のときはどの**タスク**も開かない (spec Boundaries)。
+    pub open_task_id: Option<String>,
 }
 
 /// **開示面**が描画に必要とするすべて (CAP-9 / FR-19)。
@@ -245,7 +306,7 @@ pub struct DisclosureSurface {
 /// FR-19 は「**開示面**は**腐敗**した**タスク**を含まない」と定めるが、v1 に**腐敗**は
 /// 存在しないため濾すものが無く、条件は自明に満たされる。**CAP-20 を足す時点で、除外を
 /// 加える場所はここである。**
-fn disclosure_of(state: Option<&CoreState>) -> DisclosureSurface {
+fn disclosure_of(state: Option<&CoreState>, open_task_id: Option<&str>) -> DisclosureSurface {
     let Some(state) = state else {
         return DisclosureSurface {
             state_error: Some(CORE_MISSING.to_string()),
@@ -255,11 +316,24 @@ fn disclosure_of(state: Option<&CoreState>) -> DisclosureSurface {
 
     // **現在地**は一度だけ読む。行ごとに引き直すと、行の間で値が変わりうる形になる。
     let current = state.current_position().step_id();
+    // **現在地**を抱える**タスク**も同じく一度だけ読む。閉じていても見出しがそれを示す。
+    let here = task_of_current_position(state);
+    // **開く**タスク**も一度だけ決める。** 高々一つしか真になりえないことを、この
+    // 一つの値が構造として負う。
+    let open = task_to_open(state, open_task_id);
     let mut rows = Vec::new();
     for task in state.tasks() {
+        // **見出しは常にすべて並ぶ。** 隠れるのは**ステップ**だけである。
+        let opened = open == Some(task.id());
         rows.push(DisclosureRow::Task {
+            task_id: task.id().to_string(),
             title: task.title().to_string(),
+            open: opened,
+            holds_current_position: here == Some(task.id()),
         });
+        if !opened {
+            continue;
+        }
         for step in task.steps() {
             rows.push(DisclosureRow::Step {
                 step_id: step.id().to_string(),
@@ -276,6 +350,33 @@ fn disclosure_of(state: Option<&CoreState>) -> DisclosureSurface {
         state_error: None,
         rows,
     }
+}
+
+/// **どの**タスク**の**ステップ**を並べるか決める純粋関数** (spec Boundaries)。
+///
+/// `requested` が `None` のときは**現在地**の**タスク**である — 面を開いた時点の形が
+/// これであり、**未着手**には開く**タスク**が無い。
+///
+/// # 読めない ID・消えた ID はどの**タスク**も開かない
+///
+/// フロントが送るのは直前に描いた見出しの ID だけであり、一致しないのは一覧と実際の状態が
+/// 食い違ったときに限られる。**そのとき別の**タスク**を勝手に開かない** — 確定した見出しと
+/// 違うものが開けば、次の Enter が見ていない**ステップ**へ**現在地**を移す。理由を返さない
+/// のは、開閉が表示の状態にすぎず、何も書かれていないためである。
+fn task_to_open(state: &CoreState, requested: Option<&str>) -> Option<TaskId> {
+    let Some(requested) = requested else {
+        return task_of_current_position(state);
+    };
+    state.task(TaskId::parse(requested).ok()?).map(Task::id)
+}
+
+/// **現在地**を抱える**タスク** (CAP-6 / FR-6)。**未着手**なら `None`。
+///
+/// 面を開いた時点で開く**タスク**であり、閉じているときに見出しが示す**タスク**でもある。
+/// **一つの読み方を二箇所に書かない** — 食い違えば、開いていない**タスク**に印が付く。
+fn task_of_current_position(state: &CoreState) -> Option<TaskId> {
+    let here = state.current_position().step_id()?;
+    Some(state.task_of_step(here)?.id())
 }
 
 /// `switch_current_position` が受け取る要求。**これがコマンドの引数型そのものである。**
@@ -626,6 +727,9 @@ pub fn create_task<R: Runtime>(
 /// **開示面**が表示されるたびに呼ばれ、一覧の完全なスナップショットを返す
 /// (CAP-9 / FR-19 / AD-3 鮮度規則)。
 ///
+/// 見出しを確定したときも同じ経路を通る。**開く**タスク**が変わっただけで一覧を作り直す**
+/// — 描画側に濾させると、線に乗った時点で全体像が既に渡っていることになる。
+///
 /// **コアが読めなくても失敗しない。** 面は開き、理由を [`DisclosureSurface::state_error`]
 /// として運ぶ (I/O マトリクス「コア不在」)。失敗させると、開いた面が空白のまま出る。
 ///
@@ -635,9 +739,12 @@ pub fn create_task<R: Runtime>(
 /// 初期表示のために毎回取得される値の中に全体像が入り、**隠れている間持ち越さない**
 /// という FR-19 の条件を保つ場所が無くなる。取得の契機が違うものは別のコマンドにする。
 #[tauri::command]
-pub fn get_disclosure_surface<R: Runtime>(app: AppHandle<R>) -> DisclosureSurface {
+pub fn get_disclosure_surface<R: Runtime>(
+    app: AppHandle<R>,
+    request: DisclosureRequest,
+) -> DisclosureSurface {
     let state = app.try_state::<Core>().map(|core| core.snapshot());
-    disclosure_of(state.as_ref())
+    disclosure_of(state.as_ref(), request.open_task_id.as_deref())
 }
 
 /// **開示面**で選んだ**ステップ**へ**現在地**を移す (CAP-9 / FR-19)。
@@ -1320,37 +1427,79 @@ mod tests {
         state.tasks()[task].steps()[step].id().to_string()
     }
 
-    /// 受け入れ条件「2 タスク・計 5 ステップ → 見出しと 5 行が現れ、現在地の行がそれと
-    /// 分かる」。
+    /// 見出しの ID も同じ理由でコア状態から直に読む。**全見出しが同じ ID を運んでいれば、
+    /// どの見出しを確定しても同じ**タスク**が開く。**
+    fn task_id_in(state: &CoreState, task: usize) -> String {
+        state.tasks()[task].id().to_string()
+    }
+
+    /// 開いている見出しの題名。**高々一つであることを併せて確かめる** (spec Boundaries)。
+    fn opened_heading(surface: &DisclosureSurface) -> Option<String> {
+        let mut open = surface.rows.iter().filter_map(|row| match row {
+            DisclosureRow::Task {
+                title, open: true, ..
+            } => Some(title.clone()),
+            _ => None,
+        });
+        let first = open.next();
+        assert_eq!(open.next(), None, "開いている見出しは高々一つである");
+        first
+    }
+
+    /// **現在地**を抱えると示している見出しの題名。**高々一つであることを併せて
+    /// 確かめる** (CAP-6 / FR-6)。
+    fn heading_with_the_current_position(surface: &DisclosureSurface) -> Option<String> {
+        let mut marked = surface.rows.iter().filter_map(|row| match row {
+            DisclosureRow::Task {
+                title,
+                holds_current_position: true,
+                ..
+            } => Some(title.clone()),
+            _ => None,
+        });
+        let first = marked.next();
+        assert_eq!(marked.next(), None, "現在地を抱える見出しは高々一つである");
+        first
+    }
+
+    /// 一覧に現れる**ステップ**の内容。
+    fn listed_steps(surface: &DisclosureSurface) -> Vec<String> {
+        surface
+            .rows
+            .iter()
+            .filter_map(|row| match row {
+                DisclosureRow::Step { content, .. } => Some(content.clone()),
+                DisclosureRow::Task { .. } => None,
+            })
+            .collect()
+    }
+
+    /// 受け入れ条件「面へ入る → 見出しは 2 件とも現れるが、**ステップ**は**現在地**の
+    /// **タスク**の分だけが現れる」。
     ///
     /// **見出しと**ステップ**が一つの流れになっていること**を、並びそのもので見る。
+    /// 開くのは**現在地**の**タスク**であり、もう一方の**ステップ**は一行も現れない。
     #[test]
-    fn two_tasks_project_as_one_stream_of_headings_and_steps() {
+    fn only_the_task_at_the_current_position_opens_its_steps() {
         let state = a_state_with_two_tasks_and_five_steps();
 
-        let surface = disclosure_of(Some(&state));
+        let surface = disclosure_of(Some(&state), None);
 
         assert_eq!(surface.state_error, None);
         assert_eq!(
             surface.rows,
             vec![
                 DisclosureRow::Task {
-                    title: "原稿".to_string()
-                },
-                DisclosureRow::Step {
-                    step_id: step_id_in(&state, 0, 0),
-                    content: "構成を決める".to_string(),
-                    completed: false,
-                    current: false,
-                },
-                DisclosureRow::Step {
-                    step_id: step_id_in(&state, 0, 1),
-                    content: "下書きを書く".to_string(),
-                    completed: true,
-                    current: false,
+                    task_id: task_id_in(&state, 0),
+                    title: "原稿".to_string(),
+                    open: false,
+                    holds_current_position: false,
                 },
                 DisclosureRow::Task {
-                    title: "買い物".to_string()
+                    task_id: task_id_in(&state, 1),
+                    title: "買い物".to_string(),
+                    open: true,
+                    holds_current_position: true,
                 },
                 DisclosureRow::Step {
                     step_id: step_id_in(&state, 1, 0),
@@ -1371,17 +1520,102 @@ mod tests {
                     current: true,
                 },
             ],
-            "見出し 2 行と ステップ 5 行が、タスクごとにまとまった一つの流れで並ぶ"
+            "見出しは 2 件とも現れ、ステップは開いた 1 タスクの分だけが続く"
         );
+    }
+
+    /// 見出しを確定した**タスク**が開き、**直前に開いていた**タスク**は閉じる**
+    /// (spec Boundaries / I/O マトリクス「見出しを確定する」)。
+    ///
+    /// **開いた状態を積み上げられないことが、一覧が全体像へ戻らないための条件である。**
+    /// 開けるのが一つだけであることを、内容そのもので見る — 5 件が同時に並んだ時点で
+    /// 設計上の賭け #1 が破れている。
+    #[test]
+    fn opening_a_heading_closes_the_one_that_was_open() {
+        let state = a_state_with_two_tasks_and_five_steps();
+
+        let surface = disclosure_of(Some(&state), Some(&task_id_in(&state, 0)));
+
+        assert_eq!(opened_heading(&surface).as_deref(), Some("原稿"));
+        assert_eq!(
+            listed_steps(&surface),
+            vec!["構成を決める".to_string(), "下書きを書く".to_string()],
+            "開いたタスクのステップだけが並ぶ"
+        );
+        assert_eq!(
+            surface
+                .rows
+                .iter()
+                .filter(|row| matches!(row, DisclosureRow::Task { .. }))
+                .count(),
+            2,
+            "見出しは閉じたタスクの分も含めてすべて現れる"
+        );
+    }
+
+    /// **見出しの確定は**現在地**を動かさない** (spec Boundaries)。
+    ///
+    /// 射影は状態を変えない純粋関数であり、開く**タスク**を変えても**現在地**の印は
+    /// 開いた**タスク**の中にしか現れない。閉じた**タスク**にある**現在地**は、行ごと
+    /// 一覧から消えるだけである。
+    #[test]
+    fn opening_a_heading_leaves_the_current_position_where_it_was() {
+        let state = a_state_with_two_tasks_and_five_steps();
+
+        let elsewhere = disclosure_of(Some(&state), Some(&task_id_in(&state, 0)));
+
+        assert_eq!(
+            elsewhere
+                .rows
+                .iter()
+                .filter(|row| matches!(row, DisclosureRow::Step { current: true, .. }))
+                .count(),
+            0,
+            "現在地のステップは閉じたタスクの中にあり、行が存在しない"
+        );
+        // **同じ状態から作り直せば、現在地は元の場所にある。** 開閉は表示の状態に
+        // すぎず、コアに何も書いていない。
+        let here = disclosure_of(Some(&state), Some(&task_id_in(&state, 1)));
+        let DisclosureRow::Step { step_id, .. } = here
+            .rows
+            .iter()
+            .find(|row| matches!(row, DisclosureRow::Step { current: true, .. }))
+            .expect("現在地の行がある")
+        else {
+            unreachable!()
+        };
+        assert_eq!(*step_id, step_id_in(&state, 1, 2));
+    }
+
+    /// 読めない ID・どの**タスク**にも一致しない ID は、どれも開かない。
+    ///
+    /// **勝手に別の**タスク**を開かない。** 確定した見出しと違うものが開けば、次の Enter が
+    /// 見ていない**ステップ**へ**現在地**を移す。
+    #[test]
+    fn an_unknown_open_task_leaves_every_task_closed() {
+        let state = a_state_with_two_tasks_and_five_steps();
+
+        for requested in ["not-a-uuid", "", "0198f0e0-0000-7000-8000-00000000ffff"] {
+            let surface = disclosure_of(Some(&state), Some(requested));
+
+            assert_eq!(opened_heading(&surface), None, "要求: {requested}");
+            assert!(listed_steps(&surface).is_empty(), "要求: {requested}");
+            assert_eq!(
+                surface.rows.len(),
+                2,
+                "見出しは 2 件とも残る (要求: {requested})"
+            );
+        }
     }
 
     /// 行ごとの ID は別物である。**同じ ID を配ってしまえば、どの行を選んでも同じ
     /// ステップへ移る。**
     #[test]
     fn every_listed_step_carries_its_own_id() {
-        let surface = disclosure_of(Some(&a_state_with_two_tasks_and_five_steps()));
+        let state = a_state_with_two_tasks_and_five_steps();
+        let surface = disclosure_of(Some(&state), Some(&task_id_in(&state, 1)));
 
-        let mut ids: Vec<String> = surface
+        let ids: Vec<String> = surface
             .rows
             .iter()
             .filter_map(|row| match row {
@@ -1389,10 +1623,33 @@ mod tests {
                 DisclosureRow::Task { .. } => None,
             })
             .collect();
-        assert_eq!(ids.len(), 5);
-        ids.sort();
-        ids.dedup();
-        assert_eq!(ids.len(), 5, "5 行が 5 つの異なる ID を運ぶ");
+        assert_eq!(
+            ids,
+            vec![
+                step_id_in(&state, 1, 0),
+                step_id_in(&state, 1, 1),
+                step_id_in(&state, 1, 2),
+            ],
+            "3 行が、コアが持つ 3 つのステップをそれぞれ指す"
+        );
+    }
+
+    /// 見出しごとの ID も別物である。**同じ ID を配ってしまえば、どの見出しを確定しても
+    /// 同じ**タスク**が開く。**
+    #[test]
+    fn every_heading_carries_its_own_id() {
+        let state = a_state_with_two_tasks_and_five_steps();
+        let surface = disclosure_of(Some(&state), None);
+
+        let ids: Vec<String> = surface
+            .rows
+            .iter()
+            .filter_map(|row| match row {
+                DisclosureRow::Task { task_id, .. } => Some(task_id.clone()),
+                DisclosureRow::Step { .. } => None,
+            })
+            .collect();
+        assert_eq!(ids, vec![task_id_in(&state, 0), task_id_in(&state, 1)]);
     }
 
     /// **現在地**の行はちょうど一つである (CAP-6 / FR-6)。
@@ -1400,7 +1657,7 @@ mod tests {
     /// 集合として持たない**現在地**が、射影で二つに増えないことを見る。
     #[test]
     fn exactly_one_row_is_marked_as_the_current_position() {
-        let surface = disclosure_of(Some(&a_state_with_two_tasks_and_five_steps()));
+        let surface = disclosure_of(Some(&a_state_with_two_tasks_and_five_steps()), None);
 
         let marked = surface
             .rows
@@ -1408,6 +1665,85 @@ mod tests {
             .filter(|row| matches!(row, DisclosureRow::Step { current: true, .. }))
             .count();
         assert_eq!(marked, 1);
+    }
+
+    /// **現在地**は、その**タスク**が閉じていても分かる (spec Boundaries)。
+    ///
+    /// **この検査が無いと、別の**タスク**を開いた瞬間に**現在地**がどこにも現れなくなる**
+    /// — 凍結節が無条件に求めている「現在地が指す行がどれか分かること」が、一覧の形を
+    /// 変えたことで静かに破れる。
+    #[test]
+    fn a_closed_task_still_shows_that_it_holds_the_current_position() {
+        let state = a_state_with_two_tasks_and_five_steps();
+
+        // **現在地**は第 2 タスクにあり、開いているのは第 1 タスクである。
+        let surface = disclosure_of(Some(&state), Some(&task_id_in(&state, 0)));
+
+        assert_eq!(opened_heading(&surface).as_deref(), Some("原稿"));
+        assert!(
+            !surface
+                .rows
+                .iter()
+                .any(|row| matches!(row, DisclosureRow::Step { current: true, .. })),
+            "現在地のステップは閉じたタスクの中にあり、行が存在しない"
+        );
+        assert_eq!(
+            heading_with_the_current_position(&surface).as_deref(),
+            Some("買い物"),
+            "閉じていても、現在地を抱える見出しがそれと分かる"
+        );
+    }
+
+    /// 開いている**タスク**が**現在地**を抱えているときも、印は見出しに付く。
+    ///
+    /// **開閉と取り違えていないことを見る。** `open` をそのまま返す実装にすると、開いた
+    /// だけの**タスク**に現在地の印が付き、閉じた**現在地**からは消える。
+    #[test]
+    fn the_marker_follows_the_current_position_and_not_the_open_task() {
+        let state = a_state_with_two_tasks_and_five_steps();
+
+        let here = disclosure_of(Some(&state), None);
+        assert_eq!(opened_heading(&here).as_deref(), Some("買い物"));
+        assert_eq!(
+            heading_with_the_current_position(&here).as_deref(),
+            Some("買い物")
+        );
+
+        let elsewhere = disclosure_of(Some(&state), Some(&task_id_in(&state, 0)));
+        assert_eq!(opened_heading(&elsewhere).as_deref(), Some("原稿"));
+        assert_eq!(
+            heading_with_the_current_position(&elsewhere).as_deref(),
+            Some("買い物"),
+            "開くタスクを変えても、印は現在地のあるタスクに留まる"
+        );
+    }
+
+    /// **未着手**では、どの見出しにも印が付かない。
+    ///
+    /// **無い現在地を描かない。** 付ければ、まだ始めていないことが「ここにいる」として
+    /// 静かに描かれる。
+    #[test]
+    fn a_not_started_position_marks_no_heading() {
+        let core = Core::restore(
+            Box::new(FixedClock::at(1_789_000_000_000)),
+            Box::new(AcceptingStorage),
+        )
+        .expect("空の状態は復元できる");
+        core.create_task("着手せずに書き留めた", contents(&["一", "二"]))
+            .expect("作れる");
+        let task = core
+            .create_task("こちらも書き留めただけ", contents(&["三"]))
+            .expect("作れる");
+
+        for requested in [None, Some(task.to_string())] {
+            let surface = disclosure_of(Some(&core.snapshot()), requested.as_deref());
+
+            assert_eq!(
+                heading_with_the_current_position(&surface),
+                None,
+                "未着手にはどの見出しにも印が付かない"
+            );
+        }
     }
 
     /// **未着手**でも一覧は出る。**現在地**の行が無いだけである。
@@ -1424,9 +1760,14 @@ mod tests {
         core.create_task("着手せずに書き留めた", contents(&["一", "二"]))
             .expect("作れる");
 
-        let surface = disclosure_of(Some(&core.snapshot()));
+        let surface = disclosure_of(Some(&core.snapshot()), None);
 
-        assert_eq!(surface.rows.len(), 3, "見出し 1 行 + ステップ 2 行");
+        assert_eq!(surface.rows.len(), 1, "見出し 1 行だけである");
+        assert_eq!(
+            opened_heading(&surface),
+            None,
+            "未着手のときはどのタスクも開いていない (I/O マトリクス「未着手で開く」)"
+        );
         assert!(
             !surface
                 .rows
@@ -1436,13 +1777,66 @@ mod tests {
         );
     }
 
+    /// **未着手**でも見出しを確定すればその**タスク**が開く。
+    ///
+    /// ここが開かないと、着手せずに作った**タスク**へ到達する経路が消える — 本スライスが
+    /// 解消しようとしている穴そのものが残る。
+    #[test]
+    fn a_not_started_position_can_still_open_a_heading() {
+        let core = Core::restore(
+            Box::new(FixedClock::at(1_789_000_000_000)),
+            Box::new(AcceptingStorage),
+        )
+        .expect("空の状態は復元できる");
+        let task = core
+            .create_task("着手せずに書き留めた", contents(&["一", "二"]))
+            .expect("作れる");
+
+        let surface = disclosure_of(Some(&core.snapshot()), Some(&task.to_string()));
+
+        assert_eq!(
+            opened_heading(&surface).as_deref(),
+            Some("着手せずに書き留めた")
+        );
+        assert_eq!(
+            listed_steps(&surface),
+            vec!["一".to_string(), "二".to_string()]
+        );
+    }
+
+    /// **`None` は**現在地**の**タスク**、それ以外はその**タスク**である** (純粋関数)。
+    ///
+    /// 開く**タスク**の決め方をコマンドに埋め込んだままでは、`None` の意味を取り違えても
+    /// 生きた Tauri アプリを起動しない限り誰も気づかない。
+    #[test]
+    fn the_open_task_defaults_to_the_one_holding_the_current_position() {
+        let state = a_state_with_two_tasks_and_five_steps();
+
+        assert_eq!(
+            task_to_open(&state, None),
+            Some(state.tasks()[1].id()),
+            "面を開いた時点で開くのは現在地のタスクである"
+        );
+        assert_eq!(
+            task_to_open(&state, Some(&task_id_in(&state, 0))),
+            Some(state.tasks()[0].id()),
+            "指定があればそのタスクである"
+        );
+        assert_eq!(task_to_open(&state, Some("not-a-uuid")), None);
+        assert_eq!(
+            task_to_open(&CoreState::default(), None),
+            None,
+            "未着手にはどのタスクも開かない"
+        );
+    }
+
     /// I/O マトリクス「タスクが無い」— 空の一覧であり、理由は付かない。
     ///
     /// **「読めていない」と「1 個も無い」を区別する。** フロントはこの違いで出す 1 行を
     /// 決める。
     #[test]
     fn an_empty_store_projects_as_an_empty_list_without_a_reason() {
-        let surface = disclosure_of(Some(&CoreState::default()));
+        let surface = disclosure_of(Some(&CoreState::default()), None);
 
         assert_eq!(surface.state_error, None, "読めてはいる");
         assert!(surface.rows.is_empty());
@@ -1451,7 +1845,7 @@ mod tests {
     /// I/O マトリクス「コア不在」— 面は開き、理由を運ぶ。一覧は空である。
     #[test]
     fn a_missing_core_opens_the_surface_with_a_reason() {
-        let surface = disclosure_of(None);
+        let surface = disclosure_of(None, None);
 
         assert_eq!(surface.state_error.as_deref(), Some(CORE_MISSING));
         assert!(surface.rows.is_empty(), "描く一覧は無い");
@@ -1475,7 +1869,10 @@ mod tests {
         core.set_interruption_note(first, Some(InterruptionNote::new("接続詞を整える途中")))
             .expect("メモを置ける");
 
-        let surface = disclosure_of(Some(&core.snapshot()));
+        // **タスク**を開いて**ステップ**の行を実際に並べる。閉じたままでは行が一つも
+        // 無く、本文が現れないことが何も意味しない。
+        let surface = disclosure_of(Some(&core.snapshot()), Some(&task_id.to_string()));
+        assert_eq!(listed_steps(&surface).len(), 2, "ステップの行が並んでいる");
         let json = serde_json::to_string(&surface).expect("直列化できる");
 
         assert!(
@@ -1520,7 +1917,10 @@ mod tests {
     #[test]
     fn the_disclosure_rows_keep_their_wire_contract() {
         let heading = serde_json::to_value(DisclosureRow::Task {
+            task_id: "0198f0e0-0000-7000-8000-000000000000".to_string(),
             title: "原稿".to_string(),
+            open: false,
+            holds_current_position: true,
         })
         .expect("直列化できる");
         assert_eq!(
@@ -1529,10 +1929,16 @@ mod tests {
                 .expect("オブジェクトである")
                 .keys()
                 .collect::<Vec<&String>>(),
-            vec!["kind", "title"],
-            "見出しは題名だけを運ぶ"
+            vec!["holdsCurrentPosition", "kind", "open", "taskId", "title"],
+            "見出しは題名・ID・開閉・現在地の有無だけを運ぶ。完了も件数も持たない"
         );
         assert_eq!(heading["kind"], "task");
+        assert!(heading["open"].is_boolean());
+        assert!(heading["taskId"].is_string());
+        // **開閉とは別の欄である。** 一つにまとめると、閉じたタスクが現在地を抱えて
+        // いることを表せない — この欄が要る理由そのものが消える。
+        assert!(heading["holdsCurrentPosition"].is_boolean());
+        assert_ne!(heading["holdsCurrentPosition"], heading["open"]);
 
         let step = serde_json::to_value(DisclosureRow::Step {
             step_id: "0198f0e0-0000-7000-8000-000000000000".to_string(),
@@ -1561,12 +1967,12 @@ mod tests {
     #[test]
     fn a_listed_step_id_round_trips_back_into_the_domain() {
         let state = a_state_with_two_tasks_and_five_steps();
-        let surface = disclosure_of(Some(&state));
+        let surface = disclosure_of(Some(&state), None);
         let DisclosureRow::Step {
             step_id: listed, ..
-        } = &surface.rows[6]
+        } = &surface.rows[4]
         else {
-            panic!("7 行目はステップの行である")
+            panic!("5 行目はステップの行である (見出し 2 行 + 開いたタスクの 3 ステップ)")
         };
 
         let parsed = step_to_select(listed).expect("一覧が運んだ ID はそのまま読み戻せる");
@@ -1576,6 +1982,60 @@ mod tests {
             parsed,
             state.tasks()[1].steps()[2].id(),
             "読み戻した ID はコアが持つステップそのものを指す"
+        );
+    }
+
+    /// **一覧の要求も TS → Rust の契約である。** 綴りを変えると、見出しの確定が
+    /// 毎回引数の復元で落ちる。
+    #[test]
+    fn the_disclosure_request_keeps_its_wire_contract() {
+        let opened: DisclosureRequest =
+            serde_json::from_str(r#"{"openTaskId":"0198f0e0-0000-7000-8000-000000000000"}"#)
+                .expect("フロントが送る形で復元できる");
+        assert_eq!(
+            opened,
+            DisclosureRequest {
+                open_task_id: Some("0198f0e0-0000-7000-8000-000000000000".to_string()),
+            }
+        );
+
+        // 面を開いた時点の要求。`null` は**現在地**のタスクである。
+        let initial: DisclosureRequest =
+            serde_json::from_str(r#"{"openTaskId":null}"#).expect("復元できる");
+        assert_eq!(initial.open_task_id, None);
+
+        // 欄が無い要求も `null` と同じである。
+        let empty: DisclosureRequest = serde_json::from_str("{}").expect("復元できる");
+        assert_eq!(empty.open_task_id, None);
+
+        // **受け付ける綴りは camelCase の一つだけである。** 唯一の欄が `Option` である
+        // 以上、知らない欄を拒まなければ綴りの取り違えがどこにも現れない — 見出しを
+        // 確定しても黙って現在地のタスクが開き続ける。
+        assert!(serde_json::from_str::<DisclosureRequest>(
+            r#"{"open_task_id":"0198f0e0-0000-7000-8000-000000000000"}"#
+        )
+        .is_err());
+    }
+
+    /// 見出しが運んだ ID は、そのまま送り返せば同じ**タスク**を開く。
+    ///
+    /// **期待値はコア状態から読む。** 射影の戻り値だけで閉じると、全見出しが同じ ID を
+    /// 運んでいても通る。
+    #[test]
+    fn a_listed_task_id_round_trips_back_into_the_open_task() {
+        let state = a_state_with_two_tasks_and_five_steps();
+        let surface = disclosure_of(Some(&state), None);
+        let DisclosureRow::Task { task_id, .. } = &surface.rows[0] else {
+            panic!("1 行目は見出しである")
+        };
+        assert_eq!(*task_id, task_id_in(&state, 0), "運ばれた ID は第 1 タスク");
+
+        let opened = disclosure_of(Some(&state), Some(task_id));
+
+        assert_eq!(opened_heading(&opened).as_deref(), Some("原稿"));
+        assert_eq!(
+            listed_steps(&opened),
+            vec!["構成を決める".to_string(), "下書きを書く".to_string()]
         );
     }
 

@@ -48,10 +48,19 @@
   }
 
   // src-tauri/src/commands/mod.rs の `DisclosureRow` と 1:1。**内部タグ付きである** —
-  // `kind` が見出しと行を分ける。見出しに完了の欄が無いのも、選べるのがステップだけで
-  // あるのも、この形そのものが決めている。
+  // `kind` が見出しと行を分ける。見出しに完了の欄が無いのも、確定の意味が二つに分かれる
+  // のも、この形そのものが決めている。
+  //
+  // **見出しの確定はそのタスクを開くだけであり、現在地を動かさない。** ステップの確定
+  // だけが現在地を移す。
   type DisclosureRow =
-    | { kind: 'task'; title: string }
+    | {
+        kind: 'task'
+        taskId: string
+        title: string
+        open: boolean
+        holdsCurrentPosition: boolean
+      }
     | { kind: 'step'; stepId: string; content: string; completed: boolean; current: boolean }
 
   // src-tauri/src/commands/mod.rs の `DisclosureSurface` と 1:1。
@@ -59,6 +68,15 @@
   type DisclosureSurface = {
     stateError: string | null
     rows: DisclosureRow[]
+  }
+
+  // src-tauri/src/commands/mod.rs の `DisclosureRequest` と 1:1。
+  //
+  // **ステップを並べるタスクは一つだけである。** `null` は「現在地のタスク」であり、
+  // 面を開いた時点の形がこれである。濾すのは射影の側であり、ここではない — 描画側で
+  // 濾すと、線に乗った時点で全体像が既に渡っていることになる。
+  type DisclosureRequest = {
+    openTaskId: string | null
   }
 
   // src-tauri/src/commands/mod.rs の `SelectStepRequest` / `SelectStepOutcome` と 1:1。
@@ -136,13 +154,29 @@
    * 現れず、明示的な打鍵 (⌘L) を最低 1 回経てのみ到達する (FR-2 / AD-15)。Esc・
    * フォーカス喪失・選択の確定で破棄され、次回の呼び出しは初期表示である。
    *
-   * **AD-2 の表に新しい行は要らない。** 開閉状態は表の「開示面の開閉状態」、`rows` は
-   * スナップショットの写し (`stepContent` らと同じ)、`selectedStepId` は表の
-   * 「フォーカス」に収まる。どれもドメインの真実ではない。
+   * **AD-2 の表に新しい行は要らない。** 開閉状態 (`disclosing` と `openTaskId`) は表の
+   * 「開示面の開閉状態」、`rows` はスナップショットの写し (`stepContent` らと同じ)、
+   * `selectedRowKey` は表の「フォーカス」に収まる。どれもドメインの真実ではない。
    */
   let disclosing = $state(false)
   let rows = $state<DisclosureRow[]>([])
-  let selectedStepId = $state<string | null>(null)
+  /**
+   * ステップを並べているタスク — 揮発ビュー状態 (AD-2 の表「開示面の開閉状態」)。
+   *
+   * **`null` は「現在地のタスク」である。** 面を開いた時点はこれであり、未着手なら
+   * どのタスクも開かない。見出しを確定すると、ここがそのタスクへ移る — **一つしか
+   * 持てない形が、開いた状態を積み上げられないことそのものである** (spec Boundaries)。
+   * 現在地は動かず、切り替え履歴も増えない。
+   */
+  let openTaskId = $state<string | null>(null)
+  /**
+   * 入力位置がある行の鍵。**見出しも行である** — 選べるのがステップだけではなくなった。
+   *
+   * `task:<id>` と `step:<id>` で綴りを分けるのは、ID の集合が交わらないことに寄りかから
+   * ないためである。寄りかかれば、同じ文字列の見出しとステップが並んだときに確定の
+   * 意味が入れ替わる。
+   */
+  let selectedRowKey = $state<string | null>(null)
   // **取得の失敗と移動の失敗を一つの変数にまとめない。** まとめると、どちらの文面を
   // 出すかが分岐に紛れ、移動に失敗したときに「一覧を取得できなかった」と述べうる。
   let disclosureError = $state<string | null>(null)
@@ -167,8 +201,16 @@
    */
   let selected = $state<{ moved: boolean } | null>(null)
 
-  /** 一覧のうち選べる行 — 見出しは選べない。↑↓ はこの並びの上を動く。 */
-  const stepIds = $derived(rows.flatMap((row) => (row.kind === 'step' ? [row.stepId] : [])))
+  /** 行を一意に指す鍵。見出しとステップで綴りを分ける。 */
+  function rowKey(row: DisclosureRow): string {
+    return row.kind === 'task' ? `task:${row.taskId}` : `step:${row.stepId}`
+  }
+
+  /** 一覧の全行 — **見出しも含む**。↑↓ はこの並びの上を動く。 */
+  const rowKeys = $derived(rows.map(rowKey))
+
+  /** 入力位置がある行そのもの。Enter の意味はこの行の種類で決まる。 */
+  const selectedRow = $derived(rows.find((row) => rowKey(row) === selectedRowKey) ?? null)
 
   /**
    * 直近の作成の結末。**作成が確定したことを述べる唯一の手がかりである。**
@@ -230,7 +272,7 @@
    */
   function forgetRows(): void {
     rows = []
-    selectedStepId = null
+    selectedRowKey = null
   }
 
   // AD-3 (鮮度): 隠れている間に受け取ったイベントに依存せず、表示されるたびに
@@ -352,6 +394,8 @@
   function discardDisclosure(): void {
     disclosing = false
     forgetRows()
+    // 開いていたタスクも持ち越さない。次回の呼び出しで開くのは現在地のタスクである。
+    openTaskId = null
     disclosureError = null
     selectError = null
     // 飛んでいる取り直しの応答を無効にする。着いた頃にはこの面は無い。
@@ -371,10 +415,19 @@
     // 書き戻しは、捨てたはずの行を次の呼び出しへ持ち越す。`stateError` は既定表示と
     // 共有しているため、遅れた応答がそちらの表示まで書き換えうる。
     const isCurrent = (): boolean => request === disclosureRequest && disclosing
+    // **開くタスクは要求として送る。** 全部を受け取って描画側で濾す形にすると、線に
+    // 乗った時点で全体像が既に渡っており、「見えていないだけ」になる。
+    const payload: DisclosureRequest = { openTaskId }
     try {
-      const surface = await invoke<DisclosureSurface>('get_disclosure_surface')
+      const surface = await invoke<DisclosureSurface>('get_disclosure_surface', {
+        request: payload,
+      })
       if (!isCurrent()) return
       rows = surface.rows
+      // **開いたタスクは戻り値から読み直す。** `null` で頼んだときに何が開いたのかを
+      // 知っているのはコアだけであり、以降の取り直しはその答えを保つ必要がある —
+      // 保たなければ、現在地が動いた報せのたびに開いていたタスクが別のものへ移る。
+      openTaskId = openTaskIn(surface.rows)
       // 既定表示と同じ事実であり、同じ一つの変数が持つ。二つに分ければ、同じ「読めて
       // いない」が面によって出たり出なかったりする。
       stateError = surface.stateError
@@ -393,10 +446,18 @@
     await focusSelectedRow()
   }
 
-  /** **現在地**が指す行。一覧に無ければ `null`。 */
-  function stepAtCurrentPosition(): string | null {
+  /** 一覧で実際に開いている**タスク**。どれも開いていなければ `null`。 */
+  function openTaskIn(listed: DisclosureRow[]): string | null {
+    for (const row of listed) {
+      if (row.kind === 'task' && row.open) return row.taskId
+    }
+    return null
+  }
+
+  /** **現在地**が指す行の鍵。一覧に無ければ (閉じた**タスク**の中なら) `null`。 */
+  function keyAtCurrentPosition(): string | null {
     for (const row of rows) {
-      if (row.kind === 'step' && row.current) return row.stepId
+      if (row.kind === 'step' && row.current) return rowKey(row)
     }
     return null
   }
@@ -408,8 +469,10 @@
    * 失ったまま残すと、Enter が何も起こさない状態になる。
    */
   function keepSelectionOnAnExistingRow(): void {
-    if (selectedStepId !== null && stepIds.includes(selectedStepId)) return
-    selectedStepId = stepAtCurrentPosition() ?? stepIds[0] ?? null
+    if (selectedRowKey !== null && rowKeys.includes(selectedRowKey)) return
+    // **現在地**の行が見えていればそこへ。見えていなければ (どのタスクも開いていない
+    // ときを含む) 先頭の見出しへ置く。
+    selectedRowKey = keyAtCurrentPosition() ?? rowKeys[0] ?? null
   }
 
   /**
@@ -420,11 +483,11 @@
    */
   async function focusSelectedRow(): Promise<void> {
     await tick()
-    if (!listElement || selectedStepId === null) return
-    // **ID をセレクタへ埋め込まない。** 引用符や逆斜線を含む値が来れば
+    if (!listElement || selectedRowKey === null) return
+    // **鍵をセレクタへ埋め込まない。** 引用符や逆斜線を含む値が来れば
     // `querySelector` は投げ、ここは try の外であるため未処理の rejection になる。
-    const row = [...listElement.querySelectorAll<HTMLElement>('.step-row')].find(
-      (candidate) => candidate.dataset.stepId === selectedStepId,
+    const row = [...listElement.querySelectorAll<HTMLElement>('[data-row-key]')].find(
+      (candidate) => candidate.dataset.rowKey === selectedRowKey,
     )
     if (!row) return
     row.focus()
@@ -441,6 +504,9 @@
     if (disclosing) return
     dismissNotices()
     disclosing = true
+    // **面を開いた時点で開いているのは現在地のタスクである** (spec Boundaries)。
+    // どれを開くかを決めるのはコアであり、未着手ならどれも開かない。
+    openTaskId = null
     await refreshDisclosure()
   }
 
@@ -464,13 +530,14 @@
 
   /**
    * 隣の行へ入力位置を移す。**端では留まる** — 回り込ませると、一覧のどこにいるのかが
-   * 分からなくなる。見出しは選べないため読み飛ばす。
+   * 分からなくなる。**見出しも止まる行である** — 読み飛ばすと、閉じている**タスク**を
+   * 開く手段が無くなる。
    */
   async function moveSelection(offset: 1 | -1): Promise<void> {
-    if (stepIds.length === 0) return
-    const at = selectedStepId === null ? -1 : stepIds.indexOf(selectedStepId)
-    const next = Math.min(Math.max(at + offset, 0), stepIds.length - 1)
-    await selectRow(stepIds[next])
+    if (rowKeys.length === 0) return
+    const at = selectedRowKey === null ? -1 : rowKeys.indexOf(selectedRowKey)
+    const next = Math.min(Math.max(at + offset, 0), rowKeys.length - 1)
+    await selectRow(rowKeys[next])
   }
 
   /**
@@ -481,11 +548,51 @@
    * ボタンの既定動作として確定に化け、Enter の分岐が意図して拒んでいる組み合わせが
    * マウス経由で通ってしまう。
    */
-  async function selectRow(stepId: string): Promise<void> {
-    selectedStepId = stepId
+  async function selectRow(key: string): Promise<void> {
+    selectedRowKey = key
     // 直前の失敗は選び直した行には結び付かない。
     selectError = null
     await focusSelectedRow()
+  }
+
+  /**
+   * 入力位置がある行を確定する。**行の種類が Enter の意味を決める。**
+   *
+   * 見出しならその**タスク**を開くだけであり、**現在地**は動かず**切り替え履歴**も
+   * 増えない。**ステップ**なら**現在地**がそこへ移る (spec Boundaries)。
+   */
+  async function confirmSelection(): Promise<void> {
+    const row = selectedRow
+    // 確定の途中では二つ目を受けない。取り直しの最中に開く先が変わると、着いた応答が
+    // どちらの要求のものか読めなくなる。
+    if (!row || selecting) return
+    if (row.kind === 'task') {
+      await openTask(row.taskId)
+      return
+    }
+    await moveTo(row.stepId)
+  }
+
+  /**
+   * 見出しを確定し、その**タスク**の**ステップ**を並べる (spec Boundaries)。
+   *
+   * **直前に開いていたタスクは閉じる。** 開いた状態を積み上げられないことが、一覧が
+   * 全体像へ戻らないための条件である — 開くタスクを一つしか持てない形がそれを負う。
+   *
+   * **何も書かない。** 現在地は動かず、切り替え履歴も増えない。取り直すのは一覧だけで
+   * あり、既定表示のスナップショットには触れない。
+   *
+   * 入力位置は確定した見出しに留まる。開いた**ステップ**へ飛ばすと、確定の手応えを
+   * 確かめるもう一度の Enter が、見ていない**ステップ**への**現在地**の移動になる。
+   *
+   * **既に開いている見出しを確定しても閉じない。** 畳む打鍵を与えれば、閉じた一覧から
+   * 数打鍵で全体像へ戻る形が生まれる — 開けるのが一つだけであることの意味が薄れる。
+   * 取り直しだけが走る (AD-3 鮮度規則)。
+   */
+  async function openTask(taskId: string): Promise<void> {
+    openTaskId = taskId
+    selectError = null
+    await refreshDisclosure()
   }
 
   /**
@@ -507,8 +614,8 @@
    * メモの機会を与えない**以上、下書きを生かしておく先が無い。面から戻るだけの Esc
    * ([`leaveDisclosure`]) は現在地を動かさないため、そちらでは残す。
    */
-  async function confirmSelection(stepId: string | null): Promise<void> {
-    if (stepId === null || selecting) return
+  async function moveTo(stepId: string): Promise<void> {
+    if (selecting) return
     selecting = true
     selectError = null
     const request: SelectStepRequest = { stepId }
@@ -819,7 +926,7 @@
     if (event.metaKey || event.shiftKey || event.altKey || event.ctrlKey) return
 
     event.preventDefault()
-    void confirmSelection(selectedStepId)
+    void confirmSelection()
   }
 
   onMount(() => {
@@ -955,17 +1062,49 @@
     {/if}
 
     <!--
-      見出しとステップを一つの流れで見せる。窓は固定寸法であり、溢れた分は `main` の
-      スクロールで最後の行まで到達できる。
+      見出しとステップを一つの流れで見せる。**見出しは常にすべて現れ、ステップは一度に
+      一つのタスクの分だけ現れる** (spec Boundaries / 設計上の賭け #1)。窓は固定寸法で
+      あり、溢れた分は `main` のスクロールで最後の行まで到達できる。
     -->
     <div class="disclosure" bind:this={listElement}>
       {#each rows as row}
         {#if row.kind === 'task'}
-          <p class="task-heading">{row.title}</p>
+          <!--
+            見出しも選べる行である。**確定するとそのタスクが開き、直前に開いていた
+            タスクが閉じる** — 現在地は動かず、切り替え履歴も増えない。
+
+            開いているかどうかは `aria-expanded` が伝える。**開閉に印を与えない** —
+            与えれば、下の現在地の印と並んで二つの三角が別の意味を持つことになる。
+
+            **現在地の印は、そのタスクが閉じていても付く。** ステップの行だけが現在地を
+            示す形にすると、別のタスクを開いた瞬間に現在地がどこにも現れない (spec
+            Boundaries「現在地が指す行がどれか分かること」)。これは位置情報であって
+            進捗の可視化ではない (AD-15 の「第 N / 全 M」と同じ類) — **件数も総数も
+            割合も色も持たない、書体上の素朴な印だけである**。
+
+            **ステップの行の `▸` とは別の字にする。** 三角は開閉の記号として読まれ、
+            見出しの上では `aria-expanded` と衝突する。`aria-current` の値も
+            `step` と `location` で分かれており、印と綴りの両方で区別が付く。
+
+            click は選ぶだけで確定しない (ステップの行と同じ理由)。
+          -->
+          <button
+            type="button"
+            class="task-heading"
+            class:selected={rowKey(row) === selectedRowKey}
+            data-row-key={rowKey(row)}
+            tabindex={rowKey(row) === selectedRowKey ? 0 : -1}
+            aria-expanded={row.open}
+            aria-current={row.holdsCurrentPosition ? 'location' : undefined}
+            onclick={() => selectRow(rowKey(row))}
+          >
+            <span class="here">{row.holdsCurrentPosition ? '●' : ''}</span>
+            <span class="content">{row.title}</span>
+          </button>
         {:else}
           <!--
-            選べるのはステップだけである。`aria-current="step"` が現在地の行を、
-            印が完了を伝える — **色・バー・パーセントのいずれも用いない** (AD-15)。
+            **現在地**を移せるのはステップだけである。`aria-current="step"` が現在地の
+            行を、印が完了を伝える — **色・バー・パーセントのいずれも用いない** (AD-15)。
 
             click は**選ぶだけで確定しない**。押した瞬間に現在地が動く形にすると、
             Space や修飾キーを伴う click までボタンの既定動作として確定に化け、Enter の
@@ -974,11 +1113,12 @@
           <button
             type="button"
             class="step-row"
-            class:selected={row.stepId === selectedStepId}
+            class:selected={rowKey(row) === selectedRowKey}
             data-step-id={row.stepId}
-            tabindex={row.stepId === selectedStepId ? 0 : -1}
+            data-row-key={rowKey(row)}
+            tabindex={rowKey(row) === selectedRowKey ? 0 : -1}
             aria-current={row.current ? 'step' : undefined}
-            onclick={() => selectRow(row.stepId)}
+            onclick={() => selectRow(rowKey(row))}
           >
             <span class="mark">{row.completed ? '✓' : ''}</span>
             <span class="here">{row.current ? '▸' : ''}</span>
@@ -1071,9 +1211,14 @@
     <!--
       **効かない打鍵を案内しない。** 選べる行が一つも無ければ ↑↓ も Enter も何も
       起こさない (一覧が空のとき・コアが読めていないとき)。
+
+      **Enter の意味は行の種類で変わる。** 見出しの上で「現在地を移す」と案内すれば、
+      案内と実際に効く打鍵が食い違う。
     -->
     <p class="hint">
-      {#if stepIds.length > 0}↑↓ で移動 · Enter でここへ現在地を移す · {/if}Esc で戻る
+      {#if rowKeys.length > 0}↑↓ で移動 · {selectedRow?.kind === 'task'
+          ? 'Enter でこのタスクのステップを見る'
+          : 'Enter でここへ現在地を移す'} · {/if}Esc で戻る
     </p>
   {:else}
     <!-- 案内の語を行で割らない。割ると表示に改行が混じる。 -->
@@ -1170,16 +1315,40 @@
   }
 
   /*
-    タスクの見出し。**選べない行である** — 押せる形にしない。
+    タスクの見出し。**選べる行である** — 確定するとそのタスクのステップが並ぶ。
+    ステップの行より小さく淡いままにして、見出しと行の区別を保つ。
   */
   .task-heading {
+    display: flex;
+    align-items: baseline;
+    gap: 0.3rem;
+    width: 100%;
     margin: 0.5rem 0 0.15rem;
+    padding: 0.22rem 0.4rem;
+    border: 1px solid transparent;
+    border-radius: 4px;
+    background: none;
+    font: inherit;
     font-size: 0.8rem;
+    line-height: 1.5;
     color: var(--overlay-muted);
+    text-align: left;
+    /* click は選ぶだけで確定しない。それでも押せる行であることは示す。 */
+    cursor: pointer;
   }
 
   .task-heading:first-child {
     margin-top: 0;
+  }
+
+  /* 選んでいる行と、入力位置がある行を描き分ける (`.step-row` と同じ規則)。 */
+  .task-heading.selected {
+    background: var(--overlay-raised);
+  }
+
+  .task-heading:focus {
+    outline: 1px solid var(--overlay-focus);
+    outline-offset: 0;
   }
 
   .step-row {
