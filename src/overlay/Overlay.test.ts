@@ -32,6 +32,55 @@ const SNAPSHOT = {
   interruptionNote: '接続詞を整える途中',
 }
 
+/**
+ * src-tauri/src/commands/mod.rs の `DisclosureSurface` と 1:1。
+ *
+ * 2 タスク・計 5 ステップ。現在地は第 2 タスクの第 3 ステップであり、第 1 タスクの
+ * 第 2 ステップだけが完了している (spec の I/O マトリクス)。
+ */
+const DISCLOSURE = {
+  stateError: null,
+  rows: [
+    { kind: 'task', title: '原稿' },
+    {
+      kind: 'step',
+      stepId: '0198f0e0-0000-7000-8000-000000000001',
+      content: '構成を決める',
+      completed: false,
+      current: false,
+    },
+    {
+      kind: 'step',
+      stepId: '0198f0e0-0000-7000-8000-000000000002',
+      content: '下書きを書く',
+      completed: true,
+      current: false,
+    },
+    { kind: 'task', title: '買い物' },
+    {
+      kind: 'step',
+      stepId: '0198f0e0-0000-7000-8000-000000000003',
+      content: '米',
+      completed: false,
+      current: false,
+    },
+    {
+      kind: 'step',
+      stepId: '0198f0e0-0000-7000-8000-000000000004',
+      content: '味噌',
+      completed: false,
+      current: false,
+    },
+    {
+      kind: 'step',
+      stepId: '0198f0e0-0000-7000-8000-000000000005',
+      content: '醤油',
+      completed: false,
+      current: true,
+    },
+  ],
+}
+
 /** `@tauri-apps/api` の mock が用意しないイベント内部実装の穴。 */
 type EventPluginInternals = { unregisterListener?: (event: string, id: number) => void }
 
@@ -40,6 +89,13 @@ let calls: { cmd: string; args: Record<string, unknown> }[] = []
 let snapshot: Record<string, unknown> = { ...SNAPSHOT }
 let switchOutcome = { moved: true }
 let createOutcome = { moved: false }
+let disclosure: Record<string, unknown> = { ...DISCLOSURE }
+/** 一覧の取得を失敗させる旗。**取り直しの契機を保ったまま失敗を起こすために使う。** */
+let disclosureFails = false
+/** 一覧の応答を握り、任意の時点で返すための仕掛け。遅れて着く応答を作る。 */
+let holdDisclosure = false
+let releaseDisclosure: ((surface: Record<string, unknown>) => void) | null = null
+let selectOutcome = { moved: true }
 let component: Record<string, unknown> | undefined
 
 /**
@@ -75,6 +131,16 @@ function installIPC(): void {
       if (cmd === 'get_overlay_snapshot') return snapshot
       if (cmd === 'switch_current_position') return switchOutcome
       if (cmd === 'create_task') return createOutcome
+      if (cmd === 'get_disclosure_surface') {
+        if (disclosureFails) throw new Error('常駐プロセスが応答しない')
+        if (holdDisclosure) {
+          return new Promise((resolve) => {
+            releaseDisclosure = resolve as (surface: Record<string, unknown>) => void
+          })
+        }
+        return disclosure
+      }
+      if (cmd === 'select_step') return selectOutcome
       return null
     },
     { shouldMockEvents: true },
@@ -124,6 +190,16 @@ function installHangingIPC(hanging: string): void {
       if (cmd === 'get_overlay_snapshot') return snapshot
       if (cmd === 'switch_current_position') return switchOutcome
       if (cmd === 'create_task') return createOutcome
+      if (cmd === 'get_disclosure_surface') {
+        if (disclosureFails) throw new Error('常駐プロセスが応答しない')
+        if (holdDisclosure) {
+          return new Promise((resolve) => {
+            releaseDisclosure = resolve as (surface: Record<string, unknown>) => void
+          })
+        }
+        return disclosure
+      }
+      if (cmd === 'select_step') return selectOutcome
       return null
     },
     { shouldMockEvents: true },
@@ -140,8 +216,29 @@ async function openCreation(): Promise<void> {
   await settle()
 }
 
+/** 開示面へ入る。到達には明示的な打鍵が 1 回要る (FR-19 / FR-2 / AD-15)。 */
+async function openDisclosure(): Promise<void> {
+  press('l', { metaKey: true })
+  await settle()
+}
+
+function stepRows(): HTMLButtonElement[] {
+  return [...document.querySelectorAll<HTMLButtonElement>('.step-row')]
+}
+
+function rowTexts(): string[] {
+  return stepRows().map((row) => row.textContent?.trim() ?? '')
+}
+
 function press(key: string, init: KeyboardEventInit = {}): void {
   window.dispatchEvent(new KeyboardEvent('keydown', { key, ...init }))
+}
+
+/** 打鍵を飲んだか (`preventDefault`) まで見たいときに使う。 */
+function pressCancelable(key: string, init: KeyboardEventInit = {}): KeyboardEvent {
+  const event = new KeyboardEvent('keydown', { key, cancelable: true, ...init })
+  window.dispatchEvent(event)
+  return event
 }
 
 async function mountOverlay(): Promise<void> {
@@ -158,6 +255,11 @@ beforeEach(async () => {
   snapshot = { ...SNAPSHOT }
   switchOutcome = { moved: true }
   createOutcome = { moved: false }
+  disclosure = { ...DISCLOSURE }
+  disclosureFails = false
+  holdDisclosure = false
+  releaseDisclosure = null
+  selectOutcome = { moved: true }
   mockWindows('main')
   installIPC()
   stubEventInternals()
@@ -1011,4 +1113,359 @@ test('コアが読めなくても作成の面には入れ、失敗の理由が�
   // 面は閉じない。理由はその場に出る (I/O マトリクス「コア不在」)。
   expect(document.querySelector('input.title')).not.toBeNull()
   expect(document.querySelector('[role="alert"]')?.textContent ?? '').toContain(CORE_MISSING)
+})
+
+
+// --- 開示面 (CAP-9 / FR-19) ---------------------------------------------------
+
+test('初期表示に開示面は現れない (FR-19 / FR-2 / AD-15)', () => {
+  expect(document.querySelector('.disclosure')).toBeNull()
+  expect(stepRows()).toHaveLength(0)
+  // 隠れている間に一覧を取りに行かない。
+  expect(invoked).not.toContain('get_disclosure_surface')
+  // 到達の手がかりはあるが、面そのものは出ていない。
+  expect(document.body.textContent ?? '').toContain('⌘L で一覧')
+})
+
+test('⌘L で一覧に入り、現在地の行に入力位置がある', async () => {
+  await openDisclosure()
+
+  // 表示のたびに完全なスナップショットを取得してから描く (AD-3 鮮度規則)。
+  expect(invoked).toContain('get_disclosure_surface')
+  expect(document.querySelector('.disclosure')).not.toBeNull()
+  const here = stepRows().find((row) => row.getAttribute('aria-current') === 'step')
+  expect(here?.dataset.stepId).toBe('0198f0e0-0000-7000-8000-000000000005')
+  expect(document.activeElement).toBe(here)
+})
+
+test('見出しとステップが一つの流れで現れ、完了に素朴な印が付く', async () => {
+  await openDisclosure()
+
+  const headings = [...document.querySelectorAll('.task-heading')].map((h) => h.textContent)
+  expect(headings).toEqual(['原稿', '買い物'])
+  expect(stepRows()).toHaveLength(5)
+  expect(rowTexts()[0]).toContain('構成を決める')
+  // 完了した行にだけ印が付く。
+  expect(rowTexts()[1]).toContain('✓')
+  expect(rowTexts()[0]).not.toContain('✓')
+  expect(rowTexts()[4]).not.toContain('✓')
+})
+
+test('現在地の行がそれと分かる — 印は一つだけである (FR-6)', async () => {
+  await openDisclosure()
+
+  const marked = stepRows().filter((row) => row.getAttribute('aria-current') === 'step')
+  expect(marked).toHaveLength(1)
+  expect(marked[0].textContent ?? '').toContain('醤油')
+  expect(marked[0].textContent ?? '').toContain('▸')
+})
+
+test('一覧は進捗率も件数も総数も描かない (AD-15)', async () => {
+  await openDisclosure()
+
+  const text = document.body.textContent ?? ''
+  expect(text).not.toContain('%')
+  expect(text).not.toContain('件')
+  expect(text).not.toContain('全 5')
+  expect(text).not.toContain('ステップ /')
+  expect(document.querySelector('progress')).toBeNull()
+  expect(document.querySelector('meter')).toBeNull()
+})
+
+test('一覧は並べ替え・改名・削除の手がかりを持たない (SPEC 非目標)', async () => {
+  await openDisclosure()
+
+  // 面に入力欄が無いことが、編集の面へ滑り出していないことの実体である。
+  expect(document.querySelector('input')).toBeNull()
+  expect(document.querySelector('textarea')).toBeNull()
+})
+
+test('↑↓ で入力位置が行の間を動き、見出しでは止まらない', async () => {
+  await openDisclosure()
+
+  press('ArrowUp')
+  await settle()
+  expect((document.activeElement as HTMLElement)?.dataset.stepId).toBe(
+    '0198f0e0-0000-7000-8000-000000000004',
+  )
+
+  // タスクの境目を越えても、止まるのは選べる行だけである。
+  press('ArrowUp')
+  press('ArrowUp')
+  await settle()
+  expect((document.activeElement as HTMLElement)?.dataset.stepId).toBe(
+    '0198f0e0-0000-7000-8000-000000000002',
+  )
+
+  press('ArrowDown')
+  await settle()
+  expect((document.activeElement as HTMLElement)?.dataset.stepId).toBe(
+    '0198f0e0-0000-7000-8000-000000000003',
+  )
+})
+
+test('端では留まる — 回り込まない', async () => {
+  await openDisclosure()
+
+  for (let i = 0; i < 8; i += 1) press('ArrowUp')
+  await settle()
+  expect((document.activeElement as HTMLElement)?.dataset.stepId).toBe(
+    '0198f0e0-0000-7000-8000-000000000001',
+  )
+
+  for (let i = 0; i < 8; i += 1) press('ArrowDown')
+  await settle()
+  expect((document.activeElement as HTMLElement)?.dataset.stepId).toBe(
+    '0198f0e0-0000-7000-8000-000000000005',
+  )
+})
+
+test('別のステップを選ぶと現在地が移り、面は閉じて既定表示へ戻る', async () => {
+  snapshot = { ...SNAPSHOT, stepContent: '味噌', stepOrdinal: 2, interruptionNote: null }
+  await openDisclosure()
+
+  press('ArrowUp')
+  await settle()
+  press('Enter')
+  await settle()
+
+  expect(argsOf('select_step')).toEqual({
+    request: { stepId: '0198f0e0-0000-7000-8000-000000000004' },
+  })
+  // 切り替えの儀式 (CAP-7) は撃たない。移動と履歴はコア側の単一のトランザクションである。
+  expect(invoked).not.toContain('switch_current_position')
+  // オーバーレイは閉じない。移った先の次の一手をそのまま見せる (FR-8)。
+  expect(invoked).not.toContain('hide_overlay')
+  // 取り直した既定表示がそのステップを示す (AD-3 鮮度規則)。
+  expect(invoked).toContain('get_overlay_snapshot')
+  expect(document.querySelector('.disclosure')).toBeNull()
+  expect(document.body.textContent ?? '').toContain('味噌')
+})
+
+test('中断メモも完了もこの経路からは送らない', async () => {
+  await openDisclosure()
+  press('ArrowUp')
+  await settle()
+  press('Enter')
+  await settle()
+
+  const request = (argsOf('select_step') ?? {}).request as Record<string, unknown>
+  // 欄が無いことが「機会を与えていない」の実体である (SM-C3)。
+  expect(Object.keys(request)).toEqual(['stepId'])
+})
+
+test('現在地そのものを選んでも、切り替えの儀式は起きない', async () => {
+  selectOutcome = { moved: false }
+  await openDisclosure()
+
+  press('Enter')
+  await settle()
+
+  // 何も書かないのはコアの判断である。フロントは現在地の行をそのまま送る。
+  expect(argsOf('select_step')).toEqual({
+    request: { stepId: '0198f0e0-0000-7000-8000-000000000005' },
+  })
+  expect(invoked).not.toContain('switch_current_position')
+  expect(document.querySelector('.disclosure')).toBeNull()
+})
+
+test('一覧の ⌘Enter は完了を宣言しない — どこにも束縛されていない', async () => {
+  await openDisclosure()
+
+  press('Enter', { metaKey: true })
+  press('Enter', { shiftKey: true })
+  press('Enter', { altKey: true })
+  press('Enter', { ctrlKey: true })
+  await settle()
+
+  expect(invoked).not.toContain('select_step')
+  expect(invoked).not.toContain('switch_current_position')
+  // 案内と実際に効く打鍵が一致していること。
+  expect(document.body.textContent ?? '').toContain('Enter でここへ現在地を移す')
+})
+
+test('押しっぱなしの Enter は二度確定しない', async () => {
+  await openDisclosure()
+
+  press('Enter')
+  press('Enter', { repeat: true })
+  await settle()
+
+  expect(invoked.filter((cmd) => cmd === 'select_step')).toHaveLength(1)
+})
+
+test('IME の変換確定の Enter を選択と取り違えない', async () => {
+  await openDisclosure()
+
+  press('Enter', { isComposing: true } as KeyboardEventInit)
+  await settle()
+
+  expect(invoked).not.toContain('select_step')
+})
+
+test('Esc は既定表示へ戻る — オーバーレイは閉じない', async () => {
+  await openDisclosure()
+
+  press('Escape')
+  await settle()
+
+  expect(invoked).not.toContain('hide_overlay')
+  expect(invoked).not.toContain('select_step')
+  expect(document.querySelector('.disclosure')).toBeNull()
+  expect(document.querySelector('.next-action')).not.toBeNull()
+  // 入力位置は中断メモの欄へ返る。
+  expect(document.activeElement).toBe(noteField())
+})
+
+test('一覧を出したままオーバーレイを閉じると、次回の呼び出しは初期表示である', async () => {
+  await openDisclosure()
+  expect(document.querySelector('.disclosure')).not.toBeNull()
+
+  await emit('tauri://blur', null)
+  await settle()
+  // 閉じた時点で破棄される (FR-19)。
+  expect(document.querySelector('.disclosure')).toBeNull()
+
+  await emit('tauri://focus', null)
+  await settle()
+
+  expect(document.querySelector('.disclosure')).toBeNull()
+  expect(document.querySelector('.next-action')).not.toBeNull()
+})
+
+test('タスクが 1 個も無ければ空欄にせず、その旨の 1 行を出す', async () => {
+  disclosure = { stateError: null, rows: [] }
+  await openDisclosure()
+
+  expect(stepRows()).toHaveLength(0)
+  expect(document.body.textContent ?? '').toContain('まだタスクが無い')
+
+  // 選べる行が無いのだから、Enter は何も撃たない。
+  press('Enter')
+  await settle()
+  expect(invoked).not.toContain('select_step')
+})
+
+test('コアが読めなくても面は開き、理由が出る。移動はできない', async () => {
+  const CORE_MISSING = '保存された状態を読み込めていない。'
+  disclosure = { stateError: CORE_MISSING, rows: [] }
+  await openDisclosure()
+
+  expect(document.querySelector('.disclosure')).not.toBeNull()
+  expect(noticeText()).toContain(CORE_MISSING)
+  expect(noticeText()).toContain('現在地を移すことはできない')
+
+  press('Enter')
+  await settle()
+  expect(invoked).not.toContain('select_step')
+})
+
+test('一覧を取得できなければ理由を出し、古い行に対して選択を撃たない', async () => {
+  await openDisclosure()
+  expect(stepRows()).toHaveLength(5)
+
+  disclosureFails = true
+  // 現在地が動いたという報せ。開示面が出ている間は一覧も取り直される (AD-3 鮮度規則)。
+  await emit('current_position_changed', null)
+  await settle()
+
+  // **古い一覧を残さない。** 残せば、コアが確認できなかった行に対して Enter が撃てる。
+  expect(stepRows()).toHaveLength(0)
+  expect(noticeText()).toContain('一覧を取得できなかった')
+
+  press('Enter')
+  await settle()
+  expect(invoked).not.toContain('select_step')
+})
+
+test('選択に失敗したら理由を面に出し、面は閉じない', async () => {
+  mockIPC(
+    (cmd, args) => {
+      invoked.push(cmd)
+      calls.push({ cmd, args: (args ?? {}) as Record<string, unknown> })
+      if (cmd === 'select_step') throw new Error('書き込みに失敗した')
+      if (cmd === 'get_disclosure_surface') return disclosure
+      if (cmd === 'get_overlay_snapshot') return snapshot
+      return null
+    },
+    { shouldMockEvents: true },
+  )
+  await openDisclosure()
+
+  press('Enter')
+  await settle()
+
+  expect(document.querySelector('.disclosure')).not.toBeNull()
+  expect(noticeText()).toContain('現在地を移せなかった')
+  expect(noticeText()).toContain('書き込みに失敗した')
+  expect(invoked).not.toContain('hide_overlay')
+})
+
+test('作成の面と開示面は同時に現れない — 一覧からは ⌘N が効かない', async () => {
+  await openDisclosure()
+
+  press('n', { metaKey: true })
+  await settle()
+
+  expect(document.querySelector('input.title')).toBeNull()
+  expect(document.querySelector('.disclosure')).not.toBeNull()
+})
+
+test('作成の面と開示面は同時に現れない — 作成中は ⌘L が効かない', async () => {
+  await openCreation()
+
+  press('l', { metaKey: true })
+  await settle()
+
+  expect(document.querySelector('.disclosure')).toBeNull()
+  expect(invoked).not.toContain('get_disclosure_surface')
+  expect(document.querySelector('input.title')).not.toBeNull()
+})
+
+test('切り替えの確定中は ⌘L で一覧に入らない', async () => {
+  installHangingIPC('switch_current_position')
+
+  press('Enter')
+  await settle()
+  expect(invoked).toContain('switch_current_position')
+
+  await openDisclosure()
+
+  // 入れば、失敗したときの理由を読む機会が面ごと消える。
+  expect(document.querySelector('.disclosure')).toBeNull()
+})
+
+test('選択の確定中は Esc で面を出ない', async () => {
+  installHangingIPC('select_step')
+  await openDisclosure()
+
+  press('Enter')
+  await settle()
+  expect(invoked).toContain('select_step')
+
+  press('Escape')
+  await settle()
+
+  expect(document.querySelector('.disclosure')).not.toBeNull()
+  expect(invoked).not.toContain('hide_overlay')
+})
+
+test('一覧が窓に収まらなくても、切り取られずスクロールで到達できる', async () => {
+  await openDisclosure()
+
+  const main = document.querySelector('main') as HTMLElement
+  const list = document.querySelector('.disclosure') as HTMLElement
+  // `main` が唯一のスクロール容器である。**一覧は自分では巻かず、高さも制限しない** —
+  // 入れ子の容器が巻き始めると、どちらが動くかが行の位置で変わる。
+  expect(getComputedStyle(main).overflowY).toBe('auto')
+  // 一覧自身がスクロール容器になっていないこと。`max-height` + `overflow-y: auto` を
+  // 足せばここが落ちる — コメントが名指しで警戒している入れ子の容器である。
+  const style = getComputedStyle(list)
+  expect(['auto', 'scroll']).not.toContain(style.overflowY)
+  expect(['auto', 'scroll']).not.toContain(style.overflowX)
+  expect(['auto', 'scroll']).not.toContain(style.overflow)
+  expect(['none', '']).toContain(style.maxHeight)
+  // 最後の行まで DOM にあること。切り取って描かない。
+  expect(rowTexts()[4]).toContain('醤油')
+  expect(main.contains(list)).toBe(true)
 })

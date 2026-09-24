@@ -403,6 +403,99 @@ impl Core {
         Ok(destination)
     }
 
+    /// **開示面からの切り替え** — 任意の**ステップ**へ**現在地**を移し、**切り替え履歴**を
+    /// 追記する。二つは**単一のトランザクション**で確定する (CAP-9 / FR-19 / AD-5)。
+    ///
+    /// 用語集は**切り替え**を「**現在地**をあるステップから別のステップへ移す操作」と
+    /// 定めており、**タスク**を跨ぐ移動もそれに当たる。したがって履歴を残す。
+    ///
+    /// # なぜ [`Self::move_current_position`] を呼ばないのか
+    ///
+    /// あれは履歴を残さない素の移動であり、CAP-6 の一意性を保つためだけの原始操作である。
+    /// この経路から呼べば、移動が記録されないまま**現在地**だけが動く。その履歴は
+    /// SM-C3 の分母であり、経路が丸ごと落ちれば記入率が実態より高く見える。
+    ///
+    /// # なぜ**中断メモ**を受け取らないのか
+    ///
+    /// 一覧から行を選ぶ操作にメモの入力欄を挟めば、CAP-7 の儀式を一覧の中に作り直す
+    /// ことになり、**開示面**が編集の面へ滑り出す。**この経路は機会を与えない**ため、
+    /// 履歴の `note_written` は常に偽である。**機会を与えていない移動を記入率の分子に
+    /// 数えない**ことが、この判断が SM-C3 を歪めないための条件である
+    /// (spec Design Notes)。
+    ///
+    /// **完了**にも一切触れない。**完了**は**現在地**の移動で自動的に付与も取消もされない
+    /// (FR-4 / AD-2)。離脱側の**中断メモ**も変えない。
+    ///
+    /// # **未着手**からの移動に履歴が無い理由
+    ///
+    /// [`SwitchRecord`] は離脱元の**ステップ**を必ず持つ。**未着手**には離れる場所が無く、
+    /// 用語集の定義上そこからの移動は**切り替え**ではない。欠けた値を捏造して 1 行
+    /// 積むより、離脱が無かったことを記録の不在で表す。着手せずに作った**タスク**へ
+    /// 初めて到達する経路がこれであり、**移動そのものは成立する**。
+    ///
+    /// # **非活性** (**休息**中) に選んだときの扱い
+    ///
+    /// **移した先は活性である。** [`CurrentPosition::move_to`] が定める通りであり、
+    /// [`Self::move_current_position`] も同じ値を通る — 「**現在地**を移す」の意味を
+    /// 経路ごとに変えない。**非活性**から**活性**への遷移は AD-8 が唯一のリセット契機と
+    /// して名指しているものであり、一覧から**ステップ**を選ぶ行為は用語集の**再入**
+    /// (中断された**ステップ**が再び**現在地**となり作業が再開されること) そのものである。
+    /// したがって**連続作業時間**はここで数え直される。**活性**のまま移った場合は
+    /// リセットされない (AD-8 / FR-15)。
+    ///
+    /// **同じ**ステップ**を選んだ場合も同様に扱う。** 判定は `step_id` ではなく
+    /// **現在地**の値そのもので行う ([`Self::move_current_position`] と同じ) —
+    /// `step_id` だけで短絡すると、**休息**中に自分の行を選んだときだけ何も起きず、
+    /// 「選べば現在地がそこへ移る」が状態によって成り立たなくなる。ただし**離脱が
+    /// 起きていない**以上、**切り替え履歴**は残さない。
+    ///
+    /// # 戻り値
+    ///
+    /// **現在地**が変わったか — すなわち何かが書かれたか。値が一つも変わらない選択では
+    /// `false` であり、**何も書かない — 履歴も増えない**
+    /// (I/O マトリクス「同じステップを選ぶ」)。
+    ///
+    /// # Errors
+    ///
+    /// **ステップ**が見つからないとき [`DomainError::UnknownStep`]、永続化に失敗した
+    /// とき [`CoreError::Storage`]。いずれの場合もメモリ上の状態は変わらない。
+    pub fn select_step(&self, step_id: StepId) -> Result<bool, CoreError> {
+        let mut state = self.lock();
+        let now = self.clock.now();
+
+        let task_id = state
+            .task_of_step(step_id)
+            .ok_or(DomainError::UnknownStep)?
+            .id();
+
+        let moved = state.current_position.move_to(task_id, step_id, now);
+        // **値が一つも変わらないなら何も書かない。** 書けば、一覧を開いて Enter を押す
+        // だけで履歴が 1 行ずつ積まれ、SM-C3 の分母が空の打鍵で膨らむ
+        // (`move_current_position` の短絡と同じ判定である)。
+        if moved == state.current_position {
+            return Ok(false);
+        }
+
+        // **離脱元が無い、あるいは離脱先と同じなら切り替えではない。** 前者は**未着手**
+        // からの移動、後者は**休息**からの**再入**である。どちらも「あるステップから別の
+        // ステップへ移す」に当たらず、履歴に 1 行積めば SM-C3 の分母だけが膨らむ。
+        let departed = state
+            .current_position
+            .step_id()
+            .filter(|departed| *departed != step_id);
+
+        self.storage.apply(&Commit {
+            // **タスク**は書き直さない。メモにも**完了**にも触れないため、変わるものが
+            // 一つも無い。
+            task: None,
+            current_position: Some(moved),
+            // **機会を与えていないため `note_written` は常に偽である。**
+            switch_record: departed.map(|departed| SwitchRecord::new(now, departed, false)),
+        })?;
+        state.current_position = moved;
+        Ok(true)
+    }
+
     /// **現在地**を**活性**にする (**休息**からの復帰など / CAP-6)。
     ///
     /// # Errors
@@ -1402,6 +1495,279 @@ mod tests {
                 .current_position
                 .expect("現在地のコミットである"),
             position
+        );
+    }
+
+    // --- 開示面からの切り替え (CAP-9 / FR-19) ---------------------------------
+
+    /// 受け入れ条件「現在と異なるステップを選ぶ → 現在地が移り、履歴が 1 行増え、
+    /// 『メモを書いたか』が偽である」。
+    ///
+    /// **両者が一つのコミットに載ることが本スライスの核心である** (AD-5)。別タスクへ
+    /// 跨げることも同時に見る — これが解消する穴そのものである。
+    #[test]
+    fn selecting_a_step_moves_and_records_in_one_commit() {
+        let (core, storage, _) = a_core();
+        let origin = core
+            .create_task("原稿", contents(&["下書き", "推敲"]))
+            .expect("作れる");
+        let other = core
+            .create_task("買い物", contents(&["米", "味噌"]))
+            .expect("作れる");
+        let snapshot = core.snapshot();
+        let departed = snapshot.task(origin).expect("ある").steps()[0].id();
+        let chosen = snapshot.task(other).expect("ある").steps()[1].id();
+        core.move_current_position(departed).expect("移せる");
+        let before = storage.commits().len();
+
+        let moved = core.select_step(chosen).expect("選べる");
+
+        assert!(moved, "現在地が動いた");
+        let commits = storage.commits();
+        assert_eq!(
+            commits.len(),
+            before + 1,
+            "現在地の移動と履歴の追記で 1 トランザクション (AD-5)"
+        );
+        let commit = commits.last().expect("ある");
+        assert!(commit.task.is_none(), "タスクは書き直さない");
+        assert_eq!(
+            commit.current_position.and_then(|p| p.step_id()),
+            Some(chosen),
+            "現在地が同じコミットにある"
+        );
+        let record = commit
+            .switch_record
+            .as_ref()
+            .expect("履歴も同じコミットにある");
+        assert_eq!(record.departed_step_id(), departed, "離脱元を記録する");
+        assert!(
+            !record.note_written(),
+            "機会を与えていないため記入は常に偽である (SM-C3)"
+        );
+
+        assert_eq!(core.current_position().step_id(), Some(chosen));
+        assert_eq!(
+            core.current_position().task_id(),
+            Some(other),
+            "タスクを跨いで移れる — これが CAP-7 との違いである"
+        );
+    }
+
+    /// 受け入れ条件「同じステップを選ぶ → 切り替え履歴は増えていない」。
+    #[test]
+    fn selecting_the_current_step_writes_nothing() {
+        let (core, storage, _) = a_core();
+        let task_id = core
+            .create_task("原稿", contents(&["下書き", "推敲"]))
+            .expect("作れる");
+        let first = core.snapshot().task(task_id).expect("ある").steps()[0].id();
+        core.move_current_position(first).expect("移せる");
+        let before = storage.commits();
+
+        let moved = core.select_step(first).expect("選べる");
+
+        assert!(!moved, "動いていない");
+        assert_eq!(storage.commits(), before, "履歴も現在地も書かない");
+    }
+
+    /// 受け入れ条件「任意の移動 → 離脱側の中断メモも `completed_at` も変わっていない」。
+    #[test]
+    fn selecting_a_step_touches_neither_the_note_nor_the_completion() {
+        let (core, _, _) = a_core();
+        let task_id = core
+            .create_task("原稿", contents(&["下書き", "推敲", "投稿"]))
+            .expect("作れる");
+        let snapshot = core.snapshot();
+        let task = snapshot.task(task_id).expect("ある");
+        let (first, third) = (task.steps()[0].id(), task.steps()[2].id());
+        core.move_current_position(first).expect("移せる");
+        core.set_interruption_note(first, Some(InterruptionNote::new("3 段落目まで")))
+            .expect("メモを置ける");
+
+        core.select_step(third).expect("選べる");
+
+        let snapshot = core.snapshot();
+        let departed = snapshot
+            .task(task_id)
+            .expect("ある")
+            .step(first)
+            .expect("ある");
+        assert_eq!(
+            departed.interruption_note().map(InterruptionNote::text),
+            Some("3 段落目まで"),
+            "離脱側のメモは変わらない"
+        );
+        assert!(!departed.is_completed(), "完了も付かない (FR-4 / AD-2)");
+        assert!(
+            !snapshot
+                .task(task_id)
+                .expect("ある")
+                .step(third)
+                .expect("ある")
+                .is_completed(),
+            "移動先の完了も動かない"
+        );
+    }
+
+    /// **着手せずに作ったタスクへ、初めて到達する経路である。**
+    ///
+    /// **未着手**には離れる場所が無いため履歴は残らない。移動そのものは成立する。
+    #[test]
+    fn selecting_from_not_started_moves_without_a_record() {
+        let (core, storage, _) = a_core();
+        let task_id = core
+            .create_task("着手せずに書き留めた", contents(&["一", "二"]))
+            .expect("作れる");
+        let second = core.snapshot().task(task_id).expect("ある").steps()[1].id();
+        assert!(core.current_position().step_id().is_none(), "未着手である");
+
+        let moved = core.select_step(second).expect("選べる");
+
+        assert!(moved, "到達できる");
+        assert_eq!(core.current_position().step_id(), Some(second));
+        let commit = storage.commits().last().cloned().expect("ある");
+        assert!(commit.current_position.is_some(), "現在地は書かれる");
+        assert!(
+            commit.switch_record.is_none(),
+            "離脱元が無い移動は切り替えではない — 履歴を捏造しない"
+        );
+    }
+
+    /// **一覧からの移動は連続作業時間をリセットしない** (AD-8 / FR-15)。
+    ///
+    /// `move_to` を `Active { activated_at: now }` の直接構築に置き換えると、⌘L で
+    /// 渡り歩くたびに計時が振り出しに戻り、CAP-10 の休息介入が永久に発火しなくなる。
+    /// 壊れても他のどの検査も落ちないため、ここで固定する
+    /// (`a_switch_does_not_reset_the_work_clock` の双子)。
+    #[test]
+    fn selecting_a_step_does_not_reset_the_work_clock() {
+        let (core, _, clock) = a_core();
+        let task_id = core
+            .create_task("原稿", contents(&["下書き", "推敲"]))
+            .expect("作れる");
+        let snapshot = core.snapshot();
+        let task = snapshot.task(task_id).expect("ある");
+        let (first, second) = (task.steps()[0].id(), task.steps()[1].id());
+        core.move_current_position(first).expect("移せる");
+        let started = clock.now();
+
+        clock.advance(600_000);
+        core.select_step(second).expect("選べる");
+
+        assert!(core.current_position().is_active());
+        assert_eq!(
+            core.current_position().activated_at(),
+            Some(started),
+            "活性のまま移る限り、起点は据え置かれる (AD-8)"
+        );
+    }
+
+    /// **休息中に選んだ行は再入である** — 非活性→活性の遷移であり、連続作業時間は
+    /// そこから数え直される (AD-8 が名指す唯一のリセット契機)。
+    ///
+    /// 「現在地を移す」の意味を経路ごとに変えない。`move_current_position` も同じ値を
+    /// 通る。
+    #[test]
+    fn selecting_a_step_while_inactive_takes_up_the_work_again() {
+        let (core, storage, clock) = a_core();
+        let task_id = core
+            .create_task("原稿", contents(&["下書き", "推敲"]))
+            .expect("作れる");
+        let snapshot = core.snapshot();
+        let task = snapshot.task(task_id).expect("ある");
+        let (first, second) = (task.steps()[0].id(), task.steps()[1].id());
+        core.move_current_position(first).expect("移せる");
+        core.deactivate_current_position().expect("休息に入れる");
+
+        clock.advance(600_000);
+        let resumed = clock.now();
+        let moved = core.select_step(second).expect("選べる");
+
+        assert!(moved);
+        assert!(core.current_position().is_active(), "再入である");
+        assert_eq!(
+            core.current_position().activated_at(),
+            Some(resumed),
+            "非活性→活性の遷移でのみ計時が数え直される (AD-8)"
+        );
+        assert!(
+            storage
+                .commits()
+                .last()
+                .expect("ある")
+                .switch_record
+                .is_some(),
+            "離脱元があるため切り替えである"
+        );
+    }
+
+    /// **休息中に自分の行を選んだ場合も再入である。** ただし離脱していないため履歴は
+    /// 残さない。
+    ///
+    /// 判定を `step_id` だけで短絡すると、この一つの状態でだけ「選んでも何も起きない」
+    /// が生まれる。`move_current_position` は現在地の値そのもので比べており、そちらと
+    /// 食い違わせない。
+    #[test]
+    fn selecting_the_current_step_while_inactive_takes_up_the_work_without_a_record() {
+        let (core, storage, clock) = a_core();
+        let task_id = core
+            .create_task("原稿", contents(&["下書き", "推敲"]))
+            .expect("作れる");
+        let first = core.snapshot().task(task_id).expect("ある").steps()[0].id();
+        core.move_current_position(first).expect("移せる");
+        core.deactivate_current_position().expect("休息に入れる");
+
+        clock.advance(600_000);
+        let resumed = clock.now();
+        let moved = core.select_step(first).expect("選べる");
+
+        assert!(moved, "値が変わったので書かれている");
+        assert!(core.current_position().is_active());
+        assert_eq!(core.current_position().step_id(), Some(first));
+        assert_eq!(core.current_position().activated_at(), Some(resumed));
+        let commit = storage.commits().last().cloned().expect("ある");
+        assert!(commit.current_position.is_some());
+        assert!(
+            commit.switch_record.is_none(),
+            "離れていないのだから切り替えではない — SM-C3 の分母を膨らませない"
+        );
+    }
+
+    /// 知らない**ステップ**は panic ではなくエラーである。
+    #[test]
+    fn selecting_an_unknown_step_is_an_error() {
+        let (core, storage, _) = a_core();
+        let before = storage.commits();
+
+        let outcome = core.select_step(StepId::new(Timestamp::from_unix_millis(0)));
+
+        assert_eq!(outcome, Err(CoreError::Domain(DomainError::UnknownStep)));
+        assert_eq!(storage.commits(), before, "何も書かれていない");
+    }
+
+    /// 書き込みが失敗したなら**現在地**は動かない。
+    ///
+    /// 動かせば、書けなかった移動がメモリにだけ残り、次の起動で黙って戻る。
+    #[test]
+    fn a_failed_selection_leaves_the_current_position_unchanged() {
+        let (core, storage, _) = a_core();
+        let task_id = core
+            .create_task("原稿", contents(&["下書き", "推敲"]))
+            .expect("作れる");
+        let snapshot = core.snapshot();
+        let task = snapshot.task(task_id).expect("ある");
+        let (first, second) = (task.steps()[0].id(), task.steps()[1].id());
+        core.move_current_position(first).expect("移せる");
+        storage.set_failing(true);
+
+        let outcome = core.select_step(second);
+
+        assert!(matches!(outcome, Err(CoreError::Storage(_))));
+        assert_eq!(
+            core.current_position().step_id(),
+            Some(first),
+            "メモリ上の現在地も動いていない"
         );
     }
 }

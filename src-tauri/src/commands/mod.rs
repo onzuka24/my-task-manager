@@ -172,6 +172,112 @@ fn snapshot_of(hotkey: HotkeyStatus, state: Option<&CoreState>) -> OverlaySnapsh
     }
 }
 
+/// **開示面**の一覧を成す 1 行 (CAP-9 / FR-19)。
+///
+/// **用途専用の平たい形である。** ドメインの [`Task`] / [`Step`] をそのまま線に乗せない —
+/// 乗せれば `ordinal`・`completedAt`・`interruptionNote` が境界へ出て、この面に置かないと
+/// 決めた値が「たまたま描いていないだけ」になる。運ぶのは描くものだけである。
+///
+/// # 見出しに**完了**の欄が無い
+///
+/// **タスク**は**完了**の状態を持たない (用語集: **完了**は**ステップ**に対して宣言
+/// される)。変種を分けることで、見出しに意味の無い欄が生まれず、見出しが選択の対象に
+/// なりえないことも形として決まる。
+///
+/// # 件数・進捗率に由来する欄が一つも無い
+///
+/// 「全 M ステップ」のような総数も、完了の数も運ばない (AD-15 / spec Never)。欄が無ければ
+/// フロントがどう書こうと描ける値が存在しない。契約は
+/// [`tests::the_disclosure_rows_keep_their_wire_contract`] が固定する。
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum DisclosureRow {
+    /// **タスク**の見出し。**選べない** — 選べるのは**ステップ**だけである。
+    #[serde(rename_all = "camelCase")]
+    Task {
+        /// **タスク**の題名。
+        title: String,
+    },
+    /// **ステップ**の行。
+    #[serde(rename_all = "camelCase")]
+    Step {
+        /// 選択を確定するときに送り返す ID。**`ordinal` ではない** (FR-5)。
+        step_id: String,
+        /// **ステップ**の内容。
+        content: String,
+        /// **完了**しているか。**書体上の素朴な印**として描かれる (AD-15)。
+        completed: bool,
+        /// **現在地**が指す行か。
+        current: bool,
+    },
+}
+
+/// **開示面**が描画に必要とするすべて (CAP-9 / FR-19)。
+///
+/// フィールド名は `src/overlay/Overlay.svelte` の `DisclosureSurface` 型と 1:1 で
+/// 対応する。`invoke<T>` は実行時検査を行わないため、ここを変えると一覧が無言で
+/// 空になる。契約は [`tests::the_disclosure_surface_keeps_its_wire_contract`] が固定する。
+///
+/// **表示のたびに取り直される。** 隠れている間の一覧を持ち越さない (AD-3 鮮度規則 /
+/// FR-19「オーバーレイを閉じた時点で破棄」)。
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DisclosureSurface {
+    /// コアが `manage` されていないときの理由。読めていれば `None`。
+    ///
+    /// **面は開き、理由を示す** (I/O マトリクス「コア不在」)。空の一覧と区別が付かな
+    /// ければ、状態を読めていないことが「タスクが 1 個も無い」として描かれる。
+    pub state_error: Option<String>,
+    /// 見出しと**ステップ**を一つの流れに並べた一覧。
+    ///
+    /// **タスク**が 1 個も無ければ空である。フロントはこれを見て「その旨の 1 行」を出す。
+    pub rows: Vec<DisclosureRow>,
+}
+
+/// **コア状態を開示面の一覧へ落とす純粋関数** (CAP-9 / FR-19)。
+///
+/// `AppHandle` を取らない。コマンドに埋め込んだままでは、見出しと**ステップ**の並びを
+/// 取り違えても生きた Tauri アプリを起動しない限り誰も気づかない ([`snapshot_of`] と
+/// 同じ流儀)。
+///
+/// # v2 への申し送り
+///
+/// FR-19 は「**開示面**は**腐敗**した**タスク**を含まない」と定めるが、v1 に**腐敗**は
+/// 存在しないため濾すものが無く、条件は自明に満たされる。**CAP-20 を足す時点で、除外を
+/// 加える場所はここである。**
+fn disclosure_of(state: Option<&CoreState>) -> DisclosureSurface {
+    let Some(state) = state else {
+        return DisclosureSurface {
+            state_error: Some(CORE_MISSING.to_string()),
+            rows: Vec::new(),
+        };
+    };
+
+    // **現在地**は一度だけ読む。行ごとに引き直すと、行の間で値が変わりうる形になる。
+    let current = state.current_position().step_id();
+    let mut rows = Vec::new();
+    for task in state.tasks() {
+        rows.push(DisclosureRow::Task {
+            title: task.title().to_string(),
+        });
+        for step in task.steps() {
+            rows.push(DisclosureRow::Step {
+                step_id: step.id().to_string(),
+                content: step.content().to_string(),
+                completed: step.is_completed(),
+                current: current == Some(step.id()),
+                // **中断メモ**の本文はここに現れない。再開時の提示は CAP-8 の既定表示が
+                // 担う (spec Never)。
+            });
+        }
+    }
+
+    DisclosureSurface {
+        state_error: None,
+        rows,
+    }
+}
+
 /// `switch_current_position` が受け取る要求。**これがコマンドの引数型そのものである。**
 ///
 /// フロントは `invoke('switch_current_position', { request: { note, declareCompletion } })`
@@ -232,6 +338,60 @@ pub struct CreateTaskOutcome {
     /// 入力が再確定され、v1 では削除も到達もできない重複した**タスク**が生まれる。
     /// 着手に失敗したことは `Err` ではなくこの欄の `false` として運ぶ。
     pub moved: bool,
+}
+
+/// `select_step` が受け取る要求。**これがコマンドの引数型そのものである。**
+///
+/// フロントは `invoke('select_step', { request: { stepId } })` と呼ぶ。[`SwitchRequest`]
+/// と同じ理由で名前付きの型として持つ — 平らな引数にすると、コマンドの仮引数名が唯一の
+/// 契約になり、Tauri を起動せずに検証できる型が一つも残らない。
+///
+/// # なぜ**中断メモ**の欄が無いのか
+///
+/// **この経路は中断メモの機会を与えない** (spec Design Notes)。欄が無ければ、一覧の中に
+/// CAP-7 の儀式を作り直す経路が型として成立しない。**完了**の欄が無いのも同じである —
+/// **完了**は**現在地**の移動で付与も取消もされない (FR-4 / AD-2)。
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SelectStepRequest {
+    /// 選んだ**ステップ**の ID。[`DisclosureRow::Step`] が運んだ文字列そのもの。
+    pub step_id: String,
+}
+
+/// **開示面**からの選択の結末。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SelectStepOutcome {
+    /// **現在地**が動いたか。
+    ///
+    /// 既に**現在地**である**ステップ**を選んだときは偽であり、**何も書かれていない** —
+    /// 履歴も増えない (I/O マトリクス「同じステップを選ぶ」)。
+    pub moved: bool,
+}
+
+/// **イベントを発行すべきか決める純粋関数** ([`outcome_of`] と同じ流儀)。
+///
+/// 条件をコマンドに埋め込んだままでは、`if` を外して常時発行に変えても生きた Tauri
+/// アプリを起動しない限り誰も気づかない。何も書かれていない選択で
+/// `current_position_changed` を出せば、受け手は起きていない変化のために描き直す。
+const fn announces_a_move(outcome: SelectStepOutcome) -> bool {
+    outcome.moved
+}
+
+/// 選んだ行の ID が読めないことを示す理由。
+///
+/// 起こるのは一覧と実際の状態が食い違ったときだけである。黙って何もしないと、Enter が
+/// 効かない理由が利用者に伝わらない。
+const ROW_UNREADABLE: &str = "選んだ行を特定できない。一覧を開き直すこと。";
+
+/// **選んだ行を**ステップ**の ID へ変える純粋関数** (I/O マトリクス「コア不在」の手前)。
+///
+/// `AppHandle` を取らない。**コアを要求する前にこれを通すことが、入力の不備に対して
+/// 「状態を読み込めていない」という無関係な理由を返さないための順序である**
+/// ([`as_task_definition`] と同じ流儀)。コマンドに埋め込んだままでは、読めない ID の
+/// 扱いを生きた Tauri アプリ無しに一行も検証できない。
+fn step_to_select(step_id: &str) -> Result<StepId, String> {
+    StepId::parse(step_id).map_err(|_| ROW_UNREADABLE.to_string())
 }
 
 /// 入力から組み立てた、**タスク**の題名と**ステップ**の内容の列。
@@ -461,6 +621,64 @@ pub fn create_task<R: Runtime>(
 
     log::info!("a task was created (moved=true)");
     Ok(CreateTaskOutcome { moved: true })
+}
+
+/// **開示面**が表示されるたびに呼ばれ、一覧の完全なスナップショットを返す
+/// (CAP-9 / FR-19 / AD-3 鮮度規則)。
+///
+/// **コアが読めなくても失敗しない。** 面は開き、理由を [`DisclosureSurface::state_error`]
+/// として運ぶ (I/O マトリクス「コア不在」)。失敗させると、開いた面が空白のまま出る。
+///
+/// # なぜ [`get_overlay_snapshot`] に相乗りしないのか
+///
+/// 既定表示は**次の一手**のみを描く (FR-2)。一覧を同じスナップショットに載せれば、
+/// 初期表示のために毎回取得される値の中に全体像が入り、**隠れている間持ち越さない**
+/// という FR-19 の条件を保つ場所が無くなる。取得の契機が違うものは別のコマンドにする。
+#[tauri::command]
+pub fn get_disclosure_surface<R: Runtime>(app: AppHandle<R>) -> DisclosureSurface {
+    let state = app.try_state::<Core>().map(|core| core.snapshot());
+    disclosure_of(state.as_ref())
+}
+
+/// **開示面**で選んだ**ステップ**へ**現在地**を移す (CAP-9 / FR-19)。
+///
+/// **現在地**の移動と**切り替え履歴**の追記は、コア側の単一のトランザクションで確定する
+/// (AD-5)。**中断メモ**の機会は与えず、**完了**にも触れない — 履歴の「メモを書いたか」は
+/// 常に偽である (spec Design Notes)。
+///
+/// # Errors
+///
+/// 選んだ行の ID が読めないとき、コアが `manage` されていないとき、**ステップ**が
+/// 見つからないとき、または永続化に失敗したとき。**いずれの場合も状態は変わっていない。**
+#[tauri::command]
+pub fn select_step<R: Runtime>(
+    app: AppHandle<R>,
+    request: SelectStepRequest,
+) -> Result<SelectStepOutcome, String> {
+    // **コアを要求する前に入力を検める** (`create_task` と同じ順序)。逆にすると、行の
+    // 取り違えに対して「状態を読み込めていない」という無関係な理由が返りうる。
+    let step_id = step_to_select(&request.step_id)?;
+    let core = require_core(app.try_state::<Core>())?;
+
+    let outcome = SelectStepOutcome {
+        moved: core
+            .select_step(step_id)
+            .map_err(|error| error.to_string())?,
+    };
+
+    // **動いたときだけ発行する。** 何も書かれていない選択でこれを出せば、起きていない
+    // 変化を主張することになる。
+    if announces_a_move(outcome) {
+        crate::announce_current_position_changed(&app);
+    }
+
+    // **ステップ**の内容も**タスク**の題名も書かない。書いてよいのは「起きた」という
+    // 事実だけである。
+    log::info!(
+        "a step was selected on the disclosure surface (moved={})",
+        outcome.moved
+    );
+    Ok(outcome)
 }
 
 /// 入力欄の文字列を**中断メモ**に変える。**空欄は省略である** (FR-7)。
@@ -1068,5 +1286,362 @@ mod tests {
                 .map(InterruptionNote::text),
             Some(" 3 段落目の途中 ")
         );
+    }
+
+    // --- 開示面 (CAP-9 / FR-19) ------------------------------------------------
+
+    /// 2 **タスク**・計 5 **ステップ**のコア状態を作る。第 2 **タスク**の第 3 **ステップ**
+    /// が**現在地**であり、第 1 **タスク**の第 2 **ステップ**は**完了**している。
+    fn a_state_with_two_tasks_and_five_steps() -> CoreState {
+        let core = Core::restore(
+            Box::new(FixedClock::at(1_789_000_000_000)),
+            Box::new(AcceptingStorage),
+        )
+        .expect("空の状態は復元できる");
+        let first = core
+            .create_task("原稿", contents(&["構成を決める", "下書きを書く"]))
+            .expect("作れる");
+        let second = core
+            .create_task("買い物", contents(&["米", "味噌", "醤油"]))
+            .expect("作れる");
+
+        let snapshot = core.snapshot();
+        let done = snapshot.task(first).expect("ある").steps()[1].id();
+        let here = snapshot.task(second).expect("ある").steps()[2].id();
+        core.declare_completion(done).expect("宣言できる");
+        core.move_current_position(here).expect("移せる");
+        core.snapshot()
+    }
+
+    /// **コア状態から直に ID を読む。** 射影の戻り値から取り出すと、全行が同じ ID を
+    /// 運んでいても期待値と一致してしまう — そのとき一覧のどの行を選んでも同じ
+    /// **ステップ**へ移る。
+    fn step_id_in(state: &CoreState, task: usize, step: usize) -> String {
+        state.tasks()[task].steps()[step].id().to_string()
+    }
+
+    /// 受け入れ条件「2 タスク・計 5 ステップ → 見出しと 5 行が現れ、現在地の行がそれと
+    /// 分かる」。
+    ///
+    /// **見出しと**ステップ**が一つの流れになっていること**を、並びそのもので見る。
+    #[test]
+    fn two_tasks_project_as_one_stream_of_headings_and_steps() {
+        let state = a_state_with_two_tasks_and_five_steps();
+
+        let surface = disclosure_of(Some(&state));
+
+        assert_eq!(surface.state_error, None);
+        assert_eq!(
+            surface.rows,
+            vec![
+                DisclosureRow::Task {
+                    title: "原稿".to_string()
+                },
+                DisclosureRow::Step {
+                    step_id: step_id_in(&state, 0, 0),
+                    content: "構成を決める".to_string(),
+                    completed: false,
+                    current: false,
+                },
+                DisclosureRow::Step {
+                    step_id: step_id_in(&state, 0, 1),
+                    content: "下書きを書く".to_string(),
+                    completed: true,
+                    current: false,
+                },
+                DisclosureRow::Task {
+                    title: "買い物".to_string()
+                },
+                DisclosureRow::Step {
+                    step_id: step_id_in(&state, 1, 0),
+                    content: "米".to_string(),
+                    completed: false,
+                    current: false,
+                },
+                DisclosureRow::Step {
+                    step_id: step_id_in(&state, 1, 1),
+                    content: "味噌".to_string(),
+                    completed: false,
+                    current: false,
+                },
+                DisclosureRow::Step {
+                    step_id: step_id_in(&state, 1, 2),
+                    content: "醤油".to_string(),
+                    completed: false,
+                    current: true,
+                },
+            ],
+            "見出し 2 行と ステップ 5 行が、タスクごとにまとまった一つの流れで並ぶ"
+        );
+    }
+
+    /// 行ごとの ID は別物である。**同じ ID を配ってしまえば、どの行を選んでも同じ
+    /// ステップへ移る。**
+    #[test]
+    fn every_listed_step_carries_its_own_id() {
+        let surface = disclosure_of(Some(&a_state_with_two_tasks_and_five_steps()));
+
+        let mut ids: Vec<String> = surface
+            .rows
+            .iter()
+            .filter_map(|row| match row {
+                DisclosureRow::Step { step_id, .. } => Some(step_id.clone()),
+                DisclosureRow::Task { .. } => None,
+            })
+            .collect();
+        assert_eq!(ids.len(), 5);
+        ids.sort();
+        ids.dedup();
+        assert_eq!(ids.len(), 5, "5 行が 5 つの異なる ID を運ぶ");
+    }
+
+    /// **現在地**の行はちょうど一つである (CAP-6 / FR-6)。
+    ///
+    /// 集合として持たない**現在地**が、射影で二つに増えないことを見る。
+    #[test]
+    fn exactly_one_row_is_marked_as_the_current_position() {
+        let surface = disclosure_of(Some(&a_state_with_two_tasks_and_five_steps()));
+
+        let marked = surface
+            .rows
+            .iter()
+            .filter(|row| matches!(row, DisclosureRow::Step { current: true, .. }))
+            .count();
+        assert_eq!(marked, 1);
+    }
+
+    /// **未着手**でも一覧は出る。**現在地**の行が無いだけである。
+    ///
+    /// ここが空の一覧になると、着手せずに作った**タスク**へ到達する経路が消える —
+    /// 本スライスが解消しようとしている穴そのものが残る。
+    #[test]
+    fn a_not_started_position_still_lists_every_task() {
+        let core = Core::restore(
+            Box::new(FixedClock::at(1_789_000_000_000)),
+            Box::new(AcceptingStorage),
+        )
+        .expect("空の状態は復元できる");
+        core.create_task("着手せずに書き留めた", contents(&["一", "二"]))
+            .expect("作れる");
+
+        let surface = disclosure_of(Some(&core.snapshot()));
+
+        assert_eq!(surface.rows.len(), 3, "見出し 1 行 + ステップ 2 行");
+        assert!(
+            !surface
+                .rows
+                .iter()
+                .any(|row| matches!(row, DisclosureRow::Step { current: true, .. })),
+            "現在地の行は無い"
+        );
+    }
+
+    /// I/O マトリクス「タスクが無い」— 空の一覧であり、理由は付かない。
+    ///
+    /// **「読めていない」と「1 個も無い」を区別する。** フロントはこの違いで出す 1 行を
+    /// 決める。
+    #[test]
+    fn an_empty_store_projects_as_an_empty_list_without_a_reason() {
+        let surface = disclosure_of(Some(&CoreState::default()));
+
+        assert_eq!(surface.state_error, None, "読めてはいる");
+        assert!(surface.rows.is_empty());
+    }
+
+    /// I/O マトリクス「コア不在」— 面は開き、理由を運ぶ。一覧は空である。
+    #[test]
+    fn a_missing_core_opens_the_surface_with_a_reason() {
+        let surface = disclosure_of(None);
+
+        assert_eq!(surface.state_error.as_deref(), Some(CORE_MISSING));
+        assert!(surface.rows.is_empty(), "描く一覧は無い");
+    }
+
+    /// **中断メモ**の本文が一覧に乗らない (spec Never)。
+    ///
+    /// 再開時の提示は CAP-8 の既定表示が担う。ここに載せれば、全体像を見るだけの操作で
+    /// 他の**ステップ**の文脈まで視界に入る。
+    #[test]
+    fn the_disclosure_carries_no_interruption_note_text() {
+        let core = Core::restore(
+            Box::new(FixedClock::at(1_789_000_000_000)),
+            Box::new(AcceptingStorage),
+        )
+        .expect("空の状態は復元できる");
+        let task_id = core
+            .create_task("原稿", contents(&["構成を決める", "下書きを書く"]))
+            .expect("作れる");
+        let first = core.snapshot().task(task_id).expect("ある").steps()[0].id();
+        core.set_interruption_note(first, Some(InterruptionNote::new("接続詞を整える途中")))
+            .expect("メモを置ける");
+
+        let surface = disclosure_of(Some(&core.snapshot()));
+        let json = serde_json::to_string(&surface).expect("直列化できる");
+
+        assert!(
+            !json.contains("接続詞を整える途中"),
+            "本文がどの欄にも現れない: {json}"
+        );
+        assert!(
+            !json.contains("interruptionNote"),
+            "欄そのものが無い: {json}"
+        );
+    }
+
+    /// Rust → TS の契約。フィールド名を変えると一覧が無言で空になる。
+    #[test]
+    fn the_disclosure_surface_keeps_its_wire_contract() {
+        let json: serde_json::Value = serde_json::to_value(DisclosureSurface {
+            state_error: None,
+            rows: Vec::new(),
+        })
+        .expect("直列化できる");
+
+        let fields: Vec<&String> = json
+            .as_object()
+            .expect("オブジェクトである")
+            .keys()
+            .collect();
+        assert_eq!(
+            fields,
+            vec!["rows", "stateError"],
+            "件数・進捗率に由来する欄を足さない (AD-15)"
+        );
+        assert!(json["stateError"].is_null());
+        assert!(json["rows"].is_array());
+    }
+
+    /// **鍵の集合を固定する検査** (`the_snapshot_carries_nothing_from_the_switch_record`
+    /// と同じ流儀)。
+    ///
+    /// 欄が無ければ、フロントがどう書こうと描ける値が存在しない。`ordinal` を足せば
+    /// 「第 N / 全 M」をこの面で組み立てられてしまい、`completedAt` を足せば時刻が
+    /// 出る。どちらも AD-15 と spec Never が禁じている。
+    #[test]
+    fn the_disclosure_rows_keep_their_wire_contract() {
+        let heading = serde_json::to_value(DisclosureRow::Task {
+            title: "原稿".to_string(),
+        })
+        .expect("直列化できる");
+        assert_eq!(
+            heading
+                .as_object()
+                .expect("オブジェクトである")
+                .keys()
+                .collect::<Vec<&String>>(),
+            vec!["kind", "title"],
+            "見出しは題名だけを運ぶ"
+        );
+        assert_eq!(heading["kind"], "task");
+
+        let step = serde_json::to_value(DisclosureRow::Step {
+            step_id: "0198f0e0-0000-7000-8000-000000000000".to_string(),
+            content: "下書きを書く".to_string(),
+            completed: true,
+            current: false,
+        })
+        .expect("直列化できる");
+        assert_eq!(
+            step.as_object()
+                .expect("オブジェクトである")
+                .keys()
+                .collect::<Vec<&String>>(),
+            vec!["completed", "content", "current", "kind", "stepId"],
+            "連番・時刻・メモ・件数に由来する欄を足さない (AD-15)"
+        );
+        assert_eq!(step["kind"], "step");
+        assert!(step["completed"].is_boolean());
+        assert!(step["current"].is_boolean());
+        assert!(step["stepId"].is_string());
+    }
+
+    /// 選択の対象は**ステップ**の ID である。**そのまま送り返せば復元できる。**
+    ///
+    /// 運ぶ形が壊れていれば、一覧の Enter が毎回「行を特定できない」で落ちる。
+    #[test]
+    fn a_listed_step_id_round_trips_back_into_the_domain() {
+        let state = a_state_with_two_tasks_and_five_steps();
+        let surface = disclosure_of(Some(&state));
+        let DisclosureRow::Step {
+            step_id: listed, ..
+        } = &surface.rows[6]
+        else {
+            panic!("7 行目はステップの行である")
+        };
+
+        let parsed = step_to_select(listed).expect("一覧が運んだ ID はそのまま読み戻せる");
+
+        assert_eq!(parsed.to_string(), *listed);
+        assert_eq!(
+            parsed,
+            state.tasks()[1].steps()[2].id(),
+            "読み戻した ID はコアが持つステップそのものを指す"
+        );
+    }
+
+    /// **TS → Rust の契約。** フロントが送る JSON がそのまま復元できる。
+    #[test]
+    fn the_selection_request_keeps_its_wire_contract() {
+        let request: SelectStepRequest =
+            serde_json::from_str(r#"{"stepId":"0198f0e0-0000-7000-8000-000000000000"}"#)
+                .expect("フロントが送る形で復元できる");
+        assert_eq!(
+            request,
+            SelectStepRequest {
+                step_id: "0198f0e0-0000-7000-8000-000000000000".to_string(),
+            }
+        );
+
+        // 受け付ける綴りは camelCase の一つだけである。
+        assert!(serde_json::from_str::<SelectStepRequest>(
+            r#"{"step_id":"0198f0e0-0000-7000-8000-000000000000"}"#
+        )
+        .is_err());
+
+        // **メモも完了も受け取らない。** 送られてきても無視される — 型に欄が無い。
+        let ignored: SelectStepRequest = serde_json::from_str(
+            r#"{"stepId":"0198f0e0-0000-7000-8000-000000000000","note":"書いた","declareCompletion":true}"#,
+        )
+        .expect("余分な欄は落ちる");
+        assert_eq!(ignored.step_id, "0198f0e0-0000-7000-8000-000000000000");
+    }
+
+    /// 選択の結末も TS 側と 1:1 である。**欄は `moved` の一つだけである。**
+    #[test]
+    fn the_selection_outcome_keeps_its_wire_contract() {
+        assert_eq!(
+            serde_json::to_value(SelectStepOutcome { moved: true }).expect("直列化できる"),
+            serde_json::json!({ "moved": true })
+        );
+        assert_eq!(
+            serde_json::to_value(SelectStepOutcome { moved: false }).expect("直列化できる"),
+            serde_json::json!({ "moved": false })
+        );
+    }
+
+    /// 読めない ID は、面を閉じずに示される理由になる。
+    ///
+    /// **コアを要求する前にここを通る。** この関数がコアを取らないことが、入力の不備に
+    /// 対して「状態を読み込めていない」と返らないことの担保である。
+    #[test]
+    fn an_unreadable_row_is_refused_with_a_reason() {
+        assert_eq!(
+            step_to_select("not-a-uuid").err().as_deref(),
+            Some(ROW_UNREADABLE)
+        );
+        assert_eq!(step_to_select("").err().as_deref(), Some(ROW_UNREADABLE));
+        assert!(
+            ROW_UNREADABLE.contains("開き直す"),
+            "次に何をすればよいかを示す文であること"
+        );
+    }
+
+    /// **何も書かれていない選択ではイベントを発行しない** (AD-3)。
+    ///
+    /// 発行すれば、受け手は起きていない変化のために描き直す。
+    #[test]
+    fn only_a_move_announces_the_current_position() {
+        assert!(announces_a_move(SelectStepOutcome { moved: true }));
+        assert!(!announces_a_move(SelectStepOutcome { moved: false }));
     }
 }
