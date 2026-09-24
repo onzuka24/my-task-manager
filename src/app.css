@@ -3,6 +3,10 @@
   --overlay-fg: #e8eaed;
   --overlay-muted: #9aa0a6;
   --overlay-alert: #ffb4a2;
+  /* 器の中に一段だけ起こす面 (入力欄・選んでいる行)。 */
+  --overlay-raised: #1d2026;
+  /* 入力位置がそこにあることを示す線。 */
+  --overlay-focus: #5a6270;
 
   font-family: -apple-system, BlinkMacSystemFont, "Hiragino Sans", "Noto Sans JP", sans-serif;
   color-scheme: dark;

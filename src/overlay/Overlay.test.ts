@@ -32,6 +32,78 @@ const SNAPSHOT = {
   interruptionNote: '接続詞を整える途中',
 }
 
+/**
+ * 一覧の下敷きとなるコア状態。2 タスク・計 5 ステップ。現在地は第 2 タスクの第 3
+ * ステップであり、第 1 タスクの第 2 ステップだけが完了している (spec の I/O マトリクス)。
+ *
+ * **ここから `get_disclosure_surface` の応答を組み立てる。** 固定の一覧を返すと、
+ * 「開いているタスクの分だけを並べる」という射影の規則を、フロントの検査が素通りする
+ * — どの要求にも同じ 5 ステップが返り、全部が同時に見えていても緑になる。
+ */
+const MANUSCRIPT = '0198f0e0-0000-7000-8000-0000000000a1'
+const SHOPPING = '0198f0e0-0000-7000-8000-0000000000a2'
+
+const TASKS = [
+  {
+    taskId: MANUSCRIPT,
+    title: '原稿',
+    steps: [
+      { stepId: '0198f0e0-0000-7000-8000-000000000001', content: '構成を決める', completed: false },
+      { stepId: '0198f0e0-0000-7000-8000-000000000002', content: '下書きを書く', completed: true },
+    ],
+  },
+  {
+    taskId: SHOPPING,
+    title: '買い物',
+    steps: [
+      { stepId: '0198f0e0-0000-7000-8000-000000000003', content: '米', completed: false },
+      { stepId: '0198f0e0-0000-7000-8000-000000000004', content: '味噌', completed: false },
+      { stepId: '0198f0e0-0000-7000-8000-000000000005', content: '醤油', completed: false },
+    ],
+  },
+]
+
+/** 現在地のステップ。`null` なら未着手である。 */
+let currentStepId: string | null = '0198f0e0-0000-7000-8000-000000000005'
+
+/** 現在地を含むタスク。未着手ならどのタスクでもない。 */
+function taskAtCurrentPosition(): string | null {
+  return TASKS.find((task) => task.steps.some((step) => step.stepId === currentStepId))?.taskId ?? null
+}
+
+/**
+ * src-tauri/src/commands/mod.rs の `disclosure_of` と同じ規則で一覧を組み立てる。
+ *
+ * **見出しは常にすべて並び、ステップは開いた 1 タスクの分だけが続く** (spec Boundaries)。
+ * `openTaskId` が `null` なら開くのは現在地のタスクであり、未着手ならどれも開かない。
+ */
+function disclosureFor(openTaskId: string | null): Record<string, unknown> {
+  const open = openTaskId ?? taskAtCurrentPosition()
+  const rows: Record<string, unknown>[] = []
+  for (const task of TASKS) {
+    const opened = task.taskId === open
+    rows.push({
+      kind: 'task',
+      taskId: task.taskId,
+      title: task.title,
+      open: opened,
+      // **開閉とは別の欄である。** 閉じていても現在地を抱えていることを示す。
+      holdsCurrentPosition: task.taskId === taskAtCurrentPosition(),
+    })
+    if (!opened) continue
+    for (const step of task.steps) {
+      rows.push({
+        kind: 'step',
+        stepId: step.stepId,
+        content: step.content,
+        completed: step.completed,
+        current: step.stepId === currentStepId,
+      })
+    }
+  }
+  return { stateError: null, rows }
+}
+
 /** `@tauri-apps/api` の mock が用意しないイベント内部実装の穴。 */
 type EventPluginInternals = { unregisterListener?: (event: string, id: number) => void }
 
@@ -40,6 +112,17 @@ let calls: { cmd: string; args: Record<string, unknown> }[] = []
 let snapshot: Record<string, unknown> = { ...SNAPSHOT }
 let switchOutcome = { moved: true }
 let createOutcome = { moved: false }
+/**
+ * 一覧の応答を差し替える。**空の一覧・コア不在のように、状態から組み立てられない
+ * 応答だけがここを使う。** `null` のときは [`disclosureFor`] が要求に応じて組み立てる。
+ */
+let disclosureOverride: Record<string, unknown> | null = null
+/** 一覧の取得を失敗させる旗。**取り直しの契機を保ったまま失敗を起こすために使う。** */
+let disclosureFails = false
+/** 一覧の応答を握り、任意の時点で返すための仕掛け。遅れて着く応答を作る。 */
+let holdDisclosure = false
+let releaseDisclosure: ((surface: Record<string, unknown>) => void) | null = null
+let selectOutcome = { moved: true }
 let component: Record<string, unknown> | undefined
 
 /**
@@ -75,6 +158,16 @@ function installIPC(): void {
       if (cmd === 'get_overlay_snapshot') return snapshot
       if (cmd === 'switch_current_position') return switchOutcome
       if (cmd === 'create_task') return createOutcome
+      if (cmd === 'get_disclosure_surface') {
+        if (disclosureFails) throw new Error('常駐プロセスが応答しない')
+        if (holdDisclosure) {
+          return new Promise((resolve) => {
+            releaseDisclosure = resolve as (surface: Record<string, unknown>) => void
+          })
+        }
+        return surfaceFor(args)
+      }
+      if (cmd === 'select_step') return selectOutcome
       return null
     },
     { shouldMockEvents: true },
@@ -83,6 +176,23 @@ function installIPC(): void {
 
 function argsOf(cmd: string): Record<string, unknown> | undefined {
   return calls.find((call) => call.cmd === cmd)?.args
+}
+
+/** 直近の呼び出しの引数。**開き直しの要求は毎回変わる** — 最初の 1 回では見えない。 */
+function lastArgsOf(cmd: string): Record<string, unknown> | undefined {
+  return [...calls].reverse().find((call) => call.cmd === cmd)?.args
+}
+
+/**
+ * コマンドの引数から一覧の応答を作る。
+ *
+ * **要求された `openTaskId` を実際に読む。** 無視して固定の一覧を返せば、見出しの確定が
+ * 何も変えていなくても検査は緑になる。
+ */
+function surfaceFor(args: unknown): Record<string, unknown> {
+  if (disclosureOverride) return disclosureOverride
+  const request = ((args ?? {}) as { request?: { openTaskId?: string | null } }).request ?? {}
+  return disclosureFor(request.openTaskId ?? null)
 }
 
 function noteField(): HTMLTextAreaElement {
@@ -124,6 +234,16 @@ function installHangingIPC(hanging: string): void {
       if (cmd === 'get_overlay_snapshot') return snapshot
       if (cmd === 'switch_current_position') return switchOutcome
       if (cmd === 'create_task') return createOutcome
+      if (cmd === 'get_disclosure_surface') {
+        if (disclosureFails) throw new Error('常駐プロセスが応答しない')
+        if (holdDisclosure) {
+          return new Promise((resolve) => {
+            releaseDisclosure = resolve as (surface: Record<string, unknown>) => void
+          })
+        }
+        return surfaceFor(args)
+      }
+      if (cmd === 'select_step') return selectOutcome
       return null
     },
     { shouldMockEvents: true },
@@ -140,8 +260,67 @@ async function openCreation(): Promise<void> {
   await settle()
 }
 
+/** 開示面へ入る。到達には明示的な打鍵が 1 回要る (FR-19 / FR-2 / AD-15)。 */
+async function openDisclosure(): Promise<void> {
+  press('l', { metaKey: true })
+  await settle()
+}
+
+function stepRows(): HTMLButtonElement[] {
+  return [...document.querySelectorAll<HTMLButtonElement>('.step-row')]
+}
+
+function rowTexts(): string[] {
+  return stepRows().map((row) => row.textContent?.trim() ?? '')
+}
+
+/** 見出しの行。**常にすべて現れる** — 隠れるのはステップだけである。 */
+function headings(): HTMLButtonElement[] {
+  return [...document.querySelectorAll<HTMLButtonElement>('.task-heading')]
+}
+
+/** 見出しの題名。**印は含めない** — 印そのものは別の検査が見る。 */
+function headingTitle(row: HTMLElement): string {
+  return row.querySelector('.content')?.textContent?.trim() ?? ''
+}
+
+function headingTexts(): string[] {
+  return headings().map(headingTitle)
+}
+
+/** 開いている見出し。**高々一つである** (spec Boundaries)。 */
+function openedHeadings(): string[] {
+  return headings()
+    .filter((row) => row.getAttribute('aria-expanded') === 'true')
+    .map(headingTitle)
+}
+
+/** **現在地**を抱えると示している見出し。**高々一つである** (CAP-6 / FR-6)。 */
+function headingsWithTheCurrentPosition(): string[] {
+  return headings()
+    .filter((row) => row.getAttribute('aria-current') === 'location')
+    .map(headingTitle)
+}
+
+/** 入力位置を、指定の鍵を持つ行まで ↑ で運ぶ。到達できなければ投げる。 */
+async function moveSelectionTo(rowKey: string): Promise<void> {
+  for (let i = 0; i < 16; i += 1) {
+    if ((document.activeElement as HTMLElement)?.dataset.rowKey === rowKey) return
+    press('ArrowUp')
+    await settle()
+  }
+  throw new Error(`${rowKey} へ入力位置が届かない`)
+}
+
 function press(key: string, init: KeyboardEventInit = {}): void {
   window.dispatchEvent(new KeyboardEvent('keydown', { key, ...init }))
+}
+
+/** 打鍵を飲んだか (`preventDefault`) まで見たいときに使う。 */
+function pressCancelable(key: string, init: KeyboardEventInit = {}): KeyboardEvent {
+  const event = new KeyboardEvent('keydown', { key, cancelable: true, ...init })
+  window.dispatchEvent(event)
+  return event
 }
 
 async function mountOverlay(): Promise<void> {
@@ -158,6 +337,12 @@ beforeEach(async () => {
   snapshot = { ...SNAPSHOT }
   switchOutcome = { moved: true }
   createOutcome = { moved: false }
+  currentStepId = '0198f0e0-0000-7000-8000-000000000005'
+  disclosureOverride = null
+  disclosureFails = false
+  holdDisclosure = false
+  releaseDisclosure = null
+  selectOutcome = { moved: true }
   mockWindows('main')
   installIPC()
   stubEventInternals()
@@ -1011,4 +1196,604 @@ test('コアが読めなくても作成の面には入れ、失敗の理由が�
   // 面は閉じない。理由はその場に出る (I/O マトリクス「コア不在」)。
   expect(document.querySelector('input.title')).not.toBeNull()
   expect(document.querySelector('[role="alert"]')?.textContent ?? '').toContain(CORE_MISSING)
+})
+
+
+// --- 開示面 (CAP-9 / FR-19) ---------------------------------------------------
+
+test('初期表示に開示面は現れない (FR-19 / FR-2 / AD-15)', () => {
+  expect(document.querySelector('.disclosure')).toBeNull()
+  expect(stepRows()).toHaveLength(0)
+  // 隠れている間に一覧を取りに行かない。
+  expect(invoked).not.toContain('get_disclosure_surface')
+  // 到達の手がかりはあるが、面そのものは出ていない。
+  expect(document.body.textContent ?? '').toContain('⌘L で一覧')
+})
+
+test('⌘L で一覧に入り、現在地の行に入力位置がある', async () => {
+  await openDisclosure()
+
+  // 表示のたびに完全なスナップショットを取得してから描く (AD-3 鮮度規則)。
+  expect(invoked).toContain('get_disclosure_surface')
+  // **開くタスクを決めるのはコアである。** 面を開いた時点の要求は `null` であり、
+  // 前回どのタスクを開いていたかを持ち越さない。
+  expect(argsOf('get_disclosure_surface')).toEqual({ request: { openTaskId: null } })
+  expect(document.querySelector('.disclosure')).not.toBeNull()
+  const here = stepRows().find((row) => row.getAttribute('aria-current') === 'step')
+  expect(here?.dataset.stepId).toBe('0198f0e0-0000-7000-8000-000000000005')
+  expect(document.activeElement).toBe(here)
+})
+
+test('見出しはすべて現れるが、ステップは現在地のタスクの分だけである (設計上の賭け #1)', async () => {
+  await openDisclosure()
+
+  // 見出しは 2 件とも現れる。
+  expect(headingTexts()).toEqual(['原稿', '買い物'])
+  // **開いているのは現在地のタスクだけである。**
+  expect(openedHeadings()).toEqual(['買い物'])
+  // 全部のステップが同時に見えてはならない。並ぶのは開いた 1 タスクの分だけである。
+  expect(stepRows()).toHaveLength(3)
+  expect(rowTexts()[0]).toContain('米')
+  expect(rowTexts()[1]).toContain('味噌')
+  expect(rowTexts()[2]).toContain('醤油')
+})
+
+test('全部のステップが同時に見える形にならない — 閉じたタスクの中身は現れない', async () => {
+  await openDisclosure()
+
+  const text = document.body.textContent ?? ''
+  expect(text).toContain('原稿')
+  expect(text).not.toContain('構成を決める')
+  expect(text).not.toContain('下書きを書く')
+  expect(stepRows()).toHaveLength(3)
+})
+
+test('見出しを確定するとそのタスクが開き、直前のタスクが閉じる', async () => {
+  await openDisclosure()
+  expect(openedHeadings()).toEqual(['買い物'])
+
+  await moveSelectionTo(`task:${MANUSCRIPT}`)
+  press('Enter')
+  await settle()
+
+  // 開くタスクが変わっただけで、一覧をコアから作り直す。
+  expect(lastArgsOf('get_disclosure_surface')).toEqual({
+    request: { openTaskId: MANUSCRIPT },
+  })
+  expect(openedHeadings()).toEqual(['原稿'])
+  expect(stepRows()).toHaveLength(2)
+  expect(rowTexts()[0]).toContain('構成を決める')
+  expect(rowTexts()[1]).toContain('下書きを書く')
+  // 直前に開いていたタスクのステップは消える。
+  expect(document.body.textContent ?? '').not.toContain('醤油')
+  // 見出しは 2 件とも残る。面も開いたままである。
+  expect(headingTexts()).toEqual(['原稿', '買い物'])
+  expect(document.querySelector('.disclosure')).not.toBeNull()
+})
+
+test('見出しの確定は現在地を動かさず、履歴も増やさない', async () => {
+  await openDisclosure()
+  invoked = []
+
+  await moveSelectionTo(`task:${MANUSCRIPT}`)
+  press('Enter')
+  await settle()
+
+  // 何も書かない。切り替えの儀式も、一覧からの移動も撃たない。
+  expect(invoked).not.toContain('select_step')
+  expect(invoked).not.toContain('switch_current_position')
+  // 既定表示のスナップショットも取り直さない — 現在地は動いていない。
+  expect(invoked).not.toContain('get_overlay_snapshot')
+  expect(invoked).not.toContain('hide_overlay')
+})
+
+test('確定した見出しに入力位置が留まる — 開いた行の上に落ちない', async () => {
+  await openDisclosure()
+
+  await moveSelectionTo(`task:${MANUSCRIPT}`)
+  press('Enter')
+  await settle()
+
+  expect((document.activeElement as HTMLElement)?.dataset.rowKey).toBe(`task:${MANUSCRIPT}`)
+  // そこから ↓ で、開いたばかりのステップへ入れる。
+  press('ArrowDown')
+  await settle()
+  expect((document.activeElement as HTMLElement)?.dataset.stepId).toBe(
+    '0198f0e0-0000-7000-8000-000000000001',
+  )
+})
+
+test('開いたタスクの完了したステップに素朴な印が付く', async () => {
+  await openDisclosure()
+  await moveSelectionTo(`task:${MANUSCRIPT}`)
+  press('Enter')
+  await settle()
+
+  expect(rowTexts()[0]).toContain('構成を決める')
+  // 完了した行にだけ印が付く。
+  expect(rowTexts()[1]).toContain('✓')
+  expect(rowTexts()[0]).not.toContain('✓')
+})
+
+test('別のタスクを開いても、現在地がどこにあるかは見出しが示す', async () => {
+  await openDisclosure()
+
+  await moveSelectionTo(`task:${MANUSCRIPT}`)
+  press('Enter')
+  await settle()
+
+  // 現在地のステップは閉じたタスクの中にあり、行としては現れない。
+  expect(document.body.textContent ?? '').not.toContain('醤油')
+  expect(stepRows().filter((row) => row.getAttribute('aria-current') === 'step')).toHaveLength(0)
+  // **それでも現在地は分かる。** 印は閉じている見出しの側に付く。
+  expect(headingsWithTheCurrentPosition()).toEqual(['買い物'])
+  const marked = headings().find((row) => row.getAttribute('aria-current') === 'location')
+  expect(marked?.querySelector('.here')?.textContent?.trim()).toBe('●')
+  // 開いているのは別のタスクである — 印と開閉を取り違えていない。
+  expect(openedHeadings()).toEqual(['原稿'])
+  expect(marked?.getAttribute('aria-expanded')).toBe('false')
+})
+
+test('現在地の印は一つだけである (CAP-6 / FR-6)', async () => {
+  await openDisclosure()
+
+  // 開いているタスクが現在地を抱えているときも、印は見出しに付く。
+  expect(headingsWithTheCurrentPosition()).toEqual(['買い物'])
+  // 印の付いた見出しは一つ、印の付いた行も一つ。二つの印は別の意味を持つ。
+  expect(headings().filter((row) => row.querySelector('.here')?.textContent?.trim())).toHaveLength(1)
+  expect(stepRows().filter((row) => row.getAttribute('aria-current') === 'step')).toHaveLength(1)
+})
+
+test('未着手ならどのタスクも開かない — 見出しだけが現れる', async () => {
+  currentStepId = null
+  await openDisclosure()
+
+  expect(headingTexts()).toEqual(['原稿', '買い物'])
+  expect(openedHeadings()).toEqual([])
+  expect(stepRows()).toHaveLength(0)
+  // **無い現在地を描かない。** 印を付ければ、まだ始めていないことが「ここにいる」と
+  // して静かに描かれる。
+  expect(headingsWithTheCurrentPosition()).toEqual([])
+  expect(headings().filter((row) => row.querySelector('.here')?.textContent?.trim())).toHaveLength(0)
+  // 入力位置は先頭の見出しにある。
+  expect((document.activeElement as HTMLElement)?.dataset.rowKey).toBe(`task:${MANUSCRIPT}`)
+})
+
+test('未着手でも見出しを確定すれば、着手せずに作ったタスクへ到達できる', async () => {
+  currentStepId = null
+  await openDisclosure()
+
+  press('Enter')
+  await settle()
+
+  expect(openedHeadings()).toEqual(['原稿'])
+  expect(rowTexts()[0]).toContain('構成を決める')
+
+  // そのステップを確定すれば現在地がそこへ移る — 到達不能が解消する経路である。
+  press('ArrowDown')
+  await settle()
+  press('Enter')
+  await settle()
+  expect(argsOf('select_step')).toEqual({
+    request: { stepId: '0198f0e0-0000-7000-8000-000000000001' },
+  })
+})
+
+test('現在地の行がそれと分かる — 印は一つだけである (FR-6)', async () => {
+  await openDisclosure()
+
+  const marked = stepRows().filter((row) => row.getAttribute('aria-current') === 'step')
+  expect(marked).toHaveLength(1)
+  expect(marked[0].textContent ?? '').toContain('醤油')
+  expect(marked[0].textContent ?? '').toContain('▸')
+})
+
+test('一覧は進捗率も件数も総数も描かない (AD-15)', async () => {
+  await openDisclosure()
+
+  const text = document.body.textContent ?? ''
+  expect(text).not.toContain('%')
+  expect(text).not.toContain('件')
+  expect(text).not.toContain('全 5')
+  expect(text).not.toContain('ステップ /')
+  expect(document.querySelector('progress')).toBeNull()
+  expect(document.querySelector('meter')).toBeNull()
+  // 見出しの印も位置情報である — 数も割合も伴わない。
+  expect(headings().map((row) => row.querySelector('.here')?.textContent?.trim() ?? '')).toEqual([
+    '',
+    '●',
+  ])
+})
+
+test('一覧は並べ替え・改名・削除の手がかりを持たない (SPEC 非目標)', async () => {
+  await openDisclosure()
+
+  // 面に入力欄が無いことが、編集の面へ滑り出していないことの実体である。
+  expect(document.querySelector('input')).toBeNull()
+  expect(document.querySelector('textarea')).toBeNull()
+})
+
+test('↑↓ で入力位置が行の間を動く — 見出しにも止まる', async () => {
+  await openDisclosure()
+
+  press('ArrowUp')
+  await settle()
+  expect((document.activeElement as HTMLElement)?.dataset.stepId).toBe(
+    '0198f0e0-0000-7000-8000-000000000004',
+  )
+
+  // **見出しは選べる行である。** 読み飛ばすと、閉じたタスクを開く手段が無くなる。
+  press('ArrowUp')
+  press('ArrowUp')
+  await settle()
+  expect((document.activeElement as HTMLElement)?.dataset.rowKey).toBe(`task:${SHOPPING}`)
+
+  press('ArrowUp')
+  await settle()
+  expect((document.activeElement as HTMLElement)?.dataset.rowKey).toBe(`task:${MANUSCRIPT}`)
+
+  press('ArrowDown')
+  await settle()
+  expect((document.activeElement as HTMLElement)?.dataset.rowKey).toBe(`task:${SHOPPING}`)
+})
+
+test('端では留まる — 回り込まない', async () => {
+  await openDisclosure()
+
+  for (let i = 0; i < 8; i += 1) press('ArrowUp')
+  await settle()
+  // 先頭は第 1 タスクの見出しである。
+  expect((document.activeElement as HTMLElement)?.dataset.rowKey).toBe(`task:${MANUSCRIPT}`)
+
+  for (let i = 0; i < 8; i += 1) press('ArrowDown')
+  await settle()
+  expect((document.activeElement as HTMLElement)?.dataset.stepId).toBe(
+    '0198f0e0-0000-7000-8000-000000000005',
+  )
+})
+
+test('別のステップを選ぶと現在地が移り、面は閉じて既定表示へ戻る', async () => {
+  snapshot = { ...SNAPSHOT, stepContent: '味噌', stepOrdinal: 2, interruptionNote: null }
+  await openDisclosure()
+
+  press('ArrowUp')
+  await settle()
+  press('Enter')
+  await settle()
+
+  expect(argsOf('select_step')).toEqual({
+    request: { stepId: '0198f0e0-0000-7000-8000-000000000004' },
+  })
+  // 切り替えの儀式 (CAP-7) は撃たない。移動と履歴はコア側の単一のトランザクションである。
+  expect(invoked).not.toContain('switch_current_position')
+  // オーバーレイは閉じない。移った先の次の一手をそのまま見せる (FR-8)。
+  expect(invoked).not.toContain('hide_overlay')
+  // 取り直した既定表示がそのステップを示す (AD-3 鮮度規則)。
+  expect(invoked).toContain('get_overlay_snapshot')
+  expect(document.querySelector('.disclosure')).toBeNull()
+  expect(document.body.textContent ?? '').toContain('味噌')
+})
+
+test('中断メモも完了もこの経路からは送らない', async () => {
+  await openDisclosure()
+  press('ArrowUp')
+  await settle()
+  press('Enter')
+  await settle()
+
+  const request = (argsOf('select_step') ?? {}).request as Record<string, unknown>
+  // 欄が無いことが「機会を与えていない」の実体である (SM-C3)。
+  expect(Object.keys(request)).toEqual(['stepId'])
+})
+
+test('現在地そのものを選んでも、切り替えの儀式は起きない', async () => {
+  selectOutcome = { moved: false }
+  await openDisclosure()
+
+  press('Enter')
+  await settle()
+
+  // 何も書かないのはコアの判断である。フロントは現在地の行をそのまま送る。
+  expect(argsOf('select_step')).toEqual({
+    request: { stepId: '0198f0e0-0000-7000-8000-000000000005' },
+  })
+  expect(invoked).not.toContain('switch_current_position')
+  expect(document.querySelector('.disclosure')).toBeNull()
+})
+
+test('一覧の ⌘Enter は完了を宣言しない — どこにも束縛されていない', async () => {
+  await openDisclosure()
+
+  press('Enter', { metaKey: true })
+  press('Enter', { shiftKey: true })
+  press('Enter', { altKey: true })
+  press('Enter', { ctrlKey: true })
+  await settle()
+
+  expect(invoked).not.toContain('select_step')
+  expect(invoked).not.toContain('switch_current_position')
+  // 案内と実際に効く打鍵が一致していること。
+  expect(document.body.textContent ?? '').toContain('Enter でここへ現在地を移す')
+})
+
+test('見出しの上では案内が変わる — 現在地を移すとは述べない', async () => {
+  await openDisclosure()
+  expect(document.body.textContent ?? '').toContain('Enter でここへ現在地を移す')
+
+  await moveSelectionTo(`task:${MANUSCRIPT}`)
+
+  const text = document.body.textContent ?? ''
+  expect(text).toContain('Enter でこのタスクのステップを見る')
+  expect(text).not.toContain('Enter でここへ現在地を移す')
+})
+
+test('見出しの上でも ⌘Enter はどこにも束縛されていない', async () => {
+  await openDisclosure()
+  await moveSelectionTo(`task:${MANUSCRIPT}`)
+  invoked = []
+
+  press('Enter', { metaKey: true })
+  press('Enter', { shiftKey: true })
+  await settle()
+
+  expect(invoked).not.toContain('get_disclosure_surface')
+  expect(invoked).not.toContain('select_step')
+})
+
+test('click は選ぶだけで、見出しを開かない', async () => {
+  await openDisclosure()
+  invoked = []
+
+  headings()[0].click()
+  await settle()
+
+  // 押した行が選ばれるだけである。開くのは Enter の仕事である。
+  expect((document.activeElement as HTMLElement)?.dataset.rowKey).toBe(`task:${MANUSCRIPT}`)
+  expect(openedHeadings()).toEqual(['買い物'])
+  expect(invoked).not.toContain('get_disclosure_surface')
+})
+
+test('押しっぱなしの Enter は二度確定しない', async () => {
+  await openDisclosure()
+
+  press('Enter')
+  press('Enter', { repeat: true })
+  await settle()
+
+  expect(invoked.filter((cmd) => cmd === 'select_step')).toHaveLength(1)
+})
+
+test('IME の変換確定の Enter を選択と取り違えない', async () => {
+  await openDisclosure()
+
+  press('Enter', { isComposing: true } as KeyboardEventInit)
+  await settle()
+
+  expect(invoked).not.toContain('select_step')
+})
+
+test('Esc は既定表示へ戻る — オーバーレイは閉じない', async () => {
+  await openDisclosure()
+
+  press('Escape')
+  await settle()
+
+  expect(invoked).not.toContain('hide_overlay')
+  expect(invoked).not.toContain('select_step')
+  expect(document.querySelector('.disclosure')).toBeNull()
+  expect(document.querySelector('.next-action')).not.toBeNull()
+  // 入力位置は中断メモの欄へ返る。
+  expect(document.activeElement).toBe(noteField())
+})
+
+test('一覧を出したままオーバーレイを閉じると、次回の呼び出しは初期表示である', async () => {
+  await openDisclosure()
+  expect(document.querySelector('.disclosure')).not.toBeNull()
+
+  await emit('tauri://blur', null)
+  await settle()
+  // 閉じた時点で破棄される (FR-19)。
+  expect(document.querySelector('.disclosure')).toBeNull()
+
+  await emit('tauri://focus', null)
+  await settle()
+
+  expect(document.querySelector('.disclosure')).toBeNull()
+  expect(document.querySelector('.next-action')).not.toBeNull()
+})
+
+test('開いていたタスクも持ち越さない — 次回の一覧は現在地のタスクが開く', async () => {
+  await openDisclosure()
+  await moveSelectionTo(`task:${MANUSCRIPT}`)
+  press('Enter')
+  await settle()
+  expect(openedHeadings()).toEqual(['原稿'])
+
+  await emit('tauri://blur', null)
+  await settle()
+  await emit('tauri://focus', null)
+  await settle()
+  calls = []
+
+  await openDisclosure()
+
+  expect(argsOf('get_disclosure_surface')).toEqual({ request: { openTaskId: null } })
+  expect(openedHeadings()).toEqual(['買い物'])
+})
+
+test('Esc で戻ってから開き直しても、開くのは現在地のタスクである', async () => {
+  await openDisclosure()
+  await moveSelectionTo(`task:${MANUSCRIPT}`)
+  press('Enter')
+  await settle()
+
+  press('Escape')
+  await settle()
+  calls = []
+  await openDisclosure()
+
+  expect(argsOf('get_disclosure_surface')).toEqual({ request: { openTaskId: null } })
+  expect(openedHeadings()).toEqual(['買い物'])
+})
+
+test('タスクが 1 個も無ければ空欄にせず、その旨の 1 行を出す', async () => {
+  disclosureOverride = { stateError: null, rows: [] }
+  await openDisclosure()
+
+  expect(stepRows()).toHaveLength(0)
+  expect(headings()).toHaveLength(0)
+  expect(document.body.textContent ?? '').toContain('まだタスクが無い')
+
+  // 選べる行が無いのだから、Enter は何も撃たない。
+  press('Enter')
+  await settle()
+  expect(invoked).not.toContain('select_step')
+})
+
+test('コアが読めなくても面は開き、理由が出る。移動はできない', async () => {
+  const CORE_MISSING = '保存された状態を読み込めていない。'
+  disclosureOverride = { stateError: CORE_MISSING, rows: [] }
+  await openDisclosure()
+
+  expect(document.querySelector('.disclosure')).not.toBeNull()
+  expect(noticeText()).toContain(CORE_MISSING)
+  expect(noticeText()).toContain('現在地を移すことはできない')
+
+  press('Enter')
+  await settle()
+  expect(invoked).not.toContain('select_step')
+})
+
+test('一覧を取得できなければ理由を出し、古い行に対して選択を撃たない', async () => {
+  await openDisclosure()
+  expect(stepRows()).toHaveLength(3)
+
+  disclosureFails = true
+  // 現在地が動いたという報せ。開示面が出ている間は一覧も取り直される (AD-3 鮮度規則)。
+  await emit('current_position_changed', null)
+  await settle()
+
+  // **古い一覧を残さない。** 残せば、コアが確認できなかった行に対して Enter が撃てる。
+  expect(stepRows()).toHaveLength(0)
+  expect(headings()).toHaveLength(0)
+  expect(noticeText()).toContain('一覧を取得できなかった')
+
+  press('Enter')
+  await settle()
+  expect(invoked).not.toContain('select_step')
+})
+
+test('破棄した後に着いた応答は、捨てた一覧を描き直さない', async () => {
+  holdDisclosure = true
+  await openDisclosure()
+  expect(releaseDisclosure).not.toBeNull()
+
+  // 応答が飛んでいる間にオーバーレイを閉じる。面はここで破棄される (FR-19)。
+  await emit('tauri://blur', null)
+  await settle()
+
+  // 捨てた後に応答が着く。
+  releaseDisclosure?.(disclosureFor(null))
+  await settle()
+  expect(document.querySelector('.disclosure')).toBeNull()
+
+  // **次の呼び出しがそれを一瞬見せてはならない。** 取り直しはまだ飛んでいる (握った
+  // ままである) ため、ここで行が出るなら、それは書き戻された古い一覧である。
+  await openDisclosure()
+
+  expect(document.querySelector('.disclosure')).not.toBeNull()
+  expect(stepRows()).toHaveLength(0)
+  expect(headings()).toHaveLength(0)
+})
+
+test('選択に失敗したら理由を面に出し、面は閉じない', async () => {
+  mockIPC(
+    (cmd, args) => {
+      invoked.push(cmd)
+      calls.push({ cmd, args: (args ?? {}) as Record<string, unknown> })
+      if (cmd === 'select_step') throw new Error('書き込みに失敗した')
+      if (cmd === 'get_disclosure_surface') return surfaceFor(args)
+      if (cmd === 'get_overlay_snapshot') return snapshot
+      return null
+    },
+    { shouldMockEvents: true },
+  )
+  await openDisclosure()
+
+  press('Enter')
+  await settle()
+
+  expect(document.querySelector('.disclosure')).not.toBeNull()
+  expect(noticeText()).toContain('現在地を移せなかった')
+  expect(noticeText()).toContain('書き込みに失敗した')
+  expect(invoked).not.toContain('hide_overlay')
+})
+
+test('作成の面と開示面は同時に現れない — 一覧からは ⌘N が効かない', async () => {
+  await openDisclosure()
+
+  press('n', { metaKey: true })
+  await settle()
+
+  expect(document.querySelector('input.title')).toBeNull()
+  expect(document.querySelector('.disclosure')).not.toBeNull()
+})
+
+test('作成の面と開示面は同時に現れない — 作成中は ⌘L が効かない', async () => {
+  await openCreation()
+
+  press('l', { metaKey: true })
+  await settle()
+
+  expect(document.querySelector('.disclosure')).toBeNull()
+  expect(invoked).not.toContain('get_disclosure_surface')
+  expect(document.querySelector('input.title')).not.toBeNull()
+})
+
+test('切り替えの確定中は ⌘L で一覧に入らない', async () => {
+  installHangingIPC('switch_current_position')
+
+  press('Enter')
+  await settle()
+  expect(invoked).toContain('switch_current_position')
+
+  await openDisclosure()
+
+  // 入れば、失敗したときの理由を読む機会が面ごと消える。
+  expect(document.querySelector('.disclosure')).toBeNull()
+})
+
+test('選択の確定中は Esc で面を出ない', async () => {
+  installHangingIPC('select_step')
+  await openDisclosure()
+
+  press('Enter')
+  await settle()
+  expect(invoked).toContain('select_step')
+
+  press('Escape')
+  await settle()
+
+  expect(document.querySelector('.disclosure')).not.toBeNull()
+  expect(invoked).not.toContain('hide_overlay')
+})
+
+test('一覧が窓に収まらなくても、切り取られずスクロールで到達できる', async () => {
+  await openDisclosure()
+
+  const main = document.querySelector('main') as HTMLElement
+  const list = document.querySelector('.disclosure') as HTMLElement
+  // `main` が唯一のスクロール容器である。**一覧は自分では巻かず、高さも制限しない** —
+  // 入れ子の容器が巻き始めると、どちらが動くかが行の位置で変わる。
+  expect(getComputedStyle(main).overflowY).toBe('auto')
+  // 一覧自身がスクロール容器になっていないこと。`max-height` + `overflow-y: auto` を
+  // 足せばここが落ちる — コメントが名指しで警戒している入れ子の容器である。
+  const style = getComputedStyle(list)
+  expect(['auto', 'scroll']).not.toContain(style.overflowY)
+  expect(['auto', 'scroll']).not.toContain(style.overflowX)
+  expect(['auto', 'scroll']).not.toContain(style.overflow)
+  expect(['none', '']).toContain(style.maxHeight)
+  // 最後の行まで DOM にあること。切り取って描かない。
+  expect(rowTexts()[2]).toContain('醤油')
+  expect(main.contains(list)).toBe(true)
 })

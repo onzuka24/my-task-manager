@@ -138,8 +138,10 @@ pub fn run() {
         .manage(commands::ResidentStatus::default())
         .invoke_handler(tauri::generate_handler![
             commands::get_overlay_snapshot,
+            commands::get_disclosure_surface,
             commands::create_task,
             commands::switch_current_position,
+            commands::select_step,
             commands::hide_overlay,
             commands::mark_overlay_hidden
         ])
