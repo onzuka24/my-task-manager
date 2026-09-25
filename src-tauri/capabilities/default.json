@@ -1,9 +1,10 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "オーバーレイが必要とする最小の権限 (AD-3)。独自コマンドの invoke に権限は要らない。",
+  "description": "オーバーレイと介入パネルが必要とする最小の権限 (AD-3)。独自コマンドの invoke に権限は要らない。",
   "windows": [
-    "main"
+    "main",
+    "intervention"
   ],
   "permissions": [
     "core:event:allow-listen",

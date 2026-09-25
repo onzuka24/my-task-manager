@@ -10,6 +10,7 @@
     "beforeBuildCommand": "pnpm build"
   },
   "app": {
+    "macOSPrivateApi": true,
     "windows": [
       {
         "label": "main",
@@ -17,6 +18,22 @@
         "width": 640,
         "height": 280,
         "center": true,
+        "resizable": false,
+        "fullscreen": false,
+        "visible": false,
+        "focus": false,
+        "alwaysOnTop": true,
+        "decorations": false,
+        "shadow": true,
+        "acceptFirstMouse": true,
+        "visibleOnAllWorkspaces": true,
+        "backgroundThrottling": "throttle"
+      },
+      {
+        "label": "intervention",
+        "title": "休息",
+        "width": 340,
+        "height": 150,
         "resizable": false,
         "fullscreen": false,
         "visible": false,

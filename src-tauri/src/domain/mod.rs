@@ -13,9 +13,13 @@
 //! - [`task`] — [`task::Task`] / [`task::Step`] と、その不変条件を破れない形の操作
 //! - [`position`] — [`position::CurrentPosition`] と活性/非活性の遷移
 //! - [`switch`] — [`switch::SwitchRecord`]。**切り替え**が残す 1 行 (SM-C3)
+//! - [`setting`] — [`setting::Setting`]。永続化層に一元化される設定値 (AD-11)
+//! - [`rest`] — **連続作業時間**の計時と**介入**の判断 (CAP-10 / AD-8)
 //! - [`state`] — 全タスクと唯一の現在地を保持し、状態を変えうる操作を集約する
 
 pub mod position;
+pub mod rest;
+pub mod setting;
 pub mod state;
 pub mod switch;
 pub mod task;

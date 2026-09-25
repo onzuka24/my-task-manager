@@ -34,8 +34,9 @@ use std::sync::Mutex;
 
 use tauri::{AppHandle, Manager, Runtime, State};
 
-use crate::adapters::hotkey::HotkeyStatus;
-use crate::adapters::presentation;
+use crate::adapters::hotkey::{HotkeyStatus, ResponseHotkeyStatus};
+use crate::adapters::{intervention, presentation};
+use crate::domain::rest::InterventionChoice;
 use crate::domain::state::{Core, CoreState};
 use crate::domain::task::{InterruptionNote, Step, StepId, Task, TaskId};
 
@@ -58,6 +59,11 @@ fn require_core<T>(core: Option<T>) -> Result<T, String> {
 #[derive(Default)]
 pub struct ResidentStatus {
     hotkey: Mutex<Option<HotkeyStatus>>,
+    /// 直近の**介入**で、応答のホットキーを登録できたか (AD-7)。
+    ///
+    /// **介入が出るたびに書き換わる。** パネルは表示のたびにスナップショットを取り直す
+    /// ため (AD-3 鮮度規則)、古い結果が残っていても次の表示で正される。
+    response_hotkey: Mutex<Option<ResponseHotkeyStatus>>,
 }
 
 impl ResidentStatus {
@@ -75,6 +81,23 @@ impl ResidentStatus {
     /// 確定済みのホットキーの登録結果。まだ確定していなければ `None`。
     pub fn hotkey(&self) -> Option<HotkeyStatus> {
         self.hotkey
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone()
+    }
+
+    /// 応答のホットキーの登録結果を確定させる (AD-7)。
+    pub fn set_response_hotkey(&self, status: ResponseHotkeyStatus) {
+        let mut slot = self
+            .response_hotkey
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        *slot = Some(status);
+    }
+
+    /// 直近の**介入**における応答のホットキーの登録結果。
+    pub fn response_hotkey(&self) -> Option<ResponseHotkeyStatus> {
+        self.response_hotkey
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .clone()
@@ -124,6 +147,12 @@ pub struct OverlaySnapshot {
     /// **入力欄の初期値でもある。** 既存のメモで初期化することが、FR-7 の
     /// 「上書き前の内容の提示」と「追記の形を選べる」を同時に満たす。
     pub interruption_note: Option<String>,
+    /// **休息**中か — **現在地**が値を保ったまま**非活性**である状態 (CAP-10 / AD-3)。
+    ///
+    /// **未着手と区別が付かなければならない。** どちらも「いま作業していない」だが、
+    /// **休息**には戻る先があり、終了を宣言できる。**残り時間は運ばない** — 常時の
+    /// カウントダウンを作らないためであり、運ぶ欄が無ければ描ける値も無い (AD-15)。
+    pub resting: bool,
 }
 
 /// **コア状態を描画用のスナップショットへ落とす純粋関数。**
@@ -145,6 +174,7 @@ fn snapshot_of(hotkey: HotkeyStatus, state: Option<&CoreState>) -> OverlaySnapsh
         step_ordinal: None,
         step_count: None,
         interruption_note: None,
+        resting: false,
     };
 
     let Some(state) = state else {
@@ -152,6 +182,11 @@ fn snapshot_of(hotkey: HotkeyStatus, state: Option<&CoreState>) -> OverlaySnapsh
             state_error: Some(CORE_MISSING.to_string()),
             ..empty
         };
+    };
+
+    let empty = OverlaySnapshot {
+        resting: state.is_resting(),
+        ..empty
     };
 
     let shown = state.current_position().step_id().and_then(|step_id| {
@@ -823,9 +858,166 @@ pub fn mark_overlay_hidden() {
     presentation::mark_hidden();
 }
 
+/// 介入パネルが描画に必要とするすべて (CAP-10 / AD-3 鮮度規則)。
+///
+/// フィールド名は `src/intervention/Intervention.svelte` の `InterventionSnapshot` 型と
+/// 1:1 で対応する。契約は [`tests::the_intervention_snapshot_keeps_its_wire_contract`] が
+/// 固定する。
+///
+/// # 残り時間も経過時間も運ばない
+///
+/// **カウントダウンを常時表示しない** (spec Never)。欄が無ければ、描こうとしても運ぶ値が
+/// 存在しない。**介入**が伝えるのは「休息の頃合いである」ことだけであり、何分働いたかは
+/// 伝えない — 数字を出せば、それは進捗の可視化と同じ種類の圧力になる (AD-15)。
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InterventionSnapshot {
+    /// 応答のホットキーの登録結果 (AD-7)。
+    ///
+    /// **登録できていなくてもパネルは出る。** そのことをここで伝え、パネルは
+    /// 「クリックだけで応答できる」と述べる。まだ一度も**介入**が出ていなければ `None`。
+    pub hotkey: Option<ResponseHotkeyStatus>,
+    /// コアが `manage` されていないときの理由。読めていれば `None`。
+    ///
+    /// **面は出し、理由を示す。** 応答はできない — 応答は**現在地**を書き換える操作で
+    /// あり、状態を読めていないまま書けば**現在地**を失う。
+    pub state_error: Option<String>,
+    /// **介入**が実際に表示中として記録されているか (AD-2)。
+    ///
+    /// 偽であれば、応答しても何も起きない。パネルだけが残っている状態を利用者に
+    /// 伝えるための欄である。
+    pub shown: bool,
+}
+
+/// **コア状態を介入パネルのスナップショットへ落とす純粋関数** ([`snapshot_of`] と同じ流儀)。
+fn intervention_snapshot_of(
+    hotkey: Option<ResponseHotkeyStatus>,
+    state: Option<&CoreState>,
+) -> InterventionSnapshot {
+    let Some(state) = state else {
+        return InterventionSnapshot {
+            hotkey,
+            state_error: Some(CORE_MISSING.to_string()),
+            shown: false,
+        };
+    };
+    InterventionSnapshot {
+        hotkey,
+        state_error: None,
+        shown: state.intervention().is_some(),
+    }
+}
+
+/// `answer_intervention` が受け取る要求。**これがコマンドの引数型そのものである。**
+///
+/// フロントは `invoke('answer_intervention', { request: { choice: 'rest' } })` と呼ぶ。
+/// [`SwitchRequest`] と同じ理由で名前付きの型として持つ。
+///
+/// # 欄が一つしか無い
+///
+/// **選択肢は二つだけである** ([`InterventionChoice`])。猶予の長さも、休息の長さも
+/// 受け取らない — 受け取れば、パネルの上に数値を選ぶ操作が生まれる。長さは設定値で
+/// あってその場の選択ではない (AD-11)。
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AnswerInterventionRequest {
+    /// **介入の選択肢**。
+    pub choice: InterventionChoice,
+}
+
+/// **介入**への応答の結末。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AnswerInterventionOutcome {
+    /// 応答すべき**介入**が表示されていたか。
+    ///
+    /// 偽なら**何も起きていない** — ホットキーとクリックが同時に届いた場合の二つ目が
+    /// これである。**現在地**は二度動かない。
+    pub answered: bool,
+}
+
+/// **休息**の終了の結末 (CAP-10)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EndRestOutcome {
+    /// **休息**中であり、**現在地**が**活性**へ戻ったか。
+    ///
+    /// 偽なら**休息**中ではなかった。何も書かれていない。
+    pub resumed: bool,
+}
+
+/// 介入パネルが表示されるたびに呼ばれ、描画に必要な完全なスナップショットを返す
+/// (CAP-10 / AD-3 鮮度規則)。
+///
+/// **コアが読めなくても失敗しない。** 失敗させるとパネルが空白のまま出る。読めない
+/// ことは [`InterventionSnapshot::state_error`] として運ぶ ([`get_overlay_snapshot`] と
+/// 同じ扱い)。
+#[tauri::command]
+pub fn get_intervention_snapshot<R: Runtime>(
+    app: AppHandle<R>,
+    status: State<'_, ResidentStatus>,
+) -> InterventionSnapshot {
+    let state = app.try_state::<Core>().map(|core| core.snapshot());
+    intervention_snapshot_of(status.response_hotkey(), state.as_ref())
+}
+
+/// **介入**へ応答する (CAP-10 / FR-15)。
+///
+/// **介入を閉じうる経路はこれとホットキーの二つだけであり、どちらも
+/// [`intervention::answer`] を通る** (AD-7)。
+///
+/// # Errors
+///
+/// コアが `manage` されていないとき、または**休息**への遷移を永続化できなかったとき。
+/// **いずれの場合も状態は変わらず、介入も閉じない。**
+#[tauri::command]
+pub fn answer_intervention<R: Runtime>(
+    app: AppHandle<R>,
+    request: AnswerInterventionRequest,
+) -> Result<AnswerInterventionOutcome, String> {
+    let answered = intervention::answer(&app, request.choice)?;
+
+    // **現在地**が**非活性**になったのは状態の変化である。既定表示は「休息中」を
+    // 描くため、取り直しの契機を送る (AD-3)。
+    if answered && request.choice == InterventionChoice::Rest {
+        crate::announce_current_position_changed(&app);
+    }
+    Ok(AnswerInterventionOutcome { answered })
+}
+
+/// **休息**の終了を宣言する (CAP-10 / FR-15)。
+///
+/// **ユーザーの明示的な宣言だけがこれを起こす。** **現在地**は**活性**へ戻り、
+/// **連続作業時間**はそこから数え直される (AD-8)。呼び出し側はこの後スナップショットを
+/// 取り直し、CAP-8 と同じ形式で位置と**中断メモ**を描く。
+///
+/// # Errors
+///
+/// コアが `manage` されていないとき、または永続化に失敗したとき。状態は変わらない。
+#[tauri::command]
+pub fn end_rest<R: Runtime>(app: AppHandle<R>) -> Result<EndRestOutcome, String> {
+    let core = require_core(app.try_state::<Core>())?;
+
+    let resumed = core.end_rest().map_err(|error| error.to_string())?;
+    if resumed {
+        crate::announce_current_position_changed(&app);
+    }
+
+    log::info!("the end of a rest was declared (resumed={resumed})");
+    Ok(EndRestOutcome { resumed })
+}
+
 /// 起動時に確定したホットキーの登録結果を公開する。
 pub fn publish_hotkey_status<R: Runtime>(app: &AppHandle<R>, status: HotkeyStatus) {
     app.state::<ResidentStatus>().set_hotkey(status);
+}
+
+/// **介入**を発するたびに確定する、応答のホットキーの登録結果を公開する (AD-7)。
+pub fn publish_response_hotkey_status<R: Runtime>(
+    app: &AppHandle<R>,
+    status: ResponseHotkeyStatus,
+) {
+    app.state::<ResidentStatus>().set_response_hotkey(status);
 }
 
 #[cfg(test)]
@@ -890,6 +1082,157 @@ mod tests {
         let hotkey = status.hotkey().expect("確定後は値が読める");
         assert!(!hotkey.registered);
         assert!(hotkey.error.is_some());
+    }
+
+    // --- 休息介入 (CAP-10 / FR-15) ---------------------------------------------
+
+    /// **休息**中の**現在地**を持つコア状態を作る。
+    fn a_resting_state() -> CoreState {
+        let core = Core::restore(
+            Box::new(FixedClock::at(1_789_000_000_000)),
+            Box::new(AcceptingStorage),
+        )
+        .expect("空の状態は復元できる");
+        let task_id = core
+            .create_task("原稿", contents(&["下書き", "推敲"]))
+            .expect("作れる");
+        let first = core.snapshot().task(task_id).expect("ある").steps()[0].id();
+        core.move_current_position(first).expect("移せる");
+        core.deactivate_current_position().expect("休息へ入れる");
+        core.snapshot()
+    }
+
+    /// AD-3 —**休息**中であることがスナップショットに載る。
+    #[test]
+    fn the_snapshot_reports_the_rest() {
+        let snapshot = snapshot_of(HotkeyStatus::registered(), Some(&a_resting_state()));
+        assert!(snapshot.resting);
+        // **値は保たれている。** 休息と未着手を取り違えないための土台である。
+        assert_eq!(snapshot.step_content.as_deref(), Some("下書き"));
+    }
+
+    /// **未着手は休息ではない。** どちらも「いま作業していない」だが、戻る先の有無が違う。
+    #[test]
+    fn not_started_is_not_reported_as_a_rest() {
+        let snapshot = snapshot_of(HotkeyStatus::registered(), Some(&CoreState::default()));
+        assert!(!snapshot.resting);
+        assert!(snapshot.step_content.is_none());
+    }
+
+    /// コアが読めていないときも**休息**を主張しない。
+    #[test]
+    fn a_missing_core_is_not_reported_as_a_rest() {
+        let snapshot = snapshot_of(HotkeyStatus::registered(), None);
+        assert!(!snapshot.resting);
+        assert!(snapshot.state_error.is_some());
+    }
+
+    /// Rust → TS の契約。介入パネルが読む欄の名前と型を固定する。
+    #[test]
+    fn the_intervention_snapshot_keeps_its_wire_contract() {
+        let json = serde_json::to_value(intervention_snapshot_of(
+            Some(ResponseHotkeyStatus::registered()),
+            Some(&a_resting_state()),
+        ))
+        .expect("直列化できる");
+
+        let hotkey = json
+            .get("hotkey")
+            .expect("`hotkey` は Intervention.svelte が読む名前");
+        assert!(hotkey.get("restAccelerator").is_some_and(|v| v.is_string()));
+        assert!(hotkey
+            .get("graceAccelerator")
+            .is_some_and(|v| v.is_string()));
+        assert!(hotkey.get("registered").is_some_and(|v| v.is_boolean()));
+        assert!(hotkey.get("error").is_some_and(serde_json::Value::is_null));
+        assert!(json
+            .get("stateError")
+            .is_some_and(serde_json::Value::is_null));
+        assert!(json.get("shown").is_some_and(|v| v.is_boolean()));
+    }
+
+    /// **介入パネルの境界に、経過時間も残り時間も閾値も無い** (spec Never / AD-15)。
+    ///
+    /// 欄が無ければ、フロントがどう書こうと描ける値が存在しない。
+    #[test]
+    fn the_intervention_snapshot_carries_no_clock() {
+        let json = serde_json::to_value(intervention_snapshot_of(
+            Some(ResponseHotkeyStatus::registered()),
+            Some(&a_resting_state()),
+        ))
+        .expect("直列化できる");
+
+        let fields: Vec<&String> = json
+            .as_object()
+            .expect("オブジェクトである")
+            .keys()
+            .collect();
+        assert_eq!(
+            fields,
+            vec!["hotkey", "shown", "stateError"],
+            "残り時間・経過時間・閾値・猶予のいずれの欄も足さない (AD-15)"
+        );
+    }
+
+    /// コアが読めていなければ、面は出したうえで理由を運ぶ (I/O マトリクス「コア不在」)。
+    #[test]
+    fn a_missing_core_is_reported_on_the_panel() {
+        let snapshot = intervention_snapshot_of(None, None);
+        assert_eq!(snapshot.state_error.as_deref(), Some(CORE_MISSING));
+        assert!(!snapshot.shown);
+        assert!(snapshot.hotkey.is_none());
+    }
+
+    /// 応答のホットキーの登録結果はまだ確定していないこともある (初回の介入の前)。
+    #[test]
+    fn the_response_hotkey_status_starts_unresolved() {
+        let status = ResidentStatus::default();
+        assert!(status.response_hotkey().is_none());
+
+        status.set_response_hotkey(ResponseHotkeyStatus::failed("衝突".to_string()));
+        let published = status.response_hotkey().expect("確定後は値が読める");
+        assert!(!published.registered);
+        assert!(published.error.is_some());
+    }
+
+    /// TS → Rust の契約。**選択肢の綴りが変われば応答が復元できない。**
+    #[test]
+    fn the_answer_request_keeps_its_wire_contract() {
+        let rest: AnswerInterventionRequest =
+            serde_json::from_value(serde_json::json!({ "choice": "rest" })).expect("読める");
+        assert_eq!(rest.choice, InterventionChoice::Rest);
+
+        let grace: AnswerInterventionRequest =
+            serde_json::from_value(serde_json::json!({ "choice": "grace" })).expect("読める");
+        assert_eq!(grace.choice, InterventionChoice::Grace);
+    }
+
+    /// **知らない欄を拒む。** 綴りを取り違えた要求が黙って通ってはならない。
+    #[test]
+    fn an_unknown_field_on_the_answer_request_is_refused() {
+        let outcome: Result<AnswerInterventionRequest, _> =
+            serde_json::from_value(serde_json::json!({ "choice": "rest", "minutes": 30 }));
+        assert!(outcome.is_err());
+    }
+
+    /// **第三の選択肢は存在しない** (FR-15)。
+    #[test]
+    fn a_third_choice_cannot_be_expressed() {
+        let outcome: Result<AnswerInterventionRequest, _> =
+            serde_json::from_value(serde_json::json!({ "choice": "ignore" }));
+        assert!(outcome.is_err());
+    }
+
+    /// 応答と**休息**の終了の結末も、フロントが読む名前で出る。
+    #[test]
+    fn the_rest_outcomes_keep_their_wire_contract() {
+        let answered = serde_json::to_value(AnswerInterventionOutcome { answered: true })
+            .expect("直列化できる");
+        assert_eq!(answered, serde_json::json!({ "answered": true }));
+
+        let resumed =
+            serde_json::to_value(EndRestOutcome { resumed: false }).expect("直列化できる");
+        assert_eq!(resumed, serde_json::json!({ "resumed": false }));
     }
 
     /// I/O マトリクス「コア不在」— 状態を書き換える経路では明示的なエラーになる。
@@ -989,6 +1332,7 @@ mod tests {
             step_ordinal: Some(3),
             step_count: Some(6),
             interruption_note: Some("3 段落目の途中".to_string()),
+            resting: false,
         };
         let json: serde_json::Value =
             serde_json::to_value(&snapshot).expect("スナップショットは直列化できる");
@@ -1013,6 +1357,7 @@ mod tests {
             step_ordinal: None,
             step_count: None,
             interruption_note: None,
+            resting: false,
         })
         .expect("成功時も直列化できる");
         assert!(
@@ -1040,6 +1385,7 @@ mod tests {
             step_ordinal: Some(1),
             step_count: Some(2),
             interruption_note: None,
+            resting: false,
         })
         .expect("直列化できる");
 
@@ -1054,6 +1400,8 @@ mod tests {
             vec![
                 "hotkey",
                 "interruptionNote",
+                // **休息中であることは運ぶ。残り時間は運ばない** (spec Never)。
+                "resting",
                 "stateError",
                 "stepContent",
                 "stepCount",

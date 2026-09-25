@@ -20,6 +20,12 @@
     stepOrdinal: number | null
     stepCount: number | null
     interruptionNote: string | null
+    resting: boolean
+  }
+
+  // src-tauri/src/commands/mod.rs の `EndRestOutcome` と 1:1。
+  type EndRestOutcome = {
+    resumed: boolean
   }
 
   // src-tauri/src/commands/mod.rs の `SwitchRequest` / `SwitchOutcome` と 1:1。
@@ -106,6 +112,26 @@
   let stepContent = $state<string | null>(null)
   let stepOrdinal = $state<number | null>(null)
   let stepCount = $state<number | null>(null)
+  /**
+   * 休息中か (CAP-10)。**現在地は値を保ったまま非活性である。**
+   *
+   * これも**スナップショットの写しである** — フロントは計時をしない (AD-8)。
+   * 残り時間も経過時間も運ばれてこない。
+   */
+  let resting = $state(false)
+
+  /** 休息の終了の宣言が飛んでいる間。二重確定を防ぐ。 */
+  let endingRest = $state(false)
+  /**
+   * 休息の終了について述べる 1 行。**休息中の面の外に出す。**
+   *
+   * 宣言に成功すれば面は「休息中」を畳んで既定表示へ戻る。述べる場所を休息中の面の
+   * 中に置くと、「休息中ではなかった」という最も述べる必要のある結末だけが、面ごと
+   * 消えて誰にも届かない。
+   */
+  let restNotice = $state<string | null>(null)
+  /** その理由の生の文字列。例外から来たときだけ埋まる。 */
+  let restErrorDetail = $state<string | null>(null)
 
   /**
    * 中断メモの下書き — 揮発ビュー状態 (AD-2)。
@@ -260,6 +286,9 @@
     stepContent = null
     stepOrdinal = null
     stepCount = null
+    // **確認できていない休息を描かない。** 残せば、終了の宣言がコアの知らない状態に
+    // 対して撃たれる。
+    resting = false
     notePrefill = ''
     noteDraft = ''
   }
@@ -295,6 +324,7 @@
         stepContent = snapshot.stepContent
         stepOrdinal = snapshot.stepOrdinal
         stepCount = snapshot.stepCount
+        resting = snapshot.resting === true
 
         const preserve = keepDirtyDraft && noteIsDirty
         notePrefill = snapshot.interruptionNote ?? ''
@@ -370,6 +400,8 @@
     noDestination = null
     created = null
     selected = null
+    restNotice = null
+    restErrorDetail = null
   }
 
   /**
@@ -733,6 +765,38 @@
   }
 
   /**
+   * 休息の終了を宣言する (CAP-10 / FR-15)。
+   *
+   * **休息の終了はユーザーの明示的な宣言による。** 時間でも、オーバーレイを開いた
+   * ことでも終わらない — 開いただけで終わるなら、休息中に予定を確かめることが
+   * できなくなる。
+   *
+   * 宣言の後は現在地が活性へ戻り、取り直した既定表示が CAP-8 と同じ形式で位置と
+   * 中断メモを出す。**オーバーレイは閉じない** — 戻った先を読むための面である。
+   */
+  async function declareEndOfRest(): Promise<void> {
+    if (endingRest) return
+    endingRest = true
+    dismissNotices()
+    try {
+      const outcome = await invoke<EndRestOutcome>('end_rest')
+      // 取り直しが「休息中」を畳み、次の一手と位置情報に置き換える (AD-3 鮮度規則)。
+      await refresh()
+      await focusNoteAtEnd()
+      if (!outcome.resumed) {
+        // 既に活性だった。**何も書かれていない。**
+        restNotice = '休息中ではなかった。何も変えていない。'
+      }
+    } catch (error) {
+      console.error('failed to declare the end of the rest', error)
+      restNotice = '休息を終えられなかった。状態は変わっていない。'
+      restErrorDetail = String(error)
+    } finally {
+      endingRest = false
+    }
+  }
+
+  /**
    * 切り替えを確定させる (CAP-7)。
    *
    * 離脱側のメモ確定・完了宣言 (任意)・現在地の移動・切り替え履歴の追記は、コア側の
@@ -741,7 +805,11 @@
    */
   async function confirmSwitch(declareCompletion: boolean): Promise<void> {
     // 現在地が無ければ離れるべき場所も無い。二重確定も防ぐ。
-    if (stepContent === null || switching) return
+    //
+    // **休息中は切り替えない。** 切り替えれば現在地が活性へ戻り、休息が選ばれても
+    // いないのに黙って終わる (AD-8 のリセット契機を宣言なしに踏む)。この面の Enter は
+    // 休息の終了の宣言だけを意味する。
+    if (stepContent === null || switching || resting) return
     switching = true
     dismissNotices()
     // **提示されたメモをそのまま送り返さない。** 送り返せば、読み返しただけの
@@ -813,7 +881,7 @@
     if (event.key === 'Escape') {
       // 確定の途中では閉じない。閉じてしまうと、失敗したときの理由を読む機会が
       // 画面ごと消える。
-      if (switching) return
+      if (switching || endingRest) return
       event.preventDefault()
       // 下書きは確定されない。永続化もされない (AD-5)。
       void close()
@@ -850,6 +918,11 @@
     if (event.shiftKey || event.altKey || event.ctrlKey) return
 
     event.preventDefault()
+    // **休息中の Enter は休息の終了の宣言である** (CAP-10)。切り替えではない。
+    if (resting) {
+      void declareEndOfRest()
+      return
+    }
     // 完了の宣言は同じ一連の操作から 1 打鍵で到達する (FR-4)。修飾キーの有無だけが
     // 違い、宣言しない切り替えも同じく 1 打鍵である。
     void confirmSwitch(event.metaKey)
@@ -1141,6 +1214,17 @@
       {stateError}
       <span class="detail">メニューバー項目からログの場所を確認すること。</span>
     </p>
+  {:else if resting}
+    <!--
+      休息中 (CAP-10 / FR-15)。**現在地は値を保ったまま非活性であり、計時は止まって
+      いる。** 残り時間も、休んでいる長さも出さない — 休息に締め切りを与えれば、
+      それは休息ではなくなる (spec Never / AD-15)。
+
+      **次の一手をここに出さない。** 出せば、休息中に次の作業が視界へ入る。戻る先が
+      あることだけを述べ、中身は終了を宣言してから CAP-8 の形式で示す。
+    -->
+    <p class="next-action">休息中。</p>
+    <p class="position">現在地は保たれている。連続作業時間は数えていない。</p>
   {:else if stepContent === null}
     {#if !snapshotError}
       <p class="next-action">まだ現在地が無い — 未着手である。</p>
@@ -1195,6 +1279,17 @@
     <p class="alert" role="alert">{selectionNotice}</p>
   {/if}
 
+  <!--
+    休息の終了について述べる唯一の場所。**休息中の面の中ではない** — 宣言に成功すれば
+    面は畳まれるため、そこに置くと「休息中ではなかった」が誰にも届かない。
+  -->
+  {#if !creating && !disclosing && restNotice}
+    <p class="alert" role="alert">
+      {restNotice}
+      {#if restErrorDetail}<span class="detail">{restErrorDetail}</span>{/if}
+    </p>
+  {/if}
+
   {#if creating}
     <!--
       案内と実際に効く打鍵が食い違ってはならない。素の Enter と Shift+Enter は改行で
@@ -1222,8 +1317,12 @@
     </p>
   {:else}
     <!-- 案内の語を行で割らない。割ると表示に改行が混じる。 -->
+    <!--
+      **休息中は案内が入れ替わる。** 切り替えも完了の宣言もこの面には無く、Enter は
+      休息の終了の宣言だけを意味する (CAP-10)。案内と実際に効く打鍵を食い違わせない。
+    -->
     <p class="hint">
-      {#if stepContent !== null}Enter で切り替え · ⌘Enter で完了して切り替え · {/if}⌘N で新しいタスク · ⌘L で一覧 · Esc で閉じる{#if hotkey && hotkey.registered} · {hotkey.accelerator} で開閉{/if} · 終了はメニューバー項目から
+      {#if resting}Enter で休息を終える · {:else if stepContent !== null}Enter で切り替え · ⌘Enter で完了して切り替え · {/if}⌘N で新しいタスク · ⌘L で一覧 · Esc で閉じる{#if hotkey && hotkey.registered} · {hotkey.accelerator} で開閉{/if} · 終了はメニューバー項目から
     </p>
   {/if}
 </main>

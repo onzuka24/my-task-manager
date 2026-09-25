@@ -26,6 +26,7 @@ use std::sync::{Mutex, MutexGuard};
 use rusqlite::{Connection, OptionalExtension, Transaction};
 
 use crate::domain::position::CurrentPosition;
+use crate::domain::setting::Setting;
 use crate::domain::switch::SwitchRecord;
 use crate::domain::task::{InterruptionNote, Step, StepId, Task, TaskId};
 use crate::domain::Timestamp;
@@ -100,9 +101,11 @@ impl Storage for SqliteStorage {
         let connection = self.lock();
         let tasks = read_tasks(&connection)?;
         let current_position = read_current_position(&connection)?;
+        let settings = read_settings(&connection)?;
         Ok(RestoredState {
             tasks,
             current_position,
+            settings,
         })
     }
 
@@ -129,6 +132,9 @@ impl Storage for SqliteStorage {
         }
         if let Some(record) = &commit.switch_record {
             write_switch_record(&transaction, record)?;
+        }
+        for setting in &commit.settings {
+            write_setting(&transaction, setting)?;
         }
 
         transaction
@@ -250,6 +256,46 @@ fn write_switch_record(
         )
         .map_err(|error| StorageError::Write(format!("切り替え履歴を書けない: {error}")))?;
     Ok(())
+}
+
+/// **設定値**を 1 行書く (AD-11)。
+///
+/// 鍵ごとの upsert であり、**行を消さない**。設定を消すことは既定値へ戻すことであり、
+/// v1 にその経路は無い — 表現できる値を置かないことでそれを構造として保証する。
+fn write_setting(transaction: &Transaction<'_>, setting: &Setting) -> Result<(), StorageError> {
+    transaction
+        .execute(
+            "INSERT INTO setting (key, value) VALUES (?1, ?2) \
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            rusqlite::params![setting.key(), setting.value()],
+        )
+        .map_err(|error| StorageError::Write(format!("設定値を書けない: {error}")))?;
+    Ok(())
+}
+
+/// 全**設定値**を読む (AD-11)。
+///
+/// **1 行も無いことは失敗ではない。** 初回起動の DB は空であり、読み手はコード内の
+/// 定数へ落ちる。値の意味付けはここでは行わない — 鍵と文字列の組のまま運ぶ。
+fn read_settings(connection: &Connection) -> Result<Vec<Setting>, StorageError> {
+    let mut statement = connection
+        .prepare("SELECT key, value FROM setting ORDER BY key")
+        .map_err(|error| StorageError::Read(format!("設定値を読めない: {error}")))?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok(Setting::new(
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+            ))
+        })
+        .map_err(|error| StorageError::Read(format!("設定値を読めない: {error}")))?;
+
+    let mut settings = Vec::new();
+    for row in rows {
+        settings
+            .push(row.map_err(|error| StorageError::Read(format!("設定値を読めない: {error}")))?);
+    }
+    Ok(settings)
 }
 
 /// 全**タスク**を読む。**ステップ**は `ordinal` 昇順で組み立てる。
@@ -638,6 +684,7 @@ mod tests {
                 task: Some(task.clone()),
                 current_position: Some(position),
                 switch_record: None,
+                settings: Vec::new(),
             })
             .expect("タスクが同じトランザクションで先に書かれるため成立する");
 
@@ -782,6 +829,7 @@ mod tests {
             task: Some(task.clone()),
             current_position: Some(CurrentPosition::rehydrate(task.id(), stranger, true, NOW)),
             switch_record: None,
+            settings: Vec::new(),
         });
         assert!(outcome.is_err(), "存在しないステップを指す現在地は書けない");
 
@@ -825,6 +873,7 @@ mod tests {
                 task: Some(task.clone()),
                 current_position: Some(position),
                 switch_record: Some(SwitchRecord::new(NOW, departed, true)),
+                settings: Vec::new(),
             })
             .expect("三つが同じトランザクションで書ける");
 
@@ -865,6 +914,7 @@ mod tests {
             task: Some(task.clone()),
             current_position: Some(CurrentPosition::rehydrate(task.id(), stranger, true, NOW)),
             switch_record: Some(SwitchRecord::new(NOW, task.steps()[0].id(), true)),
+            settings: Vec::new(),
         });
         assert!(outcome.is_err());
         assert_eq!(count_switch_records(&storage), 0);
@@ -891,6 +941,7 @@ mod tests {
                     task: None,
                     current_position: None,
                     switch_record: Some(SwitchRecord::new(at, departed, note_written)),
+                    settings: Vec::new(),
                 })
                 .expect("書ける");
         }
@@ -1039,6 +1090,86 @@ mod tests {
             })
             .expect("実行できる");
         rows.map(|row| row.expect("行は読める")).collect()
+    }
+
+    // --- 設定値 (AD-11) ----------------------------------------------------------
+
+    /// 空の DB には**設定値**が 1 行も無い。**それが正常な状態である。**
+    #[test]
+    fn an_empty_database_has_no_settings() {
+        let storage = SqliteStorage::in_memory().expect("開ける");
+        assert!(storage.restore().expect("読める").settings.is_empty());
+    }
+
+    /// **設定値**は書いたとおりに読み戻る (AD-11)。
+    #[test]
+    fn a_setting_round_trips() {
+        let storage = SqliteStorage::in_memory().expect("開ける");
+        storage
+            .apply(&Commit::of_settings(vec![
+                Setting::new("rest_threshold_seconds", "3000"),
+                Setting::new("grace_period_seconds", "900"),
+            ]))
+            .expect("書ける");
+
+        let settings = storage.restore().expect("読める").settings;
+        assert_eq!(
+            settings,
+            vec![
+                Setting::new("grace_period_seconds", "900"),
+                Setting::new("rest_threshold_seconds", "3000"),
+            ],
+            "鍵の昇順で読み戻る"
+        );
+    }
+
+    /// 同じ鍵を二度書いても行は増えない (upsert であり、行を消さない)。
+    #[test]
+    fn writing_the_same_setting_twice_replaces_the_value() {
+        let storage = SqliteStorage::in_memory().expect("開ける");
+        for value in ["3000", "600"] {
+            storage
+                .apply(&Commit::of_settings(vec![Setting::new(
+                    "rest_threshold_seconds",
+                    value,
+                )]))
+                .expect("書ける");
+        }
+
+        let settings = storage.restore().expect("読める").settings;
+        assert_eq!(settings.len(), 1);
+        assert_eq!(settings[0].value(), "600");
+    }
+
+    /// **設定値だけのコミットは空ではない。** 空と判定すると書き込みが黙って落ちる。
+    #[test]
+    fn a_settings_only_commit_is_not_empty() {
+        assert!(!Commit::of_settings(vec![Setting::new("k", "v")]).is_empty());
+        assert!(Commit::of_settings(Vec::new()).is_empty());
+    }
+
+    /// **設定値を書いても、タスク・現在地・履歴には触れない。**
+    #[test]
+    fn writing_a_setting_touches_nothing_else() {
+        let storage = SqliteStorage::in_memory().expect("開ける");
+        let task = a_task();
+        let step_id = task.steps()[0].id();
+        let task_id = task.id();
+        storage.apply(&Commit::of_task(task)).expect("書ける");
+        storage
+            .apply(&Commit::of_current_position(CurrentPosition::rehydrate(
+                task_id, step_id, true, NOW,
+            )))
+            .expect("書ける");
+
+        storage
+            .apply(&Commit::of_settings(vec![Setting::new("k", "v")]))
+            .expect("書ける");
+
+        let restored = storage.restore().expect("読める");
+        assert_eq!(restored.tasks.len(), 1);
+        assert_eq!(restored.current_position.step_id(), Some(step_id));
+        assert!(restored.current_position.is_active());
     }
 
     /// DB ファイルのパスはアプリデータディレクトリ配下に組み立てられる。

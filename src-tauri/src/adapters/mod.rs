@@ -4,6 +4,7 @@ pub mod appmenu;
 pub mod autostart;
 pub mod clock;
 pub mod hotkey;
+pub mod intervention;
 pub mod menubar;
 pub mod presentation;
 pub mod storage;
