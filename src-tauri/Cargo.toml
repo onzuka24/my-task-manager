@@ -21,10 +21,18 @@ tauri-build = { version = "=2.6.3", features = [] }
 # tauri の feature:
 #   tray-icon — メニューバー項目 (NSStatusItem)。唯一の明示的な終了経路 (CAP-3)
 #   image-png — Image::from_bytes。上の 2 つは既定 feature に含まれない
+#   macos-private-api — 非活性パネル (AD-6) に必須。tauri-nspanel が要求するため
+#     feature の加算でどのみち有効になるが、tauri-build は Cargo.toml の feature と
+#     tauri.conf.json の許可リストの一致を検査する。明示しないとビルドが落ちる。
+#     これにより App Store 配布は恒久的に不可能となる (SPEC 非目標)。
 [dependencies]
 serde = { version = "=1.0.229", features = ["derive"] }
 log = "=0.4.34"
-tauri = { version = "=2.11.5", features = ["tray-icon", "image-png"] }
+tauri = { version = "=2.11.5", features = [
+  "tray-icon",
+  "image-png",
+  "macos-private-api",
+] }
 tauri-plugin-log = "=2.9.1"
 # SQLite。`bundled` は SQLite 自体をソースから同梱してビルドする — システム同梱版の
 # バージョン差 (macOS のリリースごとに異なる) を排除し、WAL や upsert の挙動を固定
@@ -51,6 +59,17 @@ tauri-plugin-autostart = "=2.5.1"
 # リンクが壊れる。
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2-app-kit = { version = "=0.3.2", features = ["NSWindow", "NSResponder"] }
+# 非活性パネル (AD-6) — Tauri 2.11 に一次的な API は無く、NSPanel への差し替えを
+# 行うのはこのクレートだけである。`=` で固定するのは他の依存と同じ理由 (2.x 系に
+# 留まる) に加え、パネルの style mask と collection behavior の意味が版で変わると
+# 「三つの必須設定」が静かに失敗しうるためである。
+#
+# このクレートは tauri の `macos-private-api` feature を要求する。feature は加算的で
+# あり、結果として本体にも有効化される — tauri.conf.json の `app.macOSPrivateApi` を
+# 真にしないとビルドが通らない。App Store 配布が恒久的に不可能になることは、AD-6 を
+# 採用した時点で確定している (スパイン「スタック」)。
+tauri-nspanel = "=2.1.0"
+
 
 # テストでのみ使う。Rust → TS の配線 (フィールド名) を JSON の形として固定するため。
 [dev-dependencies]

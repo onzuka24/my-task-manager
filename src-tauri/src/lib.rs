@@ -51,8 +51,10 @@ pub mod ports;
 use tauri::{Emitter, Manager};
 
 use adapters::hotkey::HotkeyStatus;
+use adapters::intervention::INTERVENTION_LABEL;
 use adapters::storage::SqliteStorage;
-use adapters::{autostart, clock, hotkey, menubar, presentation};
+use adapters::{autostart, clock, hotkey, intervention, menubar, presentation};
+use domain::rest::TICK_INTERVAL_MILLIS;
 use domain::state::Core;
 
 /// 終了要求を拒むべきか決める純粋関数。
@@ -74,6 +76,13 @@ pub const CURRENT_POSITION_CHANGED: &str = "current_position_changed";
 /// event は `名詞_過去分詞` (スパイン「一貫性の規約」)。
 pub const TASK_CREATED: &str = "task_created";
 
+/// **介入**が発せられたことを伝えるイベントの名前 (AD-3 / CAP-10)。
+///
+/// **介入パネルが再描画する契機である。** パネルは非活性であり、フォーカスの取得という
+/// 契機を持たない — オーバーレイが `onFocusChanged` で取り直しているものを、こちらは
+/// このイベントで取り直す。状態はここでは運ばれない (AD-3 鮮度規則)。
+pub const INTERVENTION_RAISED: &str = "intervention_raised";
+
 /// **切り替え**が確定したことを提示層へ伝える (AD-3)。
 pub fn announce_current_position_changed<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
     announce(app, CURRENT_POSITION_CHANGED);
@@ -86,6 +95,11 @@ pub fn announce_current_position_changed<R: tauri::Runtime>(app: &tauri::AppHand
 /// あり、そこで**現在地**の変化を主張することになる。
 pub fn announce_task_created<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
     announce(app, TASK_CREATED);
+}
+
+/// **介入**が発せられたことを介入パネルへ伝える (AD-3 / CAP-10)。
+pub fn announce_intervention_raised<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
+    announce(app, INTERVENTION_RAISED);
 }
 
 /// 状態が変わったという事実だけを提示層へ伝える (AD-3)。
@@ -131,6 +145,13 @@ pub fn run() {
         }));
     }
 
+    // 非活性パネル (AD-6)。プラグインはパネルの登録簿を `manage` するだけであり、
+    // ここで登録しておかないと `setup` での差し替えが失敗する。
+    #[cfg(target_os = "macos")]
+    {
+        builder = builder.plugin(tauri_nspanel::init());
+    }
+
     builder
         // 第 1 層 — Cmd+Q / Cmd+W の出所そのものを消す。
         .enable_macos_default_menu(false)
@@ -143,15 +164,33 @@ pub fn run() {
             commands::switch_current_position,
             commands::select_step,
             commands::hide_overlay,
-            commands::mark_overlay_hidden
+            commands::mark_overlay_hidden,
+            commands::get_intervention_snapshot,
+            commands::answer_intervention,
+            commands::end_rest
         ])
         // 第 2 層 — 閉じる要求は破棄ではなく非表示に変換する。
+        //
+        // **ラベルを見る。** 見なければ、介入パネルへ届いた閉じる要求がオーバーレイを
+        // 隠す — 二つ目のウィンドウを足した時点で、この処理はどちらの要求も同じ一つの
+        // 面へ写していた (spec Code Map)。
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                // どちらのウィンドウも破棄しない。生かし続けることが 300ms 制約
+                // (CAP-1) と「介入は選ばれるまで消えない」(FR-15) の双方の前提である。
                 api.prevent_close();
-                log::info!("a close request was converted into hiding the overlay");
-                if let Err(error) = presentation::hide(window.app_handle()) {
-                    log::error!("failed to hide the overlay on a close request: {error}");
+                match window.label() {
+                    INTERVENTION_LABEL => {
+                        // **介入は閉じる要求では消えない。** 消えてよいのは応答が
+                        // 確定したときだけであり、その経路は一つしかない (AD-7)。
+                        log::info!("a close request on the intervention panel was refused");
+                    }
+                    label => {
+                        log::info!("a close request on `{label}` was converted into hiding the overlay");
+                        if let Err(error) = presentation::hide(window.app_handle()) {
+                            log::error!("failed to hide the overlay on a close request: {error}");
+                        }
+                    }
                 }
             }
         })
@@ -257,6 +296,20 @@ pub fn run() {
 
             autostart::enable(&handle);
 
+            // 介入パネル (AD-6)。**起動時にメインスレッドで生成し、隠しておく。**
+            // `setup` はメインスレッドで走るため、ここから `NSPanel` を触ってよい。
+            //
+            // 立たなくても常駐は止めない。ホットキーによる呼び出しと**切り替え**は
+            // 働き続ける — 休息介入だけが失われる。
+            match intervention::install(&handle) {
+                Ok(()) => log::info!("the intervention panel is ready and hidden"),
+                Err(error) => log::error!("failed to prepare the intervention panel: {error}"),
+            }
+
+            // 計時の刻み (AD-8)。**コアが計る。** ここが回さなければ、連続作業時間を
+            // 誰も引き算しない。
+            start_ticking(&handle);
+
             Ok(())
         })
         .build(tauri::generate_context!())
@@ -270,6 +323,72 @@ pub fn run() {
                 }
             }
         });
+}
+
+/// **連続作業時間**の計時を回す (AD-8 / CAP-10)。
+///
+/// # なぜ専用のスレッドなのか
+///
+/// Rust 側に非同期ランタイムは無く、持ち込まない (`Cargo.toml` が sqlx を退けた理由と
+/// 同じ)。刻みは 10 秒に一度、コアの純粋関数を一つ呼ぶだけであり、眠っている間の費用は
+/// スレッド 1 本のスタックに尽きる。
+///
+/// # 判断はここに無い
+///
+/// このループが持つのは「一定の間隔で [`Core::tick`] を呼ぶ」ことだけである。**介入**を
+/// 発するかどうかも、スリープをどう扱うかも `domain/rest.rs` の純粋関数が決める (AD-8)。
+///
+/// # 表示はメインスレッドへ回す
+///
+/// `NSPanel` は `MainThreadOnly` である。**介入**を発したという知らせを受け取ったら、
+/// パネルの操作だけをメインスレッドへ渡す。
+fn start_ticking<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
+    let handle = app.clone();
+    let interval =
+        std::time::Duration::from_millis(u64::try_from(TICK_INTERVAL_MILLIS).unwrap_or(10_000));
+
+    std::thread::Builder::new()
+        .name("continuous-work-time".to_string())
+        .spawn(move || loop {
+            std::thread::sleep(interval);
+
+            // コアが読めていなければ計る対象が無い。常駐は止めない。
+            let Some(core) = handle.try_state::<Core>() else {
+                continue;
+            };
+            let effect = match core.tick() {
+                Ok(effect) => effect,
+                Err(error) => {
+                    // 記録して次の刻みへ。ユーザー操作を伴わない失敗は介入として
+                    // 提示しない (スパイン「一貫性の規約」)。
+                    log::error!("the work clock could not be committed: {error}");
+                    continue;
+                }
+            };
+            if !effect.raised {
+                continue;
+            }
+
+            log::info!("the rest threshold was reached; raising an intervention");
+            let raiser = handle.clone();
+            if let Err(error) = handle.run_on_main_thread(move || {
+                if let Err(error) = intervention::raise(&raiser) {
+                    log::error!("failed to raise the intervention: {error}");
+                    // **出せなかった介入を「表示中」のままにしない。** 後続の契機が
+                    // 永久に待ち続ける (AD-7)。取り下げて猶予を与え、出直させる。
+                    if let Some(core) = raiser.try_state::<Core>() {
+                        core.withdraw_intervention();
+                    }
+                }
+            }) {
+                log::error!("failed to hand the intervention to the main thread: {error}");
+                core.withdraw_intervention();
+            }
+        })
+        .map_or_else(
+            |error| log::error!("failed to start the work clock: {error}"),
+            |_| log::info!("the work clock is running"),
+        );
 }
 
 /// 永続化された状態を読み戻し、コアを常駐プロセスへ預ける (AD-5)。
@@ -441,6 +560,49 @@ mod tests {
         }
     }
 
+    /// **閉じる要求はラベルで分けられていること** (本スライスで直した既存の不具合)。
+    ///
+    /// 分岐を消しても、介入パネルへの閉じる要求がオーバーレイを隠すだけであり、
+    /// **他のどの検査も赤くならない。** 字面をここで固定する。
+    ///
+    /// 主張は[字面の存在][`written_in_source`]までであり、効いていることではない。
+    #[test]
+    fn the_close_request_is_still_split_by_label() {
+        for needle in [
+            concat!("window.", "label()"),
+            concat!("INTERVENTION_", "LABEL =>"),
+        ] {
+            assert!(
+                written_in_source(needle),
+                "{needle} が lib.rs から消えている。\
+                 ラベルを見なければ、介入パネルの閉じる要求がオーバーレイを隠す"
+            );
+        }
+    }
+
+    /// **計時の刻みを回す呼び出しが書かれていること** (AD-8)。
+    ///
+    /// [`domain::rest::decide`] の検査は判断しか見ない。**`start_ticking` の呼び出しを
+    /// 消しても緑のままである** — 判断は正しいが誰もそれを問わない状態になり、v1 唯一の
+    /// 能動機能が黙って死ぬ。
+    ///
+    /// 介入パネルの生成も同じ理由で見る。生成されなければ、発した**介入**を出す先が無い。
+    #[test]
+    fn the_work_clock_and_the_panel_are_still_wired_in_the_source() {
+        for needle in [
+            concat!("start_ticking", "(&handle)"),
+            concat!("intervention::", "install(&handle)"),
+            concat!("core.", "tick()"),
+            concat!("intervention::", "raise(&raiser)"),
+        ] {
+            assert!(
+                written_in_source(needle),
+                "{needle} が lib.rs から消えている。\
+                 連続作業時間を誰も引き算しない状態に戻る"
+            );
+        }
+    }
+
     /// 編集メニューを据える呼び出しが書かれていること。
     ///
     /// [`adapters::appmenu`] の検査は「メニューに貼り付けの項目がある」ことしか見ない。
@@ -483,6 +645,17 @@ mod tests {
     #[test]
     fn the_event_name_follows_the_naming_rule() {
         assert_eq!(CURRENT_POSITION_CHANGED, "current_position_changed");
+    }
+
+    /// **介入**が発せられたことを伝えるイベントも `名詞_過去分詞` である。
+    ///
+    /// 名前を変えると介入パネルの購読が無言で外れ、**介入**が出ても中身が古いまま
+    /// 描かれる (AD-3 鮮度規則が働かなくなる)。
+    #[test]
+    fn the_intervention_event_name_follows_the_naming_rule() {
+        assert_eq!(INTERVENTION_RAISED, "intervention_raised");
+        assert_ne!(INTERVENTION_RAISED, CURRENT_POSITION_CHANGED);
+        assert_ne!(INTERVENTION_RAISED, TASK_CREATED);
     }
 
     /// **タスク**の作成を伝えるイベントも `名詞_過去分詞` である。

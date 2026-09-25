@@ -30,6 +30,7 @@ const SNAPSHOT = {
   stepOrdinal: 3,
   stepCount: 6,
   interruptionNote: '接続詞を整える途中',
+  resting: false,
 }
 
 /**
@@ -123,6 +124,7 @@ let disclosureFails = false
 let holdDisclosure = false
 let releaseDisclosure: ((surface: Record<string, unknown>) => void) | null = null
 let selectOutcome = { moved: true }
+let endRestOutcome = { resumed: true }
 let component: Record<string, unknown> | undefined
 
 /**
@@ -168,6 +170,7 @@ function installIPC(): void {
         return surfaceFor(args)
       }
       if (cmd === 'select_step') return selectOutcome
+      if (cmd === 'end_rest') return endRestOutcome
       return null
     },
     { shouldMockEvents: true },
@@ -343,6 +346,7 @@ beforeEach(async () => {
   holdDisclosure = false
   releaseDisclosure = null
   selectOutcome = { moved: true }
+  endRestOutcome = { resumed: true }
   mockWindows('main')
   installIPC()
   stubEventInternals()
@@ -1796,4 +1800,115 @@ test('一覧が窓に収まらなくても、切り取られずスクロール�
   // 最後の行まで DOM にあること。切り取って描かない。
   expect(rowTexts()[2]).toContain('醤油')
   expect(main.contains(list)).toBe(true)
+})
+
+
+// --- 休息中の既定表示 (CAP-10 / FR-15) --------------------------------------
+
+/**
+ * 休息中の状態でオーバーレイを描き直す。
+ *
+ * **スナップショットを差し替えてから取り直す。** フロントは計時をしない (AD-8) ため、
+ * 「休息中である」はコアから届く事実そのものである。
+ */
+async function enterTheRestingSurface(): Promise<void> {
+  snapshot = { ...SNAPSHOT, resting: true }
+  await emit('tauri://focus', null)
+  await settle()
+  invoked = []
+  calls = []
+}
+
+test('休息中は次の一手を出さない — 現在地が保たれていることだけを述べる', async () => {
+  await enterTheRestingSurface()
+
+  const text = document.body.textContent ?? ''
+  expect(text).toContain('休息中')
+  expect(text).not.toContain(SNAPSHOT.stepContent)
+  expect(document.querySelector('textarea.note')).toBeNull()
+})
+
+test('受け入れ条件: 休息中に Enter を押すと休息の終了が宣言される', async () => {
+  await enterTheRestingSurface()
+
+  press('Enter')
+  await settle()
+
+  expect(invoked).toContain('end_rest')
+  // **切り替えではない。** 切り替えれば現在地が黙って活性へ戻る。
+  expect(invoked).not.toContain('switch_current_position')
+})
+
+test('休息の終了の後、既定表示は取り直されて CAP-8 の形式に戻る', async () => {
+  await enterTheRestingSurface()
+  // 宣言の応答を境に、コアは活性の現在地を返す。
+  snapshot = { ...SNAPSHOT, resting: false }
+
+  press('Enter')
+  await settle()
+
+  expect(invoked).toContain('get_overlay_snapshot')
+  const text = document.body.textContent ?? ''
+  expect(text).toContain(SNAPSHOT.stepContent)
+  expect(text).toContain('第 3 ステップ / 全 6 ステップ')
+  // 中断メモは入力欄の初期値として戻る (FR-7 / FR-8)。
+  expect(noteField().value).toBe(SNAPSHOT.interruptionNote)
+})
+
+test('休息中の ⌘Enter も切り替えを撃たない', async () => {
+  await enterTheRestingSurface()
+
+  press('Enter', { metaKey: true })
+  await settle()
+
+  expect(invoked).not.toContain('switch_current_position')
+})
+
+test('休息中ではなかったと返ったら、そのことを述べる', async () => {
+  await enterTheRestingSurface()
+  endRestOutcome = { resumed: false }
+  snapshot = { ...SNAPSHOT, resting: false }
+
+  press('Enter')
+  await settle()
+
+  expect(noticeText()).toContain('休息中ではなかった')
+})
+
+test('休息の終了に失敗したら理由を出し、面は閉じない', async () => {
+  await enterTheRestingSurface()
+  mockIPC(
+    (cmd, args) => {
+      invoked.push(cmd)
+      calls.push({ cmd, args: (args ?? {}) as Record<string, unknown> })
+      if (cmd === 'end_rest') throw new Error('書き込めない')
+      if (cmd === 'get_overlay_snapshot') return snapshot
+      return null
+    },
+    { shouldMockEvents: true },
+  )
+
+  press('Enter')
+  await settle()
+
+  expect(noticeText()).toContain('書き込めない')
+  expect(invoked).not.toContain('hide_overlay')
+})
+
+test('休息中は案内が入れ替わる — 切り替えも完了の宣言も案内しない', async () => {
+  await enterTheRestingSurface()
+
+  const hint = document.querySelector('.hint')?.textContent ?? ''
+  expect(hint).toContain('Enter で休息を終える')
+  expect(hint).not.toContain('切り替え')
+  expect(hint).not.toContain('完了')
+})
+
+test('休息中でも残り時間やカウントダウンを出さない (spec Never)', async () => {
+  await enterTheRestingSurface()
+
+  const text = document.body.textContent ?? ''
+  for (const forbidden of ['残り', '分後', '経過', '%']) {
+    expect(text).not.toContain(forbidden)
+  }
 })

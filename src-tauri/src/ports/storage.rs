@@ -14,6 +14,7 @@
 //! **完了**が落ちた状態が残りうる — AD-5 が禁じているのはまさにそれである。
 
 use crate::domain::position::CurrentPosition;
+use crate::domain::setting::Setting;
 use crate::domain::switch::SwitchRecord;
 use crate::domain::task::Task;
 
@@ -26,6 +27,11 @@ pub struct RestoredState {
     pub tasks: Vec<Task>,
     /// 唯一の**現在地**。何も書かれていなければ [`CurrentPosition::NotStarted`]。
     pub current_position: CurrentPosition,
+    /// 永続化された**設定値** (AD-11)。
+    ///
+    /// **空であることが正常な状態である。** 初回起動の DB には 1 行も無く、読み手は
+    /// コード内の定数へ落ちる (スパイン「一貫性の規約」)。
+    pub settings: Vec<Setting>,
 }
 
 impl Default for RestoredState {
@@ -34,6 +40,7 @@ impl Default for RestoredState {
         Self {
             tasks: Vec::new(),
             current_position: CurrentPosition::NotStarted,
+            settings: Vec::new(),
         }
     }
 }
@@ -49,11 +56,15 @@ impl Default for RestoredState {
 /// 経路は CAP-20 にのみ属する)。削除を表現する値を置かないことで、それを構造として
 /// 保証する。
 ///
-/// **欄が三つあるのは AD-5 のためである。** 一度の**切り替え**は、離脱側の
+/// **欄が並んでいるのは AD-5 のためである。** 一度の**切り替え**は、離脱側の
 /// **中断メモ**の確定 (と任意の**完了**宣言) ・**現在地**の移動・**切り替え履歴**の
 /// 追記を同時に確定させなければならない。三つを別々の [`Storage::apply`] に分ければ
 /// 書き込みは三つのトランザクションに割れ、その隙間の異常終了が「メモは残ったが
 /// **現在地**が動いていない」状態を残す。
+///
+/// **設定値 (AD-11) だけは他の欄と束ねて使わない。** 設定の変更は**切り替え**でも
+/// **休息**でもなく、同時に確定させるべき相手を持たない。欄をここに置いたのは、
+/// 「1 メソッド = 1 トランザクション」という契約を設定のためだけに緩めないためである。
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Commit {
     /// 書き直す**タスク** (**ステップ**を含む)。変更が無ければ `None`。
@@ -64,6 +75,11 @@ pub struct Commit {
     ///
     /// 追記専用であり、置き換えも削除もしない。読み戻す経路も持たない (AD-15)。
     pub switch_record: Option<SwitchRecord>,
+    /// 置き換える**設定値** (AD-11)。変更が無ければ空。
+    ///
+    /// 鍵ごとの upsert であり、**行を消さない**。設定を「消す」ことは既定値へ戻すことで
+    /// あり、v1 にその経路は無い。
+    pub settings: Vec<Setting>,
 }
 
 impl Commit {
@@ -74,6 +90,7 @@ impl Commit {
             task: Some(task),
             current_position: None,
             switch_record: None,
+            settings: Vec::new(),
         }
     }
 
@@ -84,13 +101,28 @@ impl Commit {
             task: None,
             current_position: Some(current_position),
             switch_record: None,
+            settings: Vec::new(),
+        }
+    }
+
+    /// **設定値**だけを書き換えるコミット (AD-11)。
+    #[must_use]
+    pub fn of_settings(settings: Vec<Setting>) -> Self {
+        Self {
+            task: None,
+            current_position: None,
+            switch_record: None,
+            settings,
         }
     }
 
     /// 書き込むものが何も無いか。
     #[must_use]
-    pub const fn is_empty(&self) -> bool {
-        self.task.is_none() && self.current_position.is_none() && self.switch_record.is_none()
+    pub fn is_empty(&self) -> bool {
+        self.task.is_none()
+            && self.current_position.is_none()
+            && self.switch_record.is_none()
+            && self.settings.is_empty()
     }
 }
 

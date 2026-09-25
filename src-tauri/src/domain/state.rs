@@ -16,20 +16,53 @@
 use std::sync::{Mutex, MutexGuard};
 
 use super::position::CurrentPosition;
+use super::rest::{self, Decision, Intervention, InterventionChoice, RestSettings, Tick};
+use super::setting::Setting;
 use super::switch::SwitchRecord;
 use super::task::{InterruptionNote, Step, StepId, Task, TaskId};
-use super::{Clock, DomainError};
+use super::{Clock, DomainError, Timestamp};
 use crate::ports::storage::{Commit, RestoredState, Storage, StorageError};
 
 /// コアが保持する状態そのもの。
 ///
 /// フィールドは外へ出さない。状態を変えうる操作は [`Core`] のメソッドだけであり、
 /// この型を握って好きに書き換える経路を作らない (AD-2)。
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CoreState {
     tasks: Vec<Task>,
     /// **唯一の現在地。** 集合ではないことが FR-6 の一意性そのものである。
     current_position: CurrentPosition,
+    /// 永続化された**設定値** (AD-11)。**解釈ではなく、読んだままを持つ。**
+    ///
+    /// [`RestSettings`] を畳んだ形で持たないのは、同じ真実が二つの場所に生まれるためで
+    /// ある — 書き換えのたびに畳み直す規律が要り、片方だけ古い状態を作れてしまう。
+    settings: Vec<Setting>,
+    /// 表示中の**介入**。**永続化しない。起動時は常に非表示** (AD-2)。
+    ///
+    /// **1 個のフィールドである。** 集合として持たないため「二つの介入」を表現する値が
+    /// 存在しない — AD-7 の単一性は規律ではなく型の帰結である。
+    intervention: Option<Intervention>,
+    /// **猶予**の後に再提示する時刻。**永続化しない** (AD-2)。
+    ///
+    /// 再起動で失われてよい。失われれば次の刻みで**連続作業時間**を見て判断し直すだけ
+    /// であり、**介入**が消えるのではなく出直しが早まるにすぎない。
+    grace_until: Option<Timestamp>,
+    /// 直前の刻みの時刻。**時計の飛び (スリープ) はこことの差で測る** (AD-8)。
+    last_tick: Timestamp,
+}
+
+impl Default for CoreState {
+    /// 何も読み込まれていない状態。**`last_tick` は [`Core::restore`] が必ず上書きする。**
+    fn default() -> Self {
+        Self {
+            tasks: Vec::new(),
+            current_position: CurrentPosition::NotStarted,
+            settings: Vec::new(),
+            intervention: None,
+            grace_until: None,
+            last_tick: Timestamp::MIN,
+        }
+    }
 }
 
 impl CoreState {
@@ -68,6 +101,32 @@ impl CoreState {
     pub fn step_at_current_position(&self) -> Option<&Step> {
         let step_id = self.current_position.step_id()?;
         self.task_of_step(step_id)?.step(step_id)
+    }
+
+    /// **休息閾値**と**猶予** (AD-11)。値が無ければコード内の定数である。
+    #[must_use]
+    pub fn rest_settings(&self) -> RestSettings {
+        RestSettings::from_settings(&self.settings)
+    }
+
+    /// 永続化された**設定値**そのもの (AD-11)。
+    #[must_use]
+    pub fn settings(&self) -> &[Setting] {
+        &self.settings
+    }
+
+    /// 表示中の**介入** (AD-2)。
+    #[must_use]
+    pub const fn intervention(&self) -> Option<Intervention> {
+        self.intervention
+    }
+
+    /// **休息**中か — **現在地**が値を保ったまま**非活性**である状態 (CAP-6 / FR-6)。
+    ///
+    /// **未着手**は休息ではない。値を持たない状態であり、そこから「復帰」する先が無い。
+    #[must_use]
+    pub const fn is_resting(&self) -> bool {
+        matches!(self.current_position, CurrentPosition::Inactive { .. })
     }
 }
 
@@ -131,6 +190,7 @@ impl Core {
         let RestoredState {
             tasks,
             current_position,
+            settings,
         } = storage.restore()?;
 
         // **現在地**が実在しない**ステップ**を指していないことを、ここで一度だけ確かめる。
@@ -153,10 +213,20 @@ impl Core {
             }
         }
 
+        // **刻みの起点はいまである。** 起動前に流れた時間を時計の飛びとして扱わない —
+        // 扱えば、朝いちばんの起動が「長いスリープから復帰した」ことになり、**連続作業
+        // 時間**が黙ってリセットされる。プロセスが走っていなかった間の扱いは v1 の
+        // 対象外であり、[`rest::decide`] が見るのは走っている間の飛びだけである。
+        let last_tick = clock.now();
         Ok(Self {
             state: Mutex::new(CoreState {
                 tasks,
                 current_position,
+                settings,
+                // **起動時は常に非表示である** (AD-2)。
+                intervention: None,
+                grace_until: None,
+                last_tick,
             }),
             clock,
             storage,
@@ -392,6 +462,7 @@ impl Core {
             task: task_changed.then(|| draft.clone()),
             current_position: moved,
             switch_record: Some(SwitchRecord::new(now, departed, note_written)),
+            settings: Vec::new(),
         })?;
 
         if task_changed {
@@ -491,6 +562,7 @@ impl Core {
             current_position: Some(moved),
             // **機会を与えていないため `note_written` は常に偽である。**
             switch_record: departed.map(|departed| SwitchRecord::new(now, departed, false)),
+            settings: Vec::new(),
         })?;
         state.current_position = moved;
         Ok(true)
@@ -512,6 +584,163 @@ impl Core {
     /// 永続化に失敗したとき。
     pub fn deactivate_current_position(&self) -> Result<(), CoreError> {
         self.transition_position(|position, _| position.deactivate())
+    }
+
+    // --- 休息介入 (CAP-10 / FR-15) ---------------------------------------------
+
+    /// **計時の刻み** (AD-8)。**連続作業時間**を測り、必要なら**介入**を発する。
+    ///
+    /// 判断そのものは [`rest::decide`] が持つ純粋関数であり、ここが行うのは
+    /// 「状態を読む → 判断させる → 永続化 → メモリ反映」の直列化だけである
+    /// ([`Self::commit_task`] と同じ順序)。**この経路も他の状態変更と同じ一つの錠を
+    /// 通る** — **休息**への遷移と**切り替え**のコミットが交錯しない (AD-5)。
+    ///
+    /// # 戻り値
+    ///
+    /// 提示層が行うべきこと。**この関数はパネルを出さない** — OS を知らないためである。
+    ///
+    /// # Errors
+    ///
+    /// スリープ分の差し引きや計時のリセットを永続化できなかったとき。そのとき
+    /// **直前の刻みの時刻は進めない** — 進めると、差し引けなかったスリープが
+    /// **連続作業時間**に混ざったまま二度と補正されない。次の刻みが同じ飛びを見て
+    /// やり直す。
+    pub fn tick(&self) -> Result<TickEffect, CoreError> {
+        let mut state = self.lock();
+        let now = self.clock.now();
+
+        let decision = rest::decide(&Tick {
+            position: state.current_position,
+            now,
+            previous: state.last_tick,
+            interval_millis: rest::TICK_INTERVAL_MILLIS,
+            settings: state.rest_settings(),
+            grace_until: state.grace_until,
+            // **表示中なら後発は待つ** (AD-7)。
+            showing: state.intervention.is_some(),
+        });
+
+        if let Some(adjusted) = adjusted_position(state.current_position, &decision) {
+            self.storage.apply(&Commit::of_current_position(adjusted))?;
+            state.current_position = adjusted;
+        }
+
+        state.last_tick = now;
+        state.grace_until = decision.grace_until;
+        if decision.raise {
+            state.intervention = Some(Intervention::raised_at(now));
+        }
+        Ok(TickEffect {
+            raised: decision.raise,
+        })
+    }
+
+    /// **介入への応答** (CAP-10 / FR-15)。**介入を閉じる唯一の経路である** (AD-7)。
+    ///
+    /// - [`InterventionChoice::Rest`] — **現在地**は値を保ったまま**非活性**になり、
+    ///   計数が止まる (FR-6)。
+    /// - [`InterventionChoice::Grace`] — **現在地**は**活性**のまま、**猶予**の後に
+    ///   出直す。**上限は無い** (spec Design Notes)。
+    ///
+    /// # 戻り値
+    ///
+    /// 応答すべき**介入**が表示されていたか。表示されていなければ `false` であり、
+    /// **何も起きない** — ホットキーの二重発火や、応答と同時に届いた別経路の応答が
+    /// **現在地**を二度非活性にすることを防ぐ。
+    ///
+    /// # Errors
+    ///
+    /// **休息**への遷移を永続化できなかったとき。そのとき**状態は何も変わらず、介入も
+    /// 閉じない** (I/O マトリクス「休息に入る」)。閉じてしまえば、選んだはずの休息が
+    /// どこにも残らないまま画面から消える。
+    pub fn answer_intervention(&self, choice: InterventionChoice) -> Result<bool, CoreError> {
+        let mut state = self.lock();
+        if state.intervention.is_none() {
+            return Ok(false);
+        }
+        let now = self.clock.now();
+
+        match choice {
+            InterventionChoice::Rest => {
+                let next = state.current_position.deactivate();
+                if next != state.current_position {
+                    self.storage.apply(&Commit::of_current_position(next))?;
+                    state.current_position = next;
+                }
+                // **休息**に入った以上、出直しの約束は残さない。
+                state.grace_until = None;
+            }
+            InterventionChoice::Grace => {
+                state.grace_until = Some(after(now, state.rest_settings().grace_period_millis()));
+            }
+        }
+
+        state.intervention = None;
+        Ok(true)
+    }
+
+    /// **介入を取り下げる** (AD-7)。提示そのものに失敗したときの経路である。
+    ///
+    /// 表示できなかった**介入**を状態の上だけ「表示中」にしておくと、後続の契機が永久に
+    /// 待ち続ける。取り下げたうえで**猶予**を与え、出直させる — 与えなければ、出せない
+    /// **介入**を刻みのたびに出し直すことになる。
+    ///
+    /// **応答ではない。** 利用者は何も選んでおらず、**現在地**にも触れない。
+    pub fn withdraw_intervention(&self) -> bool {
+        let mut state = self.lock();
+        if state.intervention.take().is_none() {
+            return false;
+        }
+        let now = self.clock.now();
+        state.grace_until = Some(after(now, state.rest_settings().grace_period_millis()));
+        true
+    }
+
+    /// **休息の終了** (CAP-10 / FR-15)。**ユーザーの明示的な宣言による。**
+    ///
+    /// **現在地**は**活性**へ戻り、**連続作業時間**はそこから数え直される — **非活性**
+    /// から**活性**への遷移が AD-8 の唯一のリセット契機である。
+    ///
+    /// # 戻り値
+    ///
+    /// **休息**中であったか。**未着手**や**活性**のときは `false` であり、何も書かない。
+    ///
+    /// # Errors
+    ///
+    /// 永続化に失敗したとき。状態は変わらない。
+    pub fn end_rest(&self) -> Result<bool, CoreError> {
+        let mut state = self.lock();
+        if !state.is_resting() {
+            return Ok(false);
+        }
+        let next = state.current_position.activate(self.clock.now());
+        self.storage.apply(&Commit::of_current_position(next))?;
+        state.current_position = next;
+        state.grace_until = None;
+        Ok(true)
+    }
+
+    /// **設定値**を書き換える (AD-11)。
+    ///
+    /// v1 に設定の面は無い。この経路は、**休息閾値**を短くして**介入**を実際に出す手動
+    /// 確認 (spec Verification) と、永続化の往復を確かめる検査のために存在する。
+    ///
+    /// # Errors
+    ///
+    /// 永続化に失敗したとき。**メモリ上の設定も変えない。**
+    pub fn store_setting(&self, setting: Setting) -> Result<(), CoreError> {
+        let mut state = self.lock();
+        self.storage
+            .apply(&Commit::of_settings(vec![setting.clone()]))?;
+        match state
+            .settings
+            .iter_mut()
+            .find(|stored| stored.key() == setting.key())
+        {
+            Some(stored) => *stored = setting,
+            None => state.settings.push(setting),
+        }
+        Ok(())
     }
 
     /// **現在地**の遷移を一つの経路に集める。
@@ -602,6 +831,38 @@ impl Core {
     fn lock(&self) -> MutexGuard<'_, CoreState> {
         self.state.lock().unwrap_or_else(|error| error.into_inner())
     }
+}
+
+/// [`Core::tick`] が提示層へ返す、行うべきこと。
+///
+/// **ここに OS の語彙は無い。** 「パネルを出す」ではなく「**介入**を発した」であり、
+/// それをどう見せるかはアダプタの仕事である (AD-1)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TickEffect {
+    /// **介入**を発したか。真ならアダプタがパネルを出し、応答のホットキーを登録する。
+    pub raised: bool,
+}
+
+/// **起点の付け替えが要るなら、付け替え後の**現在地**を返す純粋関数** (AD-8)。
+///
+/// 要らないなら `None` — **何も変わらないなら何も書かない**。書けば、待機している
+/// だけの常駐が 10 秒ごとに DB へ書き込むことになる。
+fn adjusted_position(position: CurrentPosition, decision: &Decision) -> Option<CurrentPosition> {
+    let activated_at = decision.activated_at?;
+    if position.activated_at() == Some(activated_at) {
+        return None;
+    }
+    Some(CurrentPosition::rehydrate(
+        position.task_id()?,
+        position.step_id()?,
+        position.is_active(),
+        activated_at,
+    ))
+}
+
+/// 時刻にミリ秒を足す。範囲外は [`Timestamp`] が端へ丸める。
+fn after(at: Timestamp, millis: i64) -> Timestamp {
+    Timestamp::from_unix_millis(at.unix_millis().saturating_add(millis))
 }
 
 /// 同一**タスク**内で、指定の**ステップ**の次に来る**ステップ**。
@@ -1010,6 +1271,7 @@ mod tests {
                     true,
                     Timestamp::from_unix_millis(0),
                 ),
+                settings: Vec::new(),
             },
             ..RecordingStorage::default()
         });
@@ -1033,6 +1295,7 @@ mod tests {
                     true,
                     Timestamp::from_unix_millis(0),
                 ),
+                settings: Vec::new(),
             },
             ..RecordingStorage::default()
         });
@@ -1744,6 +2007,504 @@ mod tests {
 
         assert_eq!(outcome, Err(CoreError::Domain(DomainError::UnknownStep)));
         assert_eq!(storage.commits(), before, "何も書かれていない");
+    }
+
+    // --- 休息介入 (CAP-10 / FR-15) ---------------------------------------------
+
+    use crate::domain::rest::{
+        Intervention, InterventionChoice, RestSettings, GRACE_PERIOD_KEY, REST_THRESHOLD_KEY,
+        TICK_INTERVAL_MILLIS,
+    };
+    use crate::domain::setting::Setting;
+
+    const MINUTE: i64 = 60_000;
+
+    /// **現在地**を第 1 **ステップ**へ置いたコアを作る。以降の刻みはここが起点である。
+    fn a_core_at_work() -> (Core, Arc<RecordingStorage>, FixedClock) {
+        let (core, storage, clock) = a_core();
+        let task_id = core
+            .create_task("原稿", contents(&["下書き", "推敲"]))
+            .expect("作れる");
+        let first = core.snapshot().task(task_id).expect("ある").steps()[0].id();
+        core.move_current_position(first).expect("移せる");
+        (core, storage, clock)
+    }
+
+    /// 刻みを 1 回進める。**時計も刻みの間隔だけ進める** — 進めなければ、次の刻みが
+    /// 時計の飛びとしてスリープに見える。
+    fn tick_once(core: &Core, clock: &FixedClock) -> bool {
+        clock.advance(TICK_INTERVAL_MILLIS);
+        core.tick().expect("刻める").raised
+    }
+
+    /// 指定の長さだけ、**実際の刻みの間隔で刻み続ける。** 途中で**介入**が発せられたら真。
+    ///
+    /// **時計だけを一気に進めてはならない。** 進めれば、それは刻みではなく時計の飛びで
+    /// あり、[`rest::decide`] はスリープとして扱う — 計時の検査のつもりがスリープの
+    /// 検査になる。
+    fn tick_for(core: &Core, clock: &FixedClock, millis: i64) -> bool {
+        let mut raised = false;
+        let mut remaining = millis;
+        while remaining > 0 {
+            raised |= tick_once(core, clock);
+            remaining -= TICK_INTERVAL_MILLIS;
+        }
+        raised
+    }
+
+    /// 受け入れ条件「現在地が活性で起点から 50 分、刻みが来る → 介入が発せられる」。
+    #[test]
+    fn the_threshold_raises_an_intervention_on_a_tick() {
+        let (core, _, clock) = a_core_at_work();
+
+        assert!(!tick_for(&core, &clock, 49 * MINUTE), "49 分では出ない");
+        assert!(core.snapshot().intervention().is_none());
+
+        assert!(tick_for(&core, &clock, MINUTE), "50 分で出る");
+        assert!(core.snapshot().intervention().is_some());
+    }
+
+    /// I/O マトリクス「表示中の別の契機」— **後発は待つ。パネルは一つだけである** (AD-7)。
+    #[test]
+    fn only_one_intervention_is_raised_at_a_time() {
+        let (core, _, clock) = a_core_at_work();
+        assert!(tick_for(&core, &clock, 50 * MINUTE));
+        let raised = core.snapshot().intervention().expect("出ている");
+
+        for _ in 0..5 {
+            assert!(!tick_once(&core, &clock), "表示中は後発が待つ");
+        }
+        assert_eq!(
+            core.snapshot().intervention(),
+            Some(raised),
+            "表示中の介入は差し替わらない"
+        );
+    }
+
+    /// 受け入れ条件「パネルで休息を選ぶ → 現在地は値を保ったまま `is_active` が偽」。
+    #[test]
+    fn choosing_rest_deactivates_the_current_position_without_losing_it() {
+        let (core, storage, clock) = a_core_at_work();
+        let before = core.current_position();
+        assert!(tick_for(&core, &clock, 50 * MINUTE));
+        let commits = storage.commits().len();
+
+        assert!(core
+            .answer_intervention(InterventionChoice::Rest)
+            .expect("応答できる"));
+
+        let position = core.current_position();
+        assert!(!position.is_active(), "非活性になる");
+        assert_eq!(position.step_id(), before.step_id(), "値は保たれる");
+        assert_eq!(position.task_id(), before.task_id());
+        assert_eq!(
+            position.activated_at(),
+            before.activated_at(),
+            "起点は据え置かれる — 休息は計時を止めるのであって数え直すのではない"
+        );
+        assert!(core.snapshot().is_resting());
+        assert!(core.snapshot().intervention().is_none(), "介入は閉じる");
+        assert_eq!(storage.commits().len(), commits + 1, "1 トランザクション");
+    }
+
+    /// 受け入れ条件「休息中に 60 分経過 → 介入は発せられない」。
+    #[test]
+    fn no_intervention_is_raised_while_resting() {
+        let (core, _, clock) = a_core_at_work();
+        assert!(tick_for(&core, &clock, 50 * MINUTE));
+        core.answer_intervention(InterventionChoice::Rest)
+            .expect("応答できる");
+
+        for _ in 0..6 {
+            assert!(!tick_for(&core, &clock, 10 * MINUTE), "休息中は計数しない");
+        }
+        assert!(core.snapshot().intervention().is_none());
+    }
+
+    /// 受け入れ条件「休息中に終了を宣言 → 現在地が活性へ戻り、起点が更新される」。
+    #[test]
+    fn declaring_the_end_of_a_rest_takes_up_the_work_again() {
+        let (core, _, clock) = a_core_at_work();
+        let step_id = core.current_position().step_id();
+        assert!(tick_for(&core, &clock, 50 * MINUTE));
+        core.answer_intervention(InterventionChoice::Rest)
+            .expect("応答できる");
+
+        clock.advance(20 * MINUTE);
+        let resumed_at = clock.now();
+        assert!(core.end_rest().expect("終えられる"));
+
+        let position = core.current_position();
+        assert!(position.is_active());
+        assert_eq!(position.step_id(), step_id, "戻る先は同じステップである");
+        assert_eq!(
+            position.activated_at(),
+            Some(resumed_at),
+            "非活性→活性の遷移でのみ起点が更新される (AD-8)"
+        );
+        assert!(!core.snapshot().is_resting());
+    }
+
+    /// **休息**中でなければ終了の宣言は何も書かない。
+    #[test]
+    fn declaring_the_end_of_a_rest_while_active_writes_nothing() {
+        let (core, storage, _) = a_core_at_work();
+        let commits = storage.commits().len();
+
+        assert!(!core.end_rest().expect("失敗しない"));
+        assert_eq!(storage.commits().len(), commits);
+    }
+
+    /// 受け入れ条件「猶予を選ぶ → 15 分後に再び現れる。現在地は活性のまま」。
+    #[test]
+    fn a_grace_period_postpones_the_intervention_without_ending_the_work() {
+        let (core, _, clock) = a_core_at_work();
+        assert!(tick_for(&core, &clock, 50 * MINUTE));
+
+        assert!(core
+            .answer_intervention(InterventionChoice::Grace)
+            .expect("応答できる"));
+        assert!(core.current_position().is_active(), "現在地は活性のまま");
+        assert!(core.snapshot().intervention().is_none());
+
+        assert!(!tick_for(&core, &clock, 14 * MINUTE), "まだ出ない");
+        assert!(tick_for(&core, &clock, MINUTE), "15 分後に出直す");
+    }
+
+    /// I/O マトリクス「繰り返し猶予」— **上限で止まらない** (spec Design Notes)。
+    #[test]
+    fn a_grace_period_has_no_limit() {
+        let (core, _, clock) = a_core_at_work();
+        assert!(tick_for(&core, &clock, 50 * MINUTE));
+
+        for round in 0..5 {
+            core.answer_intervention(InterventionChoice::Grace)
+                .expect("応答できる");
+            assert!(
+                tick_for(&core, &clock, 15 * MINUTE),
+                "{round} 回目の猶予の後も出直す"
+            );
+        }
+        assert!(core.current_position().is_active(), "猶予は休息に化けない");
+    }
+
+    /// 受け入れ条件「起点から 40 分で切り替え、さらに 10 分 → 介入が発せられる」。
+    #[test]
+    fn a_switch_does_not_postpone_the_intervention() {
+        let (core, _, clock) = a_core_at_work();
+
+        assert!(!tick_for(&core, &clock, 40 * MINUTE));
+        core.switch_current_position(None, false)
+            .expect("切り替えられる");
+
+        assert!(
+            tick_for(&core, &clock, 10 * MINUTE),
+            "切り替えは起点を動かさない (AD-8)"
+        );
+    }
+
+    /// 受け入れ条件「閾値を超えるスリープから復帰 → 計時はリセットされ、介入は出ない」。
+    #[test]
+    fn a_long_sleep_resets_the_work_clock_without_an_intervention() {
+        let (core, _, clock) = a_core_at_work();
+        assert!(!tick_for(&core, &clock, 40 * MINUTE));
+
+        // 眠っている間、刻みは走らない。時計だけが飛ぶ。
+        clock.advance(120 * MINUTE);
+        assert!(
+            !core.tick().expect("刻める").raised,
+            "休息が取られたとみなす"
+        );
+        assert_eq!(
+            core.current_position().activated_at(),
+            Some(clock.now()),
+            "計時はリセットされる"
+        );
+
+        assert!(!tick_for(&core, &clock, 49 * MINUTE), "数え直している");
+        assert!(tick_for(&core, &clock, MINUTE));
+    }
+
+    /// I/O マトリクス「短いスリープ」— スリープ分は加算せず、計時は継続する。
+    #[test]
+    fn a_short_sleep_is_discounted_from_the_work_clock() {
+        let (core, _, clock) = a_core_at_work();
+        let started = core.current_position().activated_at().expect("起点がある");
+        assert!(!tick_for(&core, &clock, 40 * MINUTE));
+
+        clock.advance(10 * MINUTE);
+        assert!(!core.tick().expect("刻める").raised);
+        assert_eq!(
+            core.current_position().activated_at(),
+            Some(Timestamp::from_unix_millis(
+                started.unix_millis() + 10 * MINUTE - TICK_INTERVAL_MILLIS
+            )),
+            "眠った分だけ起点をずらす — リセットではない"
+        );
+
+        assert!(tick_for(&core, &clock, 10 * MINUTE), "計時は継続する");
+    }
+
+    /// **待機しているだけの刻みは何も書かない。**
+    ///
+    /// 書けば、10 秒ごとに DB へ書き込む常駐になる。
+    #[test]
+    fn an_idle_tick_writes_nothing() {
+        let (core, storage, clock) = a_core_at_work();
+        let commits = storage.commits().len();
+
+        for _ in 0..10 {
+            assert!(!tick_once(&core, &clock));
+        }
+        assert_eq!(storage.commits().len(), commits);
+    }
+
+    /// I/O マトリクス「未着手」— 計時も介入も起きない。
+    #[test]
+    fn nothing_is_counted_before_the_first_step() {
+        let (core, storage, clock) = a_core();
+        for _ in 0..10 {
+            clock.advance(10 * MINUTE);
+            assert!(!core.tick().expect("刻める").raised);
+        }
+        assert!(storage.commits().is_empty());
+    }
+
+    /// I/O マトリクス「休息に入る」— **書き込みが失敗したら状態を変えず、介入も閉じない。**
+    #[test]
+    fn a_failed_rest_changes_nothing_and_keeps_the_intervention() {
+        let (core, storage, clock) = a_core_at_work();
+        assert!(tick_for(&core, &clock, 50 * MINUTE));
+        let before = core.current_position();
+
+        storage.set_failing(true);
+        let outcome = core.answer_intervention(InterventionChoice::Rest);
+
+        assert!(matches!(outcome, Err(CoreError::Storage(_))));
+        assert_eq!(core.current_position(), before, "現在地は動かない");
+        assert!(
+            core.snapshot().intervention().is_some(),
+            "選んだはずの休息が残らないまま画面から消えない"
+        );
+    }
+
+    /// **表示されていない介入には応答できない。** 二重発火や競り合った応答で
+    /// **現在地**が二度動かない。
+    #[test]
+    fn answering_without_an_intervention_does_nothing() {
+        let (core, storage, _) = a_core_at_work();
+        let commits = storage.commits().len();
+
+        assert!(!core
+            .answer_intervention(InterventionChoice::Rest)
+            .expect("失敗しない"));
+        assert!(!core
+            .answer_intervention(InterventionChoice::Grace)
+            .expect("失敗しない"));
+        assert!(core.current_position().is_active());
+        assert_eq!(storage.commits().len(), commits);
+    }
+
+    /// **二度目の応答は何も起こさない。** ホットキーとクリックが同時に届いた場合である。
+    #[test]
+    fn a_second_answer_is_ignored() {
+        let (core, _, clock) = a_core_at_work();
+        assert!(tick_for(&core, &clock, 50 * MINUTE));
+
+        assert!(core
+            .answer_intervention(InterventionChoice::Rest)
+            .expect("応答できる"));
+        assert!(
+            !core
+                .answer_intervention(InterventionChoice::Grace)
+                .expect("失敗しない"),
+            "二つ目の応答は何も起こさない"
+        );
+        assert!(core.snapshot().is_resting(), "休息のままである");
+    }
+
+    /// **取り下げた介入は猶予を伴って出直す。** 出せなかった介入を刻みのたびに
+    /// 出し直さない (AD-7)。
+    #[test]
+    fn a_withdrawn_intervention_comes_back_after_a_grace_period() {
+        let (core, _, clock) = a_core_at_work();
+        assert!(tick_for(&core, &clock, 50 * MINUTE));
+
+        assert!(core.withdraw_intervention());
+        assert!(core.snapshot().intervention().is_none());
+        assert!(core.current_position().is_active(), "現在地には触れない");
+
+        assert!(!tick_for(&core, &clock, 14 * MINUTE), "すぐには出直さない");
+        assert!(tick_for(&core, &clock, MINUTE));
+    }
+
+    /// 表示されていない**介入**は取り下げられない。
+    #[test]
+    fn withdrawing_without_an_intervention_does_nothing() {
+        let (core, _, _) = a_core_at_work();
+        assert!(!core.withdraw_intervention());
+    }
+
+    /// **起動時は常に非表示である** (AD-2)。表示状態も猶予も永続化されない。
+    #[test]
+    fn a_restored_core_shows_no_intervention() {
+        let (core, _, _) = a_core_at_work();
+        assert!(core.snapshot().intervention().is_none());
+    }
+
+    /// **設定値は既定値を上書きし、書き込みは往復する** (AD-11)。
+    #[test]
+    fn a_stored_setting_overrides_the_constant() {
+        let (core, storage, _) = a_core();
+        assert_eq!(core.snapshot().rest_settings(), RestSettings::default());
+
+        core.store_setting(Setting::new(REST_THRESHOLD_KEY, "60"))
+            .expect("書ける");
+        core.store_setting(Setting::new(GRACE_PERIOD_KEY, "30"))
+            .expect("書ける");
+
+        assert_eq!(core.snapshot().rest_settings().rest_threshold_seconds(), 60);
+        assert_eq!(core.snapshot().rest_settings().grace_period_seconds(), 30);
+        let written: Vec<Setting> = storage
+            .commits()
+            .iter()
+            .flat_map(|commit| commit.settings.clone())
+            .collect();
+        assert_eq!(written.len(), 2, "設定値は 1 操作 = 1 コミットで書かれる");
+    }
+
+    /// 同じ鍵を二度書いても行が二つにならない。
+    #[test]
+    fn storing_the_same_key_twice_replaces_it() {
+        let (core, _, _) = a_core();
+        core.store_setting(Setting::new(REST_THRESHOLD_KEY, "60"))
+            .expect("書ける");
+        core.store_setting(Setting::new(REST_THRESHOLD_KEY, "120"))
+            .expect("書ける");
+
+        assert_eq!(core.snapshot().settings().len(), 1);
+        assert_eq!(
+            core.snapshot().rest_settings().rest_threshold_seconds(),
+            120
+        );
+    }
+
+    /// 書き込みが失敗したらメモリ上の設定も変えない。
+    #[test]
+    fn a_failed_setting_write_leaves_memory_untouched() {
+        let (core, storage, _) = a_core();
+        storage.set_failing(true);
+
+        let outcome = core.store_setting(Setting::new(REST_THRESHOLD_KEY, "60"));
+
+        assert!(matches!(outcome, Err(CoreError::Storage(_))));
+        assert!(core.snapshot().settings().is_empty());
+        assert_eq!(core.snapshot().rest_settings(), RestSettings::default());
+    }
+
+    /// **短くした閾値が実際に効く。** 手動確認 (spec Verification) の前提である。
+    #[test]
+    fn a_shortened_threshold_actually_fires_sooner() {
+        let (core, _, clock) = a_core_at_work();
+        core.store_setting(Setting::new(REST_THRESHOLD_KEY, "60"))
+            .expect("書ける");
+
+        assert!(tick_for(&core, &clock, MINUTE), "1 分で出る");
+    }
+
+    /// **休息への遷移と切り替えのコミットが交錯しない** (AD-5)。
+    ///
+    /// 錠がアグリゲート単位に割れていれば、「現在地が活性のまま休息中」という状態が
+    /// 作れてしまう。刻み・応答・切り替えをスレッドを跨いで叩き、最終状態が必ず
+    /// 一貫していることを見る。
+    #[test]
+    fn resting_and_switching_never_interleave() {
+        let storage = RecordingStorage::shared();
+        let clock = FixedClock::at(1_789_000_000_000);
+        let core = Arc::new(core_with(Arc::clone(&storage), clock.clone()));
+        let task_id = core
+            .create_task("原稿", contents(&["一", "二", "三"]))
+            .expect("作れる");
+        let first = core.snapshot().task(task_id).expect("ある").steps()[0].id();
+        core.move_current_position(first).expect("移せる");
+
+        let handles: Vec<_> = (0..4)
+            .map(|worker| {
+                let core = Arc::clone(&core);
+                let clock = clock.clone();
+                std::thread::spawn(move || {
+                    for _ in 0..50 {
+                        match worker % 4 {
+                            0 => {
+                                clock.advance(TICK_INTERVAL_MILLIS);
+                                let _ = core.tick();
+                            }
+                            1 => {
+                                let _ = core.answer_intervention(InterventionChoice::Rest);
+                            }
+                            2 => {
+                                let _ = core.end_rest();
+                            }
+                            _ => {
+                                let _ = core.switch_current_position(None, false);
+                            }
+                        }
+                    }
+                })
+            })
+            .collect();
+        for handle in handles {
+            handle.join().expect("スレッドは panic しない");
+        }
+
+        let snapshot = core.snapshot();
+        let position = snapshot.current_position();
+        assert!(position.step_id().is_some(), "現在地は値を持ったままである");
+        assert_eq!(
+            snapshot.is_resting(),
+            !position.is_active(),
+            "「活性のまま休息中」という状態が作られていない"
+        );
+        assert!(
+            !(snapshot.intervention().is_some() && snapshot.is_resting()),
+            "休息に入った以上、介入は残らない"
+        );
+    }
+
+    /// **表示中の介入は一つの値である。** 型が集合を持たないことの確認 (AD-7)。
+    #[test]
+    fn the_intervention_is_a_single_value() {
+        let (core, _, clock) = a_core_at_work();
+        assert!(tick_for(&core, &clock, 50 * MINUTE));
+        let raised: Option<Intervention> = core.snapshot().intervention();
+        assert!(raised.is_some());
+        assert_eq!(raised.map(|i| i.at()), Some(clock.now()));
+    }
+
+    /// 書き込みが失敗した刻みは、次の刻みでやり直せる。
+    ///
+    /// **`last_tick` を進めてしまうと、差し引けなかったスリープが二度と補正されない。**
+    #[test]
+    fn a_failed_tick_is_retried_on_the_next_one() {
+        let (core, storage, clock) = a_core_at_work();
+        let started = core.current_position().activated_at().expect("起点がある");
+
+        clock.advance(10 * MINUTE);
+        storage.set_failing(true);
+        assert!(matches!(core.tick(), Err(CoreError::Storage(_))));
+        assert_eq!(
+            core.current_position().activated_at(),
+            Some(started),
+            "書けなかった補正をメモリにだけ残さない"
+        );
+
+        storage.set_failing(false);
+        core.tick().expect("次の刻みは通る");
+        assert_ne!(
+            core.current_position().activated_at(),
+            Some(started),
+            "同じ飛びを見てやり直せている"
+        );
     }
 
     /// 書き込みが失敗したなら**現在地**は動かない。

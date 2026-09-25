@@ -47,6 +47,7 @@
 - source_spec: `_bmad-output/implementation-artifacts/spec-switch-and-resume.md`
   summary: **非活性** (休息中) の**現在地**から切り替えると、休息が黙って終わり**連続作業時間**の起点も更新される。
   evidence: レビュー #19。`move_to` が `Inactive` を `Active` へ遷移させるため。ただし `deactivate_current_position` を公開するコマンドが無く、今日この状態へ到達する経路は手編集の DB 以外に無い。切り替えが休息を終わらせてよいかは休息の意味付けそのものであり、CAP-10 が決める。
+  resolution: `spec-rest-intervention.md` で部分的に決着した。既定表示の Enter は**休息**中には**切り替え**ではなく**休息の終了の宣言**であり (`Overlay.svelte`)、黙って休息が終わる経路は既定表示から消えている。**開示面から**ステップ**を選ぶ経路 (CAP-9) は従来どおり**再入**として扱い、意図的に**活性**へ戻す** — 一覧から行を選ぶ行為は用語集の**再入**そのものであるため。ドメインの `switch_current_position` は依然として**非活性**から呼べば活性化するが、そこへ到達するコマンドは無い。
 
 - source_spec: `_bmad-output/implementation-artifacts/spec-switch-and-resume.md`
   summary: `switch_record` に保持期間の方針が無く、`departed_step_id` の外部キーに `ON DELETE` の方針も無い。
@@ -63,3 +64,19 @@
 - source_spec: `_bmad-output/implementation-artifacts/spec-task-creation.md`
   summary: テキスト入力面で貼り付け・全選択・取り消し (⌘V / ⌘C / ⌘X / ⌘A / ⌘Z) が効かない見込みである。アプリのメニューが存在しないため。
   evidence: レビュー #12。`enable_macos_default_menu(false)` かつ `Builder::menu()` 未設定であり、macOS ではこれらの打鍵はメニューの key equivalent 経由で WKWebView に届く。終了・閉じるを含まない編集メニューのみを足せば解決する見込みだが、既定メニューの無効化は slice 1 の誤終了阻止の第 1 層そのものであり、その層には自動検証が無い (既知の申し送り)。無検証のまま触れば、一打で常駐が死ぬ状態を再発させうる。誤終了阻止の自動検証と併せて扱う。
+
+- source_spec: `_bmad-output/implementation-artifacts/spec-rest-intervention.md`
+  summary: 常駐プロセスが走っていなかった時間が**連続作業時間**に加算される。**現在地**を**活性**のまま終了し、翌日起動すると、最初の刻み (10 秒後) で**介入**が出る。
+  evidence: スリープの検出は「刻みと刻みの間の時計の飛び」でしか行えず (`domain/rest.rs::slept_millis`)、直前の刻みの時刻は永続化されない (AD-2 の状態表に無い)。spec の I/O マトリクスは起動をまたぐ間隔を扱っておらず、実装は spec のとおりである。ただし PRD は「反射的に無視される介入は介入全体の信頼性を損なう」と述べており、毎朝の起動直後に出る介入はまさにそれに当たりうる。直すには「直前の刻みの時刻」を永続化する必要があり、AD-2 の状態表への追加を伴う — アーキテクチャの改訂を要する判断であるため送る。
+
+- source_spec: `_bmad-output/implementation-artifacts/spec-rest-intervention.md`
+  summary: 待機時メモリの余裕が 2MB しかない (実測 97.8〜97.9 MB / 上限 100 MB)。起動から数分は 101 MB を指す。
+  evidence: AD-14 が予告したとおり、常駐 webview が二つになったことで予算が逼迫した。定常値は予算内だが、三つ目の常駐 webview を足す余地は無く、WebKit 側の版が上がるだけで超過しうる。対処は (a) 提示面の webview を一つに畳む設計変更 (AD-6 が禁じているため実質不可能) (b) PRD §8 の上限の改訂 のいずれかであり、どちらも計画側の判断を要する。
+
+- source_spec: `_bmad-output/implementation-artifacts/spec-rest-intervention.md`
+  summary: 非活性パネルの三つの必須設定 (`nonactivating_panel` / `set_hides_on_deactivate(false)` / `full_screen_auxiliary`) が**効いていること**を確かめる自動検査が無い。組み立てたビットの字面と、設定を適用する呼び出しの存在までしか固定できていない。
+  evidence: いずれも AppKit を起動した実アプリでしか観測できず、本リポジトリは UI 自動化の基盤を持たない (既存の申し送り「誤終了阻止の実挙動」と同じ性質)。欠けたときの失敗は「フルスクリーン作業中にだけ出ない」「入力中にだけ打鍵を奪う」という、最も気づきにくい形で現れる。リリース前の手動確認を運用で固定するか、UI 自動化を導入するかの判断と併せて扱う。
+
+- source_spec: `_bmad-output/implementation-artifacts/spec-rest-intervention.md`
+  summary: **休息閾値**と**猶予**を変更する面が無い。値は SQLite の `setting` 表に置かれ、コアに読み書きの口 (`Core::store_setting`) はあるが、そこへ到達する UI もコマンドも無い。
+  evidence: CAP-10 は「閾値の既定値は 50 分で変更可能」と述べるが、本スライスの Intent は設定の面を含まない。変更は `sqlite3` から直接行える状態にしてある。設定の面をどこに置くか (オーバーレイの中か、別の面か) は FR-2 の「既定表示の最小化」と衝突しうる論点であり、独立した判断を要する。
