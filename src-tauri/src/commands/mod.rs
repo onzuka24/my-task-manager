@@ -1284,6 +1284,18 @@ pub struct AnswerInterventionOutcome {
     pub answered: bool,
 }
 
+/// **休息**の開始の結末 (CAP-10)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BeginRestOutcome {
+    /// **現在地**が**非活性**になったか。
+    ///
+    /// **未着手**と、既に**休息**中のときは偽であり、**何も書かれていない**。黙って
+    /// いると、宣言が効いたのかどうかを確かめる方法が残らない
+    /// ([`EndRestOutcome::resumed`] と同じ理由)。
+    pub rested: bool,
+}
+
 /// **休息**の終了の結末 (CAP-10)。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -1331,6 +1343,35 @@ pub fn answer_intervention<R: Runtime>(
         crate::announce_current_position_changed(&app);
     }
     Ok(AnswerInterventionOutcome { answered })
+}
+
+/// **休息**の開始を宣言する (CAP-10 / FR-15)。
+///
+/// **ユーザーの明示的な宣言だけがこれを起こす。** **現在地**は値を保ったまま**非活性**に
+/// なり、**連続作業時間**の計数が止まる。[`end_rest`] の対である。
+///
+/// **介入**を待たずに入れることが要である — 閾値より前に離席する日は当然にあり、宣言する
+/// 手段が無ければ離席の間も計数が続き、戻った直後に**介入**が出る。
+///
+/// **表示中の介入は取り下げない** (AD-7)。閉じる経路は [`answer_intervention`] だけで
+/// ある。
+///
+/// # Errors
+///
+/// コアが `manage` されていないとき、または永続化に失敗したとき。状態は変わらない。
+#[tauri::command]
+pub fn begin_rest<R: Runtime>(app: AppHandle<R>) -> Result<BeginRestOutcome, String> {
+    let core = require_core(app.try_state::<Core>())?;
+
+    let rested = core.begin_rest().map_err(|error| error.to_string())?;
+    // **非活性になったのは状態の変化である。** 既定表示は「休息中」を描くため、
+    // 取り直しの契機を送る (AD-3) — `answer_intervention` の `Rest` と同じ扱い。
+    if rested {
+        crate::announce_current_position_changed(&app);
+    }
+
+    log::info!("a rest was declared (rested={rested})");
+    Ok(BeginRestOutcome { rested })
 }
 
 /// **休息**の終了を宣言する (CAP-10 / FR-15)。

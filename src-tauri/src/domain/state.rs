@@ -800,6 +800,49 @@ impl Core {
         true
     }
 
+    /// **休息の開始** (CAP-10 / FR-15)。**ユーザーの明示的な宣言による。**
+    ///
+    /// **現在地**は値を保ったまま**非活性**になり、**連続作業時間**の計数が止まる
+    /// (FR-6 / AD-8)。[`Self::end_rest`] の対である。
+    ///
+    /// # なぜ**介入**を待たないのか
+    ///
+    /// **介入**は「自力では休息を取れていない」を補うための能動的な働きかけであって、
+    /// **休息**へ入る唯一の門ではない。閾値より前に離席する日は当然にあり、そのとき
+    /// 宣言する手段が無ければ、離席の間も**連続作業時間**が伸び、戻ってきた直後に
+    /// **介入**が出る — 反射的に無視される**介入**は**介入**全体の信頼性を損なう。
+    ///
+    /// # **介入**が表示中でも取り下げない (AD-7)
+    ///
+    /// **介入**を閉じる経路は [`Self::answer_intervention`] だけである。ここから閉じれば
+    /// 「応答していないのに消えた**介入**」が生まれ、パネルの表示と状態が食い違う。
+    /// 表示中に宣言した場合、**現在地**は先に**非活性**となり、続く応答は
+    /// [`CurrentPosition::deactivate`] が何も変えないため二重には効かない。
+    ///
+    /// # 戻り値
+    ///
+    /// **非活性**になったか。**未着手**と、既に**休息**中のときは `false` であり、
+    /// **何も書かない**。
+    ///
+    /// # Errors
+    ///
+    /// 永続化に失敗したとき。状態は変わらない。
+    pub fn begin_rest(&self) -> Result<bool, CoreError> {
+        let mut state = self.lock();
+        let next = state.current_position.deactivate();
+        // **未着手**と、既に**休息**中。どちらも値が変わらない — 書けば、何も変えない
+        // 要求が永続化の失敗で `Err` になりうる。
+        if next == state.current_position {
+            return Ok(false);
+        }
+        self.storage.apply(&Commit::of_current_position(next))?;
+        state.current_position = next;
+        // **休息**に入った以上、出直しの約束は残さない
+        // ([`Self::answer_intervention`] の `Rest` と同じ)。
+        state.grace_until = None;
+        Ok(true)
+    }
+
     /// **休息の終了** (CAP-10 / FR-15)。**ユーザーの明示的な宣言による。**
     ///
     /// **現在地**は**活性**へ戻り、**連続作業時間**はそこから数え直される — **非活性**
@@ -2402,6 +2445,90 @@ mod tests {
             "非活性→活性の遷移でのみ起点が更新される (AD-8)"
         );
         assert!(!core.snapshot().is_resting());
+    }
+
+    /// **介入**を待たずに宣言した**休息**も、選んだ**休息**と同じ状態になる。
+    #[test]
+    fn declaring_a_rest_deactivates_the_current_position_without_losing_it() {
+        let (core, storage, _) = a_core_at_work();
+        let before = core.current_position();
+        let commits = storage.commits().len();
+
+        assert!(core.begin_rest().expect("入れる"));
+
+        let position = core.current_position();
+        assert!(!position.is_active(), "非活性になる");
+        assert_eq!(position.step_id(), before.step_id(), "値は保たれる");
+        assert_eq!(
+            position.activated_at(),
+            before.activated_at(),
+            "起点は据え置かれる — 休息は計時を止めるのであって数え直すのではない"
+        );
+        assert!(core.snapshot().is_resting());
+        assert_eq!(storage.commits().len(), commits + 1, "1 トランザクション");
+    }
+
+    /// 宣言した**休息**の間も計数は止まっており、終了の宣言で数え直される。
+    ///
+    /// **介入**を経た**休息**と振る舞いが割れていないことを、経路を変えて同じ条件で見る。
+    #[test]
+    fn a_declared_rest_stops_the_work_clock_like_any_other() {
+        let (core, _, clock) = a_core_at_work();
+        assert!(core.begin_rest().expect("入れる"));
+
+        for _ in 0..6 {
+            assert!(!tick_for(&core, &clock, 10 * MINUTE), "休息中は計数しない");
+        }
+
+        let resumed_at = clock.now();
+        assert!(core.end_rest().expect("終えられる"));
+        assert_eq!(
+            core.current_position().activated_at(),
+            Some(resumed_at),
+            "非活性→活性の遷移でのみ起点が更新される (AD-8)"
+        );
+    }
+
+    /// 二度目の宣言も、**未着手**での宣言も、何も書かない。
+    #[test]
+    fn declaring_a_rest_twice_or_from_nowhere_writes_nothing() {
+        let (core, storage, _) = a_core_at_work();
+        assert!(core.begin_rest().expect("入れる"));
+        let commits = storage.commits().len();
+
+        assert!(!core.begin_rest().expect("失敗しない"), "既に休息中である");
+        assert_eq!(storage.commits().len(), commits);
+
+        let (empty, empty_storage, _) = a_core();
+        assert!(
+            !empty.begin_rest().expect("失敗しない"),
+            "未着手には入れない"
+        );
+        assert!(empty_storage.commits().is_empty());
+    }
+
+    /// 表示中の**介入**は、宣言では取り下げられない (AD-7)。
+    ///
+    /// 閉じる経路は応答だけである。ここから閉じれば「応答していないのに消えた**介入**」
+    /// が生まれ、パネルの表示と状態が食い違う。
+    #[test]
+    fn declaring_a_rest_does_not_close_a_showing_intervention() {
+        let (core, _, clock) = a_core_at_work();
+        assert!(tick_for(&core, &clock, 50 * MINUTE));
+        assert!(core.snapshot().intervention().is_some());
+
+        assert!(core.begin_rest().expect("入れる"));
+
+        assert!(
+            core.snapshot().intervention().is_some(),
+            "介入は表示されたままである"
+        );
+        // 続く応答は現在地を二度非活性にしない。
+        let before = core.current_position();
+        assert!(core
+            .answer_intervention(InterventionChoice::Rest)
+            .expect("応答できる"));
+        assert_eq!(core.current_position(), before);
     }
 
     /// **休息**中でなければ終了の宣言は何も書かない。

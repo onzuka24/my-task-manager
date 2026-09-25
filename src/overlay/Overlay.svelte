@@ -23,7 +23,11 @@
     resting: boolean
   }
 
-  // src-tauri/src/commands/mod.rs の `EndRestOutcome` と 1:1。
+  // src-tauri/src/commands/mod.rs の `BeginRestOutcome` / `EndRestOutcome` と 1:1。
+  type BeginRestOutcome = {
+    rested: boolean
+  }
+
   type EndRestOutcome = {
     resumed: boolean
   }
@@ -165,6 +169,8 @@
    */
   let resting = $state(false)
 
+  /** 休息の宣言が飛んでいる間。二重確定を防ぐ。 */
+  let beginningRest = $state(false)
   /** 休息の終了の宣言が飛んでいる間。二重確定を防ぐ。 */
   let endingRest = $state(false)
   /**
@@ -1000,6 +1006,39 @@
   }
 
   /**
+   * 休息に入ることを宣言する (CAP-10 / FR-15)。
+   *
+   * **介入を待たない。** 介入は「自力では休息を取れていない」を補う働きかけであって、
+   * 休息へ入る唯一の門ではない。閾値より前に離席する日は当然にあり、宣言する手段が
+   * 無ければ離席の間も連続作業時間が伸び、戻った直後に介入が出る — 反射的に無視される
+   * 介入は、介入全体の信頼性を損なう。
+   *
+   * 現在地は値を保ったまま非活性になり、計数が止まる。**オーバーレイは閉じない** —
+   * 取り直した面が「休息中」に入れ替わることが、宣言が効いた唯一の手応えである。
+   */
+  async function declareRest(): Promise<void> {
+    // 現在地が無ければ止める計数も無い。既に休息中なら宣言する相手も無い。
+    if (stepContent === null || beginningRest || resting) return
+    beginningRest = true
+    dismissNotices()
+    try {
+      const outcome = await invoke<BeginRestOutcome>('begin_rest')
+      // 取り直しが次の一手を畳み、「休息中」に置き換える (AD-3 鮮度規則)。
+      await refresh()
+      if (!outcome.rested) {
+        // **何も書かれていない。** 面も入れ替わらないため、述べなければ手応えが残らない。
+        restNotice = '休息に入れなかった。現在地が無いか、既に休息中である。'
+      }
+    } catch (error) {
+      console.error('failed to declare the rest', error)
+      restNotice = '休息に入れなかった。状態は変わっていない。'
+      restErrorDetail = String(error)
+    } finally {
+      beginningRest = false
+    }
+  }
+
+  /**
    * 休息の終了を宣言する (CAP-10 / FR-15)。
    *
    * **休息の終了はユーザーの明示的な宣言による。** 時間でも、オーバーレイを開いた
@@ -1121,12 +1160,15 @@
   }
 
   /**
-   * 面へ入る打鍵か。⌘ と綴りだけで決まり、他の修飾キーを伴えば別の打鍵である。
+   * ⌘ と綴りだけで決まる打鍵か。他の修飾キーを伴えば別の打鍵である。
+   *
+   * **面へ入る三つ (⌘N / ⌘L / ⌘E) と、休息の宣言 (⌘R) が同じ形を共有する。** 綴りごとに
+   * 判定を書き分けると、CapsLock の扱いのような細部が片方にだけ入る。
    *
    * **`key` を畳んで比べる。** CapsLock が入っていると `key` は `'L'` で届き、小文字と
    * の比較では一致しない — 案内どおりに押しても何も起きない面ができる。
    */
-  function isSurfaceKey(event: KeyboardEvent, letter: 'n' | 'l' | 'e'): boolean {
+  function isSurfaceKey(event: KeyboardEvent, letter: 'n' | 'l' | 'e' | 'r'): boolean {
     return (
       event.key.toLowerCase() === letter &&
       event.metaKey &&
@@ -1206,6 +1248,15 @@
       // 打鍵が何も起こさないほうが案内と食い違わない。
       if (stepContent === null) return
       void openEdit(null)
+      return
+    }
+
+    // 休息の宣言 (CAP-10 / FR-15)。**面へは入らない** — 取り直した既定表示が
+    // 「休息中」に入れ替わる。
+    if (isSurfaceKey(event, 'r')) {
+      event.preventDefault()
+      if (switching) return
+      void declareRest()
       return
     }
 
@@ -1766,6 +1817,7 @@
       {:else if stepContent !== null}
         <button type="button" onmousedown={preventStealingFocus} onclick={() => confirmSwitch()}>切り替え</button>
         <button type="button" onmousedown={preventStealingFocus} onclick={() => completeAndChooseNext()}>完了して次を選ぶ</button>
+        <button type="button" onmousedown={preventStealingFocus} onclick={() => declareRest()}>休息に入る</button>
         <button type="button" onmousedown={preventStealingFocus} onclick={() => openEdit(null)}>このタスクを直す</button>
       {/if}
       <button type="button" onmousedown={preventStealingFocus} onclick={() => openCreation()}>新しいタスク</button>
@@ -1814,7 +1866,7 @@
       休息の終了の宣言だけを意味する (CAP-10)。案内と実際に効く打鍵を食い違わせない。
     -->
     <p class="hint">
-      {#if resting}Enter で休息を終える · {:else if stepContent !== null}Enter で切り替え · ⌘Enter で完了して次を選ぶ · ⌘E でこのタスクを直す · {/if}⌘N で新しいタスク · ⌘L で一覧 · Esc で閉じる{#if hotkey && hotkey.registered} · {hotkey.accelerator} で開閉{/if} · 開く・終了はメニューバー項目からも
+      {#if resting}Enter で休息を終える · {:else if stepContent !== null}Enter で切り替え · ⌘Enter で完了して次を選ぶ · ⌘R で休息に入る · ⌘E でこのタスクを直す · {/if}⌘N で新しいタスク · ⌘L で一覧 · Esc で閉じる{#if hotkey && hotkey.registered} · {hotkey.accelerator} で開閉{/if} · 開く・終了はメニューバー項目からも
     </p>
   {/if}
 </main>

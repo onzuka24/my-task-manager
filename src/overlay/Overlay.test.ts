@@ -125,6 +125,7 @@ let holdDisclosure = false
 let releaseDisclosure: ((surface: Record<string, unknown>) => void) | null = null
 let selectOutcome = { moved: true }
 let endRestOutcome = { resumed: true }
+let beginRestOutcome = { rested: true }
 let completionOutcome = { taskFinished: false }
 /**
  * 修正の面の下書き。**`get_task_draft` の応答である。**
@@ -179,6 +180,7 @@ function installIPC(): void {
       }
       if (cmd === 'select_step') return selectOutcome
       if (cmd === 'end_rest') return endRestOutcome
+      if (cmd === 'begin_rest') return beginRestOutcome
       if (cmd === 'complete_current_step') return completionOutcome
       if (cmd === 'get_task_draft') {
         if (draftFails) throw new Error('常駐プロセスが応答しない')
@@ -409,6 +411,7 @@ beforeEach(async () => {
   releaseDisclosure = null
   selectOutcome = { moved: true }
   endRestOutcome = { resumed: true }
+  beginRestOutcome = { rested: true }
   completionOutcome = { taskFinished: false }
   draftFails = false
   mockWindows('main')
@@ -2198,6 +2201,7 @@ test('既定表示の操作はボタンからも到達できる', async () => {
   expect(actionLabels()).toEqual([
     '切り替え',
     '完了して次を選ぶ',
+    '休息に入る',
     'このタスクを直す',
     '新しいタスク',
     '一覧',
@@ -2289,4 +2293,115 @@ test('「閉じる」のボタンは Esc と同じ経路を通る', async () => 
   await settle()
 
   expect(invoked).toContain('hide_overlay')
+})
+
+// ---------------------------------------------------------------------------
+// 休息への手動の切り替え (CAP-10 / FR-15)
+// ---------------------------------------------------------------------------
+
+test('⌘R で休息に入る — 介入を待たない', async () => {
+  press('r', { metaKey: true })
+  await settle()
+
+  expect(invoked).toContain('begin_rest')
+  // 面は取り直され、オーバーレイは閉じない。
+  expect(invoked).toContain('get_overlay_snapshot')
+  expect(invoked).not.toContain('hide_overlay')
+})
+
+test('休息に入ると面が「休息中」へ入れ替わる', async () => {
+  // コアが確定させた後の状態を返す。取り直しがそれを描く。
+  mockIPC(
+    (cmd) => {
+      invoked.push(cmd)
+      if (cmd === 'begin_rest') {
+        snapshot = { ...SNAPSHOT, resting: true }
+        return beginRestOutcome
+      }
+      if (cmd === 'get_overlay_snapshot') return snapshot
+      return null
+    },
+    { shouldMockEvents: true },
+  )
+
+  press('r', { metaKey: true })
+  await settle()
+
+  const text = document.body.textContent ?? ''
+  expect(text).toContain('休息中')
+  expect(text).not.toContain(SNAPSHOT.stepContent)
+  // 案内も入れ替わる。
+  expect(document.querySelector('.hint')?.textContent ?? '').toContain('Enter で休息を終える')
+})
+
+test('「休息に入る」のボタンは ⌘R と同じ経路を通る', async () => {
+  actionButton('休息に入る').click()
+  await settle()
+
+  expect(invoked).toContain('begin_rest')
+})
+
+test('休息中には ⌘R もボタンも無い — Enter は終了の宣言だけを意味する', async () => {
+  await enterTheRestingSurface()
+
+  expect(actionLabels()).not.toContain('休息に入る')
+  expect(document.querySelector('.hint')?.textContent ?? '').not.toContain('⌘R')
+
+  press('r', { metaKey: true })
+  await settle()
+  expect(invoked).not.toContain('begin_rest')
+})
+
+test('未着手では休息に入れない — 止める計数が無い', async () => {
+  snapshot = { ...SNAPSHOT, stepContent: null, stepOrdinal: null, stepCount: null }
+  if (component) unmount(component)
+  await mountOverlay()
+  invoked = []
+
+  press('r', { metaKey: true })
+  await settle()
+
+  expect(invoked).not.toContain('begin_rest')
+  expect(actionLabels()).not.toContain('休息に入る')
+})
+
+test('何も書かれなかったなら、そう述べる', async () => {
+  beginRestOutcome = { rested: false }
+
+  press('r', { metaKey: true })
+  await settle()
+
+  expect(noticeText()).toContain('休息に入れなかった')
+})
+
+test('宣言に失敗したら理由を面に出し、閉じない', async () => {
+  mockIPC(
+    (cmd) => {
+      invoked.push(cmd)
+      if (cmd === 'get_overlay_snapshot') return snapshot
+      if (cmd === 'begin_rest') throw new Error('書き込みに失敗した')
+      return null
+    },
+    { shouldMockEvents: true },
+  )
+
+  press('r', { metaKey: true })
+  await settle()
+
+  expect(noticeText()).toContain('状態は変わっていない')
+  expect(invoked).not.toContain('hide_overlay')
+})
+
+test('作成の面と一覧では ⌘R が休息を宣言しない', async () => {
+  await openCreation()
+  press('r', { metaKey: true })
+  await settle()
+  expect(invoked).not.toContain('begin_rest')
+
+  press('Escape')
+  await settle()
+  await openDisclosure()
+  press('r', { metaKey: true })
+  await settle()
+  expect(invoked).not.toContain('begin_rest')
 })

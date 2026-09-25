@@ -170,6 +170,7 @@ pub fn run() {
             commands::mark_overlay_hidden,
             commands::get_intervention_snapshot,
             commands::answer_intervention,
+            commands::begin_rest,
             commands::end_rest
         ])
         // 第 2 層 — 閉じる要求は破棄ではなく非表示に変換する。
