@@ -80,3 +80,15 @@
 - source_spec: `_bmad-output/implementation-artifacts/spec-rest-intervention.md`
   summary: **休息閾値**と**猶予**を変更する面が無い。値は SQLite の `setting` 表に置かれ、コアに読み書きの口 (`Core::store_setting`) はあるが、そこへ到達する UI もコマンドも無い。
   evidence: CAP-10 は「閾値の既定値は 50 分で変更可能」と述べるが、本スライスの Intent は設定の面を含まない。変更は `sqlite3` から直接行える状態にしてある。設定の面をどこに置くか (オーバーレイの中か、別の面か) は FR-2 の「既定表示の最小化」と衝突しうる論点であり、独立した判断を要する。
+
+- source_spec: `_bmad-output/implementation-artifacts/spec-disclosure-surface.md`
+  summary: **開示面**に「このタスクを直す」への入口 (⌘E とボタン) を置いた。spec の非目標は「並べ替え・改名・削除の手がかりを一つも置かない」と定めており、改名への手がかりがこれに当たる。
+  evidence: 利用者の裁定により、打ち間違えた**タスク**を直す経路 (CAP-5 の可視面) を v1 に入れた。直す相手を選ぶには一覧が要る — 既定表示からの ⌘E は**現在地**の**タスク**しか直せず、着手していない**タスク**へ届かない。**一覧そのものには依然として入力欄が無く**、修正は排他の別の面で行う (`the_disclosure_surface_has_no_editing_handles` 相当の検査は通ったままである)。手がかりを一つ置いたことが一覧を編集の面へ滑り出させるかは、1 か月の試用で判断する。
+
+- source_spec: `_bmad-output/implementation-artifacts/spec-switch-and-resume.md`
+  summary: ⌘Enter (**完了**を伴う確定) で書かれた**中断メモ**は SM-C3 の分子に入らない。
+  evidence: 利用者の裁定により、**完了**の宣言は**現在地**を動かさなくなった (次に着手する**ステップ**は利用者が**開示面**で選ぶ)。`Core::complete_current_step` は離脱が起きていないため**切り替え履歴**を積まず、続く `Core::select_step` が積む 1 行は `note_written` が常に偽である (CAP-9 が「機会を与えていない移動を分子に数えない」と決めたとおり)。二つを跨いで「今回メモを書いたか」を運ぶには履歴の形を変える必要があり、指標の読み手がまだ存在しない (AD-15 は読み戻す経路を持たないと定める) ため、変更を伴う判断は送る。
+
+- source_spec: `_bmad-output/implementation-artifacts/spec-disclosure-surface.md`
+  summary: 全**ステップ**の**完了**が宣言された**タスク**を**開示面**から落とす扱いは、**腐敗** (CAP-20 / FR-17) とは別の規則として `disclosure_of` に立っている。二つの除外が同じ場所で別々の条件として並ぶことになる。
+  evidence: 利用者の裁定により「完了したタスクは消す」を v1 に入れた。FR-17 の**腐敗**は「長期間**現在地**にならなかった」を契機とし、こちらは「全部終わった」を契機とする — 契機も、復帰の要否 (FR-18) も異なる。CAP-20 を設計する時点で、二つを一つの述語へ畳むか別々に保つかを決めること。終わった**タスク**へ戻る経路が v1 に無いことも併せて扱う (**現在地**を離れた時点で一覧から到達できなくなる)。

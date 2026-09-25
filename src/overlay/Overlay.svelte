@@ -96,6 +96,51 @@
     moved: boolean
   }
 
+  // src-tauri/src/commands/mod.rs の `CompleteStepRequest` / `CompleteStepOutcome` と 1:1。
+  //
+  // **移動の欄が無い。** この経路は完了を宣言するだけであり、次にどのステップへ着手
+  // するかは利用者が開示面で選ぶ。
+  type CompleteStepRequest = {
+    note: string | null
+  }
+
+  type CompleteStepOutcome = {
+    taskFinished: boolean
+  }
+
+  // src-tauri/src/commands/mod.rs の `TaskDraftRequest` / `DraftStep` / `TaskDraft` と 1:1。
+  //
+  // **`taskId` が `null` なら現在地のタスクである。** 開示面の `DisclosureRequest` と
+  // 同じ規則であり、決めるのはコアの側である。
+  type TaskDraftRequest = {
+    taskId: string | null
+  }
+
+  type DraftStep = {
+    stepId: string
+    content: string
+  }
+
+  type TaskDraft = {
+    stateError: string | null
+    taskId: string | null
+    title: string
+    steps: DraftStep[]
+  }
+
+  // src-tauri/src/commands/mod.rs の `EditTaskRequest` と 1:1。
+  //
+  // **既存のステップだけ ID と本文の対で送る。** 行で送れば対応は並び順という暗黙の
+  // 約束になり、1 行ずれた瞬間に別のステップの本文が書き換わる。追記の欄だけは
+  // 「1 行 = 1 ステップ」の文字列であり、切り分けるのは Rust 側の `step_contents_of`
+  // である (作成と同じ規則)。
+  type EditTaskRequest = {
+    taskId: string
+    title: string
+    steps: DraftStep[]
+    addedSteps: string
+  }
+
   /** コアから届く、再描画の契機 (AD-3)。状態は運ばれてこない。 */
   const CURRENT_POSITION_CHANGED = 'current_position_changed'
 
@@ -174,6 +219,33 @@
   let creatingTask = $state(false)
 
   /**
+   * 修正の面の開閉状態と下書き — 揮発ビュー状態 (AD-2 の状態表)。
+   *
+   * **`editing` が初期値で偽であることが FR-2 の実体である。** 修正の面は初期表示に
+   * 現れず、明示的な打鍵 (⌘E) を最低 1 回経てのみ到達する (AD-15)。Esc・フォーカス
+   * 喪失・保存の成功で破棄され、次回の呼び出しは初期表示である。
+   *
+   * **`editTaskId` はコアが返した値である。** 面へ入るとき `null` で頼めるのは
+   * 「現在地のタスク」だけであり、どれが開いたのかを知っているのはコアである。
+   * `null` のままなら直す相手が無く、確定の手段そのものを出さない。
+   */
+  let editing = $state(false)
+  let editTaskId = $state<string | null>(null)
+  let editTitleDraft = $state('')
+  /**
+   * 既存のステップの下書き。**ID と本文の対である。**
+   *
+   * 連番で指さない — 追記や分割で番号が動いた瞬間に別のステップの本文が書き換わる
+   * (FR-5)。**消す欄は無い** (v1 に削除の経路が無い)。
+   */
+  let editStepDrafts = $state<DraftStep[]>([])
+  /** 末尾へ追記するステップ。1 行 = 1 ステップ。空でよい。 */
+  let editAddedDraft = $state('')
+  let editTitleInput = $state<HTMLInputElement | null>(null)
+  let editError = $state<string | null>(null)
+  let editingTask = $state(false)
+
+  /**
    * 開示面の開閉状態 — 揮発ビュー状態 (AD-2 の状態表)。
    *
    * **`disclosing` が初期値で偽であることが FR-19 の実体である。** 一覧は初期表示に
@@ -227,6 +299,17 @@
    */
   let selected = $state<{ moved: boolean } | null>(null)
 
+  /**
+   * 直近の**完了**の宣言の結末。**開示面の上にも出る唯一の報せである。**
+   *
+   * ⌘Enter は現在地を動かさなくなった。黙って一覧が開けば、完了が記録されたのか、
+   * それとも ⌘L を押し間違えただけなのかを確かめる方法が残らない。
+   */
+  let completionNotice = $state<string | null>(null)
+
+  /** 直近の修正が確定したことを述べる 1 行。面は成功と同時に畳まれる。 */
+  let edited = $state(false)
+
   /** 行を一意に指す鍵。見出しとステップで綴りを分ける。 */
   function rowKey(row: DisclosureRow): string {
     return row.kind === 'task' ? `task:${row.taskId}` : `step:${row.stepId}`
@@ -276,6 +359,17 @@
   const selectionNotice = $derived(
     selected && !selected.moved ? '現在地は既にそのステップにあった。何も記録していない。' : '',
   )
+
+  /**
+   * ボタンの押下が入力位置を奪うのを止める。
+   *
+   * 中断メモを書きかけたまま押したボタンが欄からフォーカスを外すと、続きが打てなく
+   * なる。**click は止めない** — 止めるのは mousedown の既定動作 (フォーカスの移動)
+   * だけであり、キーボードから Tab で辿る経路は残る。
+   */
+  function preventStealingFocus(event: MouseEvent): void {
+    event.preventDefault()
+  }
 
   function sleep(ms: number): Promise<void> {
     return new Promise((resolve) => setTimeout(resolve, ms))
@@ -402,6 +496,8 @@
     selected = null
     restNotice = null
     restErrorDetail = null
+    completionNotice = null
+    edited = false
   }
 
   /**
@@ -532,9 +628,12 @@
    * **初期表示には現れない。** ここへ到達する経路は明示的な打鍵だけである (FR-2 / AD-15)。
    * 入力位置は**現在地**の行に置かれる (I/O マトリクス「面へ入る」)。
    */
-  async function openDisclosure(): Promise<void> {
+  async function openDisclosure({ keepNotices = false } = {}): Promise<void> {
     if (disclosing) return
-    dismissNotices()
+    // **`keepNotices` は完了の宣言のためにある。** 宣言の直後にこの面を開くのは
+    // 「次に着手するステップを選ぶ」ためであり、そこで報せを畳めば、完了が記録された
+    // ことを述べる場所が一つも残らない。
+    if (!keepNotices) dismissNotices()
     disclosing = true
     // **面を開いた時点で開いているのは現在地のタスクである** (spec Boundaries)。
     // どれを開くかを決めるのはコアであり、未着手ならどれも開かない。
@@ -672,6 +771,142 @@
   }
 
   /**
+   * 修正の面へ入る (CAP-5 / FR-4 / FR-5)。
+   *
+   * **初期表示には現れない。** ここへ到達する経路は明示的な打鍵 (⌘E) と、同じ意味の
+   * ボタンだけである (FR-2 / AD-15)。
+   *
+   * `taskId` が `null` なら**現在地**の**タスク**を直す — 既定表示から入ったときの形が
+   * これである。開示面から入ったときは、選んでいる行が属する**タスク**を名指しする。
+   *
+   * **開示面は畳む。** 二つの面を同時に出さない (作成の面と同じ排他である)。
+   */
+  async function openEdit(taskId: string | null): Promise<void> {
+    if (editing) return
+    dismissNotices()
+    // 一覧から来た場合はそれを畳む。飛んでいる取り直しの応答もここで無効になる。
+    discardDisclosure()
+    editing = true
+    editError = null
+    await refreshDraft(taskId)
+  }
+
+  /**
+   * 下書きの出発点をコアから取り直す (CAP-5 / AD-3 鮮度規則)。
+   *
+   * **いまの題名と本文はコアだけが知っている。** 一覧の行から組み立てると、閉じた
+   * **タスク**には**ステップ**の行が無く、直す相手の中身が揃わない。
+   */
+  async function refreshDraft(taskId: string | null): Promise<void> {
+    const payload: TaskDraftRequest = { taskId }
+    try {
+      const draft = await invoke<TaskDraft>('get_task_draft', { request: payload })
+      // 既定表示と同じ事実であり、同じ一つの変数が持つ (`refreshDisclosure` と同じ)。
+      stateError = draft.stateError
+      // **開いた相手は戻り値から読み直す。** `null` で頼んだときに何が開いたのかを
+      // 知っているのはコアだけである。
+      editTaskId = draft.taskId
+      editTitleDraft = draft.title
+      // **写しを作る。** そのまま束縛すると、入力のたびにスナップショットの中身を
+      // 書き換えていることになる。
+      editStepDrafts = draft.steps.map((step) => ({ ...step }))
+      editAddedDraft = ''
+      editError = null
+    } catch (error) {
+      console.error('failed to fetch the task draft', error)
+      // **確認できていない相手を残さない。** 残せば、コアが確かめられなかった ID に
+      // 対して保存が撃たれる。
+      editTaskId = null
+      editTitleDraft = ''
+      editStepDrafts = []
+      editError = String(error)
+    }
+    await focusEditTitleAtEnd()
+  }
+
+  /** 修正の面の題名の欄へ入力位置を移す (I/O マトリクス「面へ入る」)。 */
+  async function focusEditTitleAtEnd(): Promise<void> {
+    await tick()
+    focusAtEnd(editTitleInput)
+  }
+
+  /**
+   * 下書きを捨て、修正の面を畳む (AD-2 / AD-5)。**`discardTaskDraft` の双子である。**
+   *
+   * 畳む契機は Esc・フォーカス喪失・保存の成功の三つだけである。
+   */
+  function discardTaskEdit(): void {
+    editing = false
+    editTaskId = null
+    editTitleDraft = ''
+    editStepDrafts = []
+    editAddedDraft = ''
+    editError = null
+  }
+
+  /**
+   * 修正の面から出る。**オーバーレイは閉じない** (I/O マトリクス「Esc」)。
+   *
+   * **戻り際に必ず取り直す。** 下書きの取得は `stateError` を書き換えるため、取り直さずに
+   * 戻ると、直前の失敗で消えた現在地が「未着手」として描かれたまま残る
+   * (`leaveDisclosure` と同じ理由)。**入力途中の中断メモは残す。**
+   */
+  async function leaveEdit(): Promise<void> {
+    discardTaskEdit()
+    await refresh({ keepDirtyDraft: true })
+    await focusNoteAtEnd()
+  }
+
+  /**
+   * タスクを直す (CAP-5 / FR-4 / FR-5)。
+   *
+   * 題名・既存のステップの本文・末尾への追記は、コア側の**単一のトランザクション**で
+   * 確定する (AD-5)。**現在地・完了・中断メモのいずれにも触れない。**
+   *
+   * 題名の欠落と空のステップは Rust 側の純粋関数が判定する。ここで先回りして弾くと、
+   * 規則が二箇所に分かれ、片方だけが直る形になる (`confirmCreation` と同じ流儀)。
+   */
+  async function confirmEdit(): Promise<void> {
+    // **相手が無ければ確定しない。** `null` を送れば、読めない ID として拒まれるだけで
+    // ある。
+    if (editingTask || editTaskId === null) return
+    editingTask = true
+    editError = null
+    const request: EditTaskRequest = {
+      taskId: editTaskId,
+      title: editTitleDraft,
+      steps: editStepDrafts.map((step) => ({ stepId: step.stepId, content: step.content })),
+      addedSteps: editAddedDraft,
+    }
+    try {
+      await invoke('edit_task', { request })
+      discardTaskEdit()
+      // `task_created` の購読と同じ規則で取り直す (`confirmCreation` と同じ理由)。
+      await refresh({ keepDirtyDraft: true })
+      await focusNoteAtEnd()
+      edited = true
+    } catch (error) {
+      // **面は閉じず、入力も保持したまま理由を示す** (I/O マトリクス)。閉じれば、
+      // 打ち直した題名と本文が理由もろとも消える。
+      console.error('failed to edit the task', error)
+      editError = String(error)
+    } finally {
+      editingTask = false
+    }
+  }
+
+  /**
+   * 開示面で直す相手にあたる**タスク**。
+   *
+   * 見出しを選んでいればその**タスク**、**ステップ**の行を選んでいれば開いている
+   * **タスク**である — **ステップ**の行が現れるのは開いた**タスク**の分だけであり、
+   * 属する先は一つに定まる。
+   */
+  const taskToEdit = $derived(
+    selectedRow?.kind === 'task' ? selectedRow.taskId : (openTaskId ?? null),
+  )
+
+  /**
    * 作成の面へ入る (CAP-4 / FR-2)。
    *
    * **初期表示には現れない。** ここへ到達する経路は明示的な打鍵だけである (AD-15)。
@@ -797,13 +1032,55 @@
   }
 
   /**
+   * 完了を宣言し、次に着手するステップを選ぶ (CAP-7 / FR-4 / FR-19)。
+   *
+   * 離脱側のメモの確定と**完了**の宣言は、コア側の**単一のトランザクション**で確定する
+   * (AD-5)。**現在地は動かない。**
+   *
+   * # なぜ次のステップへ自動で進めないのか
+   *
+   * **完了**の次にどこへ行くかを決めるのは利用者である。同一タスク内の次のステップへ
+   * 自動で進めば、そのタスクを続ける以外の選択が「進んでしまった後の訂正」になり、
+   * 訂正のたびに実際には作業していないステップからの離脱が切り替え履歴に残る。
+   *
+   * # なぜオーバーレイを閉じないのか
+   *
+   * 選ぶ面をここで開くためである。閉じてしまえば、選ぶために呼び出し直すことになる。
+   * 選択の確定 ([`moveTo`]) もオーバーレイを閉じない — 移った先の次の一手と中断メモを
+   * そのまま見るための面である (FR-8)。
+   */
+  async function completeAndChooseNext(): Promise<void> {
+    // 現在地が無ければ宣言する相手も無い。二重確定も防ぐ。**休息中は宣言しない** —
+    // その面の Enter は休息の終了の宣言だけを意味する。
+    if (stepContent === null || switching || resting) return
+    switching = true
+    dismissNotices()
+    // **提示されたメモをそのまま送り返さない** (`confirmSwitch` と同じ規則)。
+    const request: CompleteStepRequest = { note: noteIsDirty ? noteDraft : null }
+    try {
+      const outcome = await invoke<CompleteStepOutcome>('complete_current_step', { request })
+      // 完了の印とメモを取り直してから一覧を開く (AD-3 鮮度規則)。
+      await refresh()
+      completionNotice = outcome.taskFinished
+        ? '完了を宣言した。このタスクはこれで終わりであり、現在地が離れれば一覧から消える。'
+        : '完了を宣言した。次に着手するステップを選ぶこと。'
+      await openDisclosure({ keepNotices: true })
+    } catch (error) {
+      console.error('failed to declare the completion', error)
+      switchError = String(error)
+    } finally {
+      switching = false
+    }
+  }
+
+  /**
    * 切り替えを確定させる (CAP-7)。
    *
    * 離脱側のメモ確定・完了宣言 (任意)・現在地の移動・切り替え履歴の追記は、コア側の
    * **単一のトランザクション**で確定する (AD-5)。ここが行うのは要求と、その結末に
    * 応じた離脱だけである。
    */
-  async function confirmSwitch(declareCompletion: boolean): Promise<void> {
+  async function confirmSwitch(): Promise<void> {
     // 現在地が無ければ離れるべき場所も無い。二重確定も防ぐ。
     //
     // **休息中は切り替えない。** 切り替えれば現在地が活性へ戻り、休息が選ばれても
@@ -814,9 +1091,12 @@
     dismissNotices()
     // **提示されたメモをそのまま送り返さない。** 送り返せば、読み返しただけの
     // 切り替えが「メモを書いた」として履歴に残り、SM-C3 の記入率が膨らむ。
+    // **この経路は完了を宣言しない。** 宣言を伴う打鍵は [`completeAndChooseNext`] へ
+    // 分かれた。欄そのものはコア側の契約に残っている — **完了**を伴う**切り替え**は
+    // ドメインの操作として成立し続けるためであり、ここが送らないだけである。
     const request: SwitchRequest = {
       note: noteIsDirty ? noteDraft : null,
-      declareCompletion,
+      declareCompletion: false,
     }
     try {
       const outcome = await invoke<SwitchOutcome>('switch_current_position', { request })
@@ -829,7 +1109,8 @@
       noDestination = {
         // 空白だけの本文はコア側で省略として扱われる。述べる内容をそれに合わせる。
         noteWritten: (request.note ?? '').trim() !== '',
-        completionDeclared: declareCompletion,
+        // **この経路は完了を宣言しない。** 宣言を伴う打鍵は別の経路へ分かれた。
+        completionDeclared: false,
       }
     } catch (error) {
       console.error('failed to commit the switch', error)
@@ -845,7 +1126,7 @@
    * **`key` を畳んで比べる。** CapsLock が入っていると `key` は `'L'` で届き、小文字と
    * の比較では一致しない — 案内どおりに押しても何も起きない面ができる。
    */
-  function isSurfaceKey(event: KeyboardEvent, letter: 'n' | 'l'): boolean {
+  function isSurfaceKey(event: KeyboardEvent, letter: 'n' | 'l' | 'e'): boolean {
     return (
       event.key.toLowerCase() === letter &&
       event.metaKey &&
@@ -875,6 +1156,13 @@
     // 相手へ入る打鍵に触れさせない。
     if (disclosing) {
       onDisclosureKeydown(event)
+      return
+    }
+
+    // 修正の面も自前の打鍵を持つ。既定表示の Enter (切り替え) をここへ持ち込まない —
+    // 入力中の Enter が切り替えを撃てば、打ち直した題名と本文ごと面が消える。
+    if (editing) {
+      onEditKeydown(event)
       return
     }
 
@@ -908,6 +1196,19 @@
       return
     }
 
+    // 三つ目の面 (CAP-5 / FR-4 / FR-5)。**直す相手は現在地のタスクである** — どれを
+    // 直すかを選ばせる面は作らない。それは CAP-9 の開示面であり、そちらからも同じ
+    // 打鍵で入れる。
+    if (isSurfaceKey(event, 'e')) {
+      event.preventDefault()
+      if (switching) return
+      // **現在地が無ければ直す相手も無い。** 面だけ開いて「相手が無い」と述べるより、
+      // 打鍵が何も起こさないほうが案内と食い違わない。
+      if (stepContent === null) return
+      void openEdit(null)
+      return
+    }
+
     if (event.key !== 'Enter') return
     // **押しっぱなしの自動反復を確定として扱わない。** 作成の面は成功と同時に畳まれる
     // ため、押し続けられた ⌘Enter の続きがそのまま既定表示へ落ち、生まれたばかりの
@@ -924,8 +1225,16 @@
       return
     }
     // 完了の宣言は同じ一連の操作から 1 打鍵で到達する (FR-4)。修飾キーの有無だけが
-    // 違い、宣言しない切り替えも同じく 1 打鍵である。
-    void confirmSwitch(event.metaKey)
+    // 違う。
+    //
+    // **二つは移動の扱いが違う。** 素の Enter は同一タスク内の次のステップへ移って
+    // 離脱する。⌘Enter は完了を宣言してそこに留まり、次に着手するステップを一覧から
+    // 選ばせる — 完了の次にどこへ行くかを決めるのは利用者である。
+    if (event.metaKey) {
+      void completeAndChooseNext()
+      return
+    }
+    void confirmSwitch()
   }
 
   /**
@@ -984,6 +1293,15 @@
       return
     }
 
+    // 選んでいる行の**タスク**を直す (CAP-5)。**現在地は動かない** — 直す行為は
+    // 位置にも完了にも触れない。
+    if (isSurfaceKey(event, 'e')) {
+      event.preventDefault()
+      if (selecting || taskToEdit === null) return
+      void openEdit(taskToEdit)
+      return
+    }
+
     if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
       if (selecting) return
       // 既定の動作 (面ごとのスクロール) を止める。入力位置の移動が選んだ行を
@@ -1002,6 +1320,40 @@
     void confirmSelection()
   }
 
+  /**
+   * 修正の面の打鍵。**IME ガードは呼び出し元が既に通している** (AD-6)。
+   *
+   * # なぜ確定が素の Enter ではないのか
+   *
+   * 追記の欄は 1 行 = 1 ステップであり、複数行を打つことが前提である (作成の面と同じ)。
+   * 素の Enter を確定にすると、2 行目を打とうとした打鍵がそのまま保存になる。
+   *
+   * # ⌘⇧Enter に意味を与えない
+   *
+   * 作成の面の ⌘⇧Enter は「作成して着手」である。同じ打鍵をここで受け付ければ、直した
+   * ついでに現在地が動くことになり、**修正は現在地に触れない**という約束が破れる。
+   * 修飾キーを伴う Enter のうち効くのは ⌘Enter だけである。
+   */
+  function onEditKeydown(event: KeyboardEvent): void {
+    if (event.key === 'Escape') {
+      // 確定の途中では出ない。失敗したときの理由を読む機会が消える。
+      if (editingTask) return
+      event.preventDefault()
+      // 下書きは確定されない。永続化もされない (AD-5)。
+      void leaveEdit()
+      return
+    }
+
+    if (event.key !== 'Enter') return
+    // 押しっぱなしの自動反復を確定として扱わない (他の面と同じ理由)。
+    if (event.repeat) return
+    // 素の Enter と Shift+Enter は改行である。Option / Control は受け付けない。
+    if (!event.metaKey || event.shiftKey || event.altKey || event.ctrlKey) return
+
+    event.preventDefault()
+    void confirmEdit()
+  }
+
   onMount(() => {
     void refresh()
 
@@ -1017,6 +1369,7 @@
         dismissNotices()
         discardTaskDraft()
         discardDisclosure()
+        discardTaskEdit()
         void refresh()
       } else {
         // 呼び出して使ったら消える一時的な面として扱う (AD-15)。
@@ -1026,6 +1379,7 @@
         // 伴わない再表示が、作成の面を出したままの初期表示になる (FR-2 が禁じる)。
         discardTaskDraft()
         discardDisclosure()
+        discardTaskEdit()
         void close()
       }
     })
@@ -1061,6 +1415,15 @@
       メニューバー項目からはいつでも状態を確認できる。
       {#if hotkey.error}<span class="detail">{hotkey.error}</span>{/if}
     </p>
+  {/if}
+
+  <!--
+    完了を宣言したことを述べる唯一の場所。**面の外に出す** — 宣言の直後に開くのは
+    開示面であり、既定表示の側に置くと、最も述べる必要のある結末が面ごと隠れる
+    (休息の報せと同じ理由)。
+  -->
+  {#if completionNotice}
+    <p class="alert" role="alert">{completionNotice}</p>
   {/if}
 
   <!--
@@ -1103,6 +1466,78 @@
       <p class="alert" role="alert">
         タスクを作成できなかった。何も保存されていない。
         <span class="detail">{createError}</span>
+      </p>
+    {/if}
+  {:else if editing}
+    <!--
+      修正の面 (CAP-5 / FR-4 / FR-5)。**明示的な打鍵 (⌘E) かボタンを経てのみここに来る。**
+
+      **一度に一つのタスクしか出さない。** 直す相手を選ばせる面は作らない — 選ばせた
+      瞬間、それは CAP-9 の開示面そのものになる (作成の面と同じ排他である)。
+
+      **完了の印も中断メモも出さない。** 直せるのは題名と本文だけであり、コマンドが
+      運ぶ欄もそれだけである。進捗率・件数・総数も置かない (AD-15)。
+
+      コアが読めていないときもこの面は出る。保存は失敗し、その理由が下に出る
+      (I/O マトリクス「コア不在」)。
+    -->
+    {#if stateError}
+      <p class="alert" role="alert">
+        {stateError}
+        <span class="detail">この面からタスクを直すことはできない。</span>
+      </p>
+    {/if}
+
+    {#if editTaskId === null}
+      <!-- 直す相手が無い。**確定の手段そのものを出さない。** -->
+      <p class="empty">直せるタスクが無い。</p>
+    {:else}
+      <input
+        class="title"
+        type="text"
+        bind:this={editTitleInput}
+        bind:value={editTitleDraft}
+        spellcheck="false"
+        placeholder="タスクの題名"
+        aria-label="タスクの題名"
+      />
+
+      <!--
+        既存のステップは 1 個 = 1 欄である。**行ではなく欄で分ける** — 欄ごとに ID を
+        持たせることが、1 行ずれても別のステップが書き換わらないための形である (FR-5)。
+
+        **消す手がかりを置かない。** v1 に削除の経路は無く、空にした欄は保存時に
+        拒まれる (コマンド境界の `STEP_CONTENT_MISSING`)。
+      -->
+      {#each editStepDrafts as step, index (step.stepId)}
+        <input
+          class="step-edit"
+          type="text"
+          data-step-id={step.stepId}
+          bind:value={editStepDrafts[index].content}
+          spellcheck="false"
+          aria-label={`第 ${index + 1} ステップ`}
+        />
+      {/each}
+
+      <!--
+        末尾への追記。1 行 = 1 ステップであり、切り分けるのはコマンド境界の純粋関数で
+        ある (作成と同じ規則)。空でよい。
+      -->
+      <textarea
+        class="steps"
+        bind:value={editAddedDraft}
+        rows="2"
+        spellcheck="false"
+        placeholder="末尾に追記 (1 行 = 1 ステップ・省略可)"
+        aria-label="追記するステップ (1 行 = 1 ステップ)"
+      ></textarea>
+    {/if}
+
+    {#if editError}
+      <p class="alert" role="alert">
+        タスクを直せなかった。何も保存されていない。
+        <span class="detail">{editError}</span>
       </p>
     {/if}
   {:else if disclosing}
@@ -1267,7 +1702,7 @@
     作成が確定したことを述べる唯一の場所。面は成功と同時に畳まれるため、ここに無ければ
     「作成できたのか」を確かめる方法が残らない。件数も登録数も述べない (AD-15 / SM-C1)。
   -->
-  {#if !creating && !disclosing && creationNotice}
+  {#if !creating && !disclosing && !editing && creationNotice}
     <p class="alert" role="alert">{creationNotice}</p>
   {/if}
 
@@ -1275,7 +1710,7 @@
     一覧から選んだのに何も書かれなかったことを述べる唯一の場所。**移った場合は述べない**
     — 既定表示がそのステップを示していることが結末そのものである。
   -->
-  {#if !creating && !disclosing && selectionNotice}
+  {#if !creating && !disclosing && !editing && selectionNotice}
     <p class="alert" role="alert">{selectionNotice}</p>
   {/if}
 
@@ -1283,12 +1718,61 @@
     休息の終了について述べる唯一の場所。**休息中の面の中ではない** — 宣言に成功すれば
     面は畳まれるため、そこに置くと「休息中ではなかった」が誰にも届かない。
   -->
-  {#if !creating && !disclosing && restNotice}
+  {#if !creating && !disclosing && !editing && restNotice}
     <p class="alert" role="alert">
       {restNotice}
       {#if restErrorDetail}<span class="detail">{restErrorDetail}</span>{/if}
     </p>
   {/if}
+
+  <!--
+    修正が確定したことを述べる唯一の場所。面は成功と同時に畳まれるため、ここに無ければ
+    「直せたのか」を確かめる方法が残らない。
+  -->
+  {#if !creating && !disclosing && !editing && edited}
+    <p class="alert" role="alert">タスクを直した。現在地も完了も変えていない。</p>
+  {/if}
+
+  <!--
+    マウスで到達できる操作 (I/O マトリクス「ボタン」)。**案内の打鍵と同じものしか
+    置かない** — 打鍵に無い操作をボタンだけが持てば、面ごとに二つの操作体系が並ぶ。
+
+    `onmousedown` で既定動作を止めるのは、入力位置を奪わないためである。中断メモを
+    書きかけたまま押したボタンが欄からフォーカスを外すと、続きが打てなくなる。
+  -->
+  <div class="actions">
+    {#if creating}
+      <button type="button" onmousedown={preventStealingFocus} onclick={() => confirmCreation(false)}>作成</button>
+      <button type="button" onmousedown={preventStealingFocus} onclick={() => confirmCreation(true)}>作成して着手</button>
+      <button type="button" onmousedown={preventStealingFocus} onclick={() => leaveCreation()}>戻る</button>
+    {:else if editing}
+      {#if editTaskId !== null}
+        <button type="button" onmousedown={preventStealingFocus} onclick={() => confirmEdit()}>保存</button>
+      {/if}
+      <button type="button" onmousedown={preventStealingFocus} onclick={() => leaveEdit()}>戻る</button>
+    {:else if disclosing}
+      {#if selectedRow}
+        <button type="button" onmousedown={preventStealingFocus} onclick={() => confirmSelection()}>
+          {selectedRow.kind === 'task' ? 'このタスクのステップを見る' : 'ここへ現在地を移す'}
+        </button>
+      {/if}
+      {#if taskToEdit !== null}
+        <button type="button" onmousedown={preventStealingFocus} onclick={() => openEdit(taskToEdit)}>このタスクを直す</button>
+      {/if}
+      <button type="button" onmousedown={preventStealingFocus} onclick={() => leaveDisclosure()}>戻る</button>
+    {:else}
+      {#if resting}
+        <button type="button" onmousedown={preventStealingFocus} onclick={() => declareEndOfRest()}>休息を終える</button>
+      {:else if stepContent !== null}
+        <button type="button" onmousedown={preventStealingFocus} onclick={() => confirmSwitch()}>切り替え</button>
+        <button type="button" onmousedown={preventStealingFocus} onclick={() => completeAndChooseNext()}>完了して次を選ぶ</button>
+        <button type="button" onmousedown={preventStealingFocus} onclick={() => openEdit(null)}>このタスクを直す</button>
+      {/if}
+      <button type="button" onmousedown={preventStealingFocus} onclick={() => openCreation()}>新しいタスク</button>
+      <button type="button" onmousedown={preventStealingFocus} onclick={() => openDisclosure()}>一覧</button>
+      <button type="button" onmousedown={preventStealingFocus} onclick={() => close()}>閉じる</button>
+    {/if}
+  </div>
 
   {#if creating}
     <!--
@@ -1297,6 +1781,13 @@
     -->
     <p class="hint">
       ⌘Enter で作成 · ⌘⇧Enter で作成して着手 · Enter で改行 · Esc で戻る
+    </p>
+  {:else if editing}
+    <!--
+      案内と実際に効く打鍵が食い違ってはならない。相手が無ければ保存の打鍵も効かない。
+    -->
+    <p class="hint">
+      {#if editTaskId !== null}⌘Enter で保存 · Enter で改行 · {/if}Esc で戻る
     </p>
   {:else if disclosing}
     <!--
@@ -1313,7 +1804,8 @@
     <p class="hint">
       {#if rowKeys.length > 0}↑↓ で移動 · {selectedRow?.kind === 'task'
           ? 'Enter でこのタスクのステップを見る'
-          : 'Enter でここへ現在地を移す'} · {/if}Esc で戻る
+          : 'Enter でここへ現在地を移す'} · {/if}{#if taskToEdit !== null}⌘E でこのタスクを直す
+        · {/if}Esc で戻る
     </p>
   {:else}
     <!-- 案内の語を行で割らない。割ると表示に改行が混じる。 -->
@@ -1322,7 +1814,7 @@
       休息の終了の宣言だけを意味する (CAP-10)。案内と実際に効く打鍵を食い違わせない。
     -->
     <p class="hint">
-      {#if resting}Enter で休息を終える · {:else if stepContent !== null}Enter で切り替え · ⌘Enter で完了して切り替え · {/if}⌘N で新しいタスク · ⌘L で一覧 · Esc で閉じる{#if hotkey && hotkey.registered} · {hotkey.accelerator} で開閉{/if} · 終了はメニューバー項目から
+      {#if resting}Enter で休息を終える · {:else if stepContent !== null}Enter で切り替え · ⌘Enter で完了して次を選ぶ · ⌘E でこのタスクを直す · {/if}⌘N で新しいタスク · ⌘L で一覧 · Esc で閉じる{#if hotkey && hotkey.registered} · {hotkey.accelerator} で開閉{/if} · 開く・終了はメニューバー項目からも
     </p>
   {/if}
 </main>
@@ -1367,13 +1859,43 @@
   }
 
   /*
+    マウスで到達できる操作の並び。**案内の打鍵と同じものしか並ばない。**
+
+    溢れたら折り返す — 窓は固定寸法であり、切り取れば到達できない操作が生まれる。
+  */
+  .actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.35rem;
+  }
+
+  .actions button {
+    margin: 0;
+    padding: 0.25rem 0.6rem;
+    border: 1px solid #3a3f47;
+    border-radius: 4px;
+    background: var(--overlay-raised);
+    color: var(--overlay-fg);
+    font: inherit;
+    font-size: 0.78rem;
+    line-height: 1.5;
+    cursor: pointer;
+  }
+
+  .actions button:focus {
+    outline: 1px solid var(--overlay-focus);
+    outline-offset: 0;
+  }
+
+  /*
     入力欄は三つとも同じ器である (中断メモ・タスクの題名・ステップ)。
     `user-select` の解除は app.css が input / textarea に一括で掛けている — 面を
     足すたびに書き忘れうる規則を、面の側に置かないため。
   */
   .note,
   .title,
-  .steps {
+  .steps,
+  .step-edit {
     margin: 0;
     width: 100%;
     resize: none;
@@ -1390,13 +1912,15 @@
 
   .note::placeholder,
   .title::placeholder,
-  .steps::placeholder {
+  .steps::placeholder,
+  .step-edit::placeholder {
     color: var(--overlay-muted);
   }
 
   .note:focus,
   .title:focus,
-  .steps:focus {
+  .steps:focus,
+  .step-edit:focus {
     outline: 1px solid var(--overlay-focus);
     outline-offset: 0;
   }

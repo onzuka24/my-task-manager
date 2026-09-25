@@ -125,6 +125,14 @@ let holdDisclosure = false
 let releaseDisclosure: ((surface: Record<string, unknown>) => void) | null = null
 let selectOutcome = { moved: true }
 let endRestOutcome = { resumed: true }
+let completionOutcome = { taskFinished: false }
+/**
+ * 修正の面の下書き。**`get_task_draft` の応答である。**
+ *
+ * 要求された `taskId` を読んで組み立てる — 無視して固定で返すと、どの見出しから
+ * 入っても同じタスクが出る実装が緑のまま通る。
+ */
+let draftFails = false
 let component: Record<string, unknown> | undefined
 
 /**
@@ -171,10 +179,34 @@ function installIPC(): void {
       }
       if (cmd === 'select_step') return selectOutcome
       if (cmd === 'end_rest') return endRestOutcome
+      if (cmd === 'complete_current_step') return completionOutcome
+      if (cmd === 'get_task_draft') {
+        if (draftFails) throw new Error('常駐プロセスが応答しない')
+        return draftFor(args)
+      }
+      if (cmd === 'edit_task') return null
       return null
     },
     { shouldMockEvents: true },
   )
+}
+
+/**
+ * src-tauri/src/commands/mod.rs の `task_draft_of` と同じ規則で下書きを組み立てる。
+ *
+ * `taskId` が `null` なら**現在地**のタスクであり、未着手なら相手が無い。
+ */
+function draftFor(args: unknown): Record<string, unknown> {
+  const request = ((args ?? {}) as { request?: { taskId?: string | null } }).request ?? {}
+  const wanted = request.taskId ?? taskAtCurrentPosition()
+  const task = TASKS.find((candidate) => candidate.taskId === wanted)
+  if (!task) return { stateError: null, taskId: null, title: '', steps: [] }
+  return {
+    stateError: null,
+    taskId: task.taskId,
+    title: task.title,
+    steps: task.steps.map((step) => ({ stepId: step.stepId, content: step.content })),
+  }
 }
 
 function argsOf(cmd: string): Record<string, unknown> | undefined {
@@ -247,6 +279,9 @@ function installHangingIPC(hanging: string): void {
         return surfaceFor(args)
       }
       if (cmd === 'select_step') return selectOutcome
+      if (cmd === 'complete_current_step') return completionOutcome
+      if (cmd === 'get_task_draft') return draftFor(args)
+      if (cmd === 'edit_task') return null
       return null
     },
     { shouldMockEvents: true },
@@ -261,6 +296,33 @@ function noticeText(): string {
 async function openCreation(): Promise<void> {
   press('n', { metaKey: true })
   await settle()
+}
+
+/** 修正の面へ入る。到達には明示的な打鍵が 1 回要る (FR-2 / AD-15)。 */
+async function openEdit(): Promise<void> {
+  press('e', { metaKey: true })
+  await settle()
+}
+
+/** 修正の面に並ぶ、既存のステップの入力欄。 */
+function stepEditFields(): HTMLInputElement[] {
+  return [...document.querySelectorAll<HTMLInputElement>('input.step-edit')]
+}
+
+/** ボタンの並びから、表示名で 1 個を引く。 */
+function actionButton(label: string): HTMLButtonElement {
+  const button = [...document.querySelectorAll<HTMLButtonElement>('.actions button')].find(
+    (candidate) => candidate.textContent?.trim() === label,
+  )
+  if (!button) throw new Error(`「${label}」のボタンが無い`)
+  return button
+}
+
+/** ボタンが並んでいるか。無い場合を述べるために使う。 */
+function actionLabels(): string[] {
+  return [...document.querySelectorAll<HTMLButtonElement>('.actions button')].map(
+    (button) => button.textContent?.trim() ?? '',
+  )
 }
 
 /** 開示面へ入る。到達には明示的な打鍵が 1 回要る (FR-19 / FR-2 / AD-15)。 */
@@ -347,6 +409,8 @@ beforeEach(async () => {
   releaseDisclosure = null
   selectOutcome = { moved: true }
   endRestOutcome = { resumed: true }
+  completionOutcome = { taskFinished: false }
+  draftFails = false
   mockWindows('main')
   installIPC()
   stubEventInternals()
@@ -496,16 +560,63 @@ test('提示されたメモに触れずに Enter — 記入として送らない
   expect(invoked).toContain('hide_overlay')
 })
 
-test('⌘Enter は完了の宣言を伴う切り替え — 同じ一連の操作から 1 打鍵', async () => {
+test('⌘Enter は完了の宣言 — 同じ一連の操作から 1 打鍵で、メモも同時に確定する', async () => {
   typeNote('接続詞を整える途中 / 次は結論')
   await settle()
 
   press('Enter', { metaKey: true })
   await settle()
 
-  expect(argsOf('switch_current_position')).toEqual({
-    request: { note: '接続詞を整える途中 / 次は結論', declareCompletion: true },
+  expect(argsOf('complete_current_step')).toEqual({
+    request: { note: '接続詞を整える途中 / 次は結論' },
   })
+  // **切り替えではない。** 現在地は動かず、次にどこへ着手するかは利用者が選ぶ。
+  expect(invoked).not.toContain('switch_current_position')
+})
+
+test('完了を宣言したら一覧が開き、オーバーレイは閉じない', async () => {
+  press('Enter', { metaKey: true })
+  await settle()
+
+  expect(invoked).toContain('get_disclosure_surface')
+  expect(invoked).not.toContain('hide_overlay')
+  expect(headingTexts()).toEqual(['原稿', '買い物'])
+})
+
+test('完了を宣言したことが、一覧の上に述べられる', async () => {
+  press('Enter', { metaKey: true })
+  await settle()
+
+  // 黙って一覧が開けば、完了が記録されたのか ⌘L を押し間違えただけなのか分からない。
+  expect(noticeText()).toContain('完了を宣言した')
+})
+
+test('そのタスクが終わったなら、消えることも併せて述べる', async () => {
+  completionOutcome = { taskFinished: true }
+
+  press('Enter', { metaKey: true })
+  await settle()
+
+  expect(noticeText()).toContain('一覧から消える')
+})
+
+test('完了の宣言に失敗したら理由を面に出し、一覧も開かない', async () => {
+  mockIPC(
+    (cmd) => {
+      invoked.push(cmd)
+      if (cmd === 'get_overlay_snapshot') return snapshot
+      if (cmd === 'complete_current_step') throw new Error('書き込みに失敗した')
+      return null
+    },
+    { shouldMockEvents: true },
+  )
+
+  press('Enter', { metaKey: true })
+  await settle()
+
+  expect(noticeText()).toContain('状態は変わっていない')
+  expect(invoked).not.toContain('get_disclosure_surface')
+  expect(invoked).not.toContain('hide_overlay')
 })
 
 test('メモを空にしたまま確定しても切り替えは完了する', async () => {
@@ -564,16 +675,15 @@ test('最終ステップでは離脱せず、確定したものを述べる — 
   expect(notice).not.toContain('完了')
 })
 
-test('最終ステップで完了も宣言したなら、そう述べる', async () => {
-  switchOutcome = { moved: false }
-  typeNote('続きは明日')
-  await settle()
-
+test('最終ステップでも完了の宣言は切り替えを伴わない', async () => {
+  // **この経路はもう switch_current_position を通らない。** 最終ステップでも同じであり、
+  // 「移動先が無い」という結末そのものが生じない。
   press('Enter', { metaKey: true })
   await settle()
 
-  const notice = document.querySelector('[role="alert"]')?.textContent ?? ''
-  expect(notice).toContain('完了とメモは記録した')
+  expect(invoked).toContain('complete_current_step')
+  expect(invoked).not.toContain('switch_current_position')
+  expect(noticeText()).not.toContain('次のステップが無い')
 })
 
 test('最終ステップで何も宣言していないなら、記録は無かったと述べる', async () => {
@@ -631,7 +741,7 @@ test('案内に無い修飾キー (Option / Control) では切り替えない', 
 
   expect(invoked).not.toContain('switch_current_position')
   // 案内と実際に効く打鍵が一致していること。
-  expect(document.body.textContent ?? '').toContain('⌘Enter で完了して切り替え')
+  expect(document.body.textContent ?? '').toContain('⌘Enter で完了して次を選ぶ')
 })
 
 test('IME の変換取り消しの Esc でオーバーレイを閉じない', async () => {
@@ -1911,4 +2021,272 @@ test('休息中でも残り時間やカウントダウンを出さない (spec N
   for (const forbidden of ['残り', '分後', '経過', '%']) {
     expect(text).not.toContain(forbidden)
   }
+})
+
+// ---------------------------------------------------------------------------
+// 修正の面 (CAP-5 / FR-4 / FR-5)
+// ---------------------------------------------------------------------------
+
+test('初期表示に修正の面は現れない (FR-2 / AD-15)', () => {
+  expect(document.querySelector('input.title')).toBeNull()
+  expect(stepEditFields()).toHaveLength(0)
+})
+
+test('⌘E で修正の面に入り、現在地のタスクが下書きになる', async () => {
+  await openEdit()
+
+  expect(argsOf('get_task_draft')).toEqual({ request: { taskId: null } })
+  expect(titleField().value).toBe('買い物')
+  expect(stepEditFields().map((field) => field.value)).toEqual(['米', '味噌', '醤油'])
+  // 入力位置は題名の欄にある (I/O マトリクス「面へ入る」)。
+  expect(document.activeElement).toBe(titleField())
+})
+
+test('修正の面は一度に一つのタスクしか出さない', async () => {
+  await openEdit()
+
+  const text = document.body.textContent ?? ''
+  expect(text).not.toContain('原稿')
+  expect(text).not.toContain('構成を決める')
+})
+
+test('⌘Enter で題名・本文・追記が一度に送られる — ID と本文の対で', async () => {
+  await openEdit()
+  typeInto(titleField(), '買い出し')
+  typeInto(stepEditFields()[1], '味噌 (白)')
+  typeInto(stepsField(), '酢\n\n みりん ')
+  await settle()
+
+  press('Enter', { metaKey: true })
+  await settle()
+
+  expect(argsOf('edit_task')).toEqual({
+    request: {
+      taskId: SHOPPING,
+      title: '買い出し',
+      steps: [
+        { stepId: '0198f0e0-0000-7000-8000-000000000003', content: '米' },
+        { stepId: '0198f0e0-0000-7000-8000-000000000004', content: '味噌 (白)' },
+        { stepId: '0198f0e0-0000-7000-8000-000000000005', content: '醤油' },
+      ],
+      // **切り分けはコマンド境界が持つ。** 空行も前後の空白もそのまま送る。
+      addedSteps: '酢\n\n みりん ',
+    },
+  })
+})
+
+test('保存に成功すると面は畳まれ、直したことが述べられる', async () => {
+  await openEdit()
+
+  press('Enter', { metaKey: true })
+  await settle()
+
+  expect(stepEditFields()).toHaveLength(0)
+  expect(noticeText()).toContain('タスクを直した')
+})
+
+test('保存に失敗したら面は閉じず、入力も理由も残る', async () => {
+  await openEdit()
+  typeInto(titleField(), '   ')
+  await settle()
+
+  mockIPC(
+    (cmd, args) => {
+      invoked.push(cmd)
+      if (cmd === 'get_overlay_snapshot') return snapshot
+      if (cmd === 'get_task_draft') return draftFor(args)
+      if (cmd === 'edit_task') throw new Error('題名が空である。')
+      return null
+    },
+    { shouldMockEvents: true },
+  )
+
+  press('Enter', { metaKey: true })
+  await settle()
+
+  expect(titleField().value).toBe('   ')
+  expect(noticeText()).toContain('何も保存されていない')
+})
+
+test('Esc は下書きを捨てて既定表示へ戻る — オーバーレイは閉じない', async () => {
+  await openEdit()
+  typeInto(titleField(), '打ち間違い')
+  await settle()
+
+  press('Escape')
+  await settle()
+
+  expect(stepEditFields()).toHaveLength(0)
+  expect(invoked).not.toContain('hide_overlay')
+  expect(invoked).not.toContain('edit_task')
+})
+
+test('修正の面では素の Enter は改行であって保存ではない', async () => {
+  await openEdit()
+
+  press('Enter')
+  press('Enter', { shiftKey: true })
+  await settle()
+
+  expect(invoked).not.toContain('edit_task')
+})
+
+test('⌘⇧Enter はどこにも束縛されていない — 直したついでに現在地が動かない', async () => {
+  await openEdit()
+
+  press('Enter', { metaKey: true, shiftKey: true })
+  await settle()
+
+  expect(invoked).not.toContain('edit_task')
+  expect(invoked).not.toContain('select_step')
+})
+
+test('フォーカスを失うと下書きは失われ、修正の面も畳まれる', async () => {
+  await openEdit()
+  typeInto(titleField(), '打ち間違い')
+  await settle()
+
+  await emit('tauri://blur', null)
+  await settle()
+  await emit('tauri://focus', null)
+  await settle()
+
+  expect(stepEditFields()).toHaveLength(0)
+  expect(invoked).not.toContain('edit_task')
+})
+
+test('未着手では ⌘E が何も起こさない — 直す相手が無い', async () => {
+  snapshot = { ...SNAPSHOT, stepContent: null, stepOrdinal: null, stepCount: null }
+  currentStepId = null
+  if (component) unmount(component)
+  await mountOverlay()
+  invoked = []
+
+  await openEdit()
+
+  expect(invoked).not.toContain('get_task_draft')
+})
+
+test('一覧からは選んでいる行のタスクを直せる — 現在地は動かない', async () => {
+  await openDisclosure()
+  await moveSelectionTo(`task:${MANUSCRIPT}`)
+  invoked = []
+
+  press('e', { metaKey: true })
+  await settle()
+
+  expect(argsOf('get_task_draft')).toEqual({ request: { taskId: MANUSCRIPT } })
+  expect(titleField().value).toBe('原稿')
+  expect(invoked).not.toContain('select_step')
+})
+
+test('修正の面は進捗率も件数も完了の印も描かない (AD-15)', async () => {
+  await openEdit()
+
+  const text = document.body.textContent ?? ''
+  for (const forbidden of ['%', '件', '✓', '全 3']) {
+    expect(text).not.toContain(forbidden)
+  }
+  expect(document.querySelector('progress')).toBeNull()
+})
+
+// ---------------------------------------------------------------------------
+// マウス操作 (ボタン)
+// ---------------------------------------------------------------------------
+
+test('既定表示の操作はボタンからも到達できる', async () => {
+  expect(actionLabels()).toEqual([
+    '切り替え',
+    '完了して次を選ぶ',
+    'このタスクを直す',
+    '新しいタスク',
+    '一覧',
+    '閉じる',
+  ])
+})
+
+test('「切り替え」のボタンは Enter と同じ経路を通る', async () => {
+  typeNote('接続詞を整える途中 / 次は結論')
+  await settle()
+
+  actionButton('切り替え').click()
+  await settle()
+
+  expect(argsOf('switch_current_position')).toEqual({
+    request: { note: '接続詞を整える途中 / 次は結論', declareCompletion: false },
+  })
+  expect(invoked).toContain('hide_overlay')
+})
+
+test('「完了して次を選ぶ」のボタンは ⌘Enter と同じ経路を通る', async () => {
+  actionButton('完了して次を選ぶ').click()
+  await settle()
+
+  expect(invoked).toContain('complete_current_step')
+  expect(invoked).toContain('get_disclosure_surface')
+})
+
+test('ボタンの押下は入力位置を奪わない', async () => {
+  const note = noteField()
+  note.focus()
+
+  // 既定動作 (フォーカスの移動) が止められていること。
+  const event = new MouseEvent('mousedown', { bubbles: true, cancelable: true })
+  actionButton('一覧').dispatchEvent(event)
+
+  expect(event.defaultPrevented).toBe(true)
+  expect(document.activeElement).toBe(note)
+})
+
+test('一覧の確定もボタンから到達でき、案内は行の種類で変わる', async () => {
+  await openDisclosure()
+
+  expect(actionLabels()).toContain('ここへ現在地を移す')
+  actionButton('ここへ現在地を移す').click()
+  await settle()
+
+  expect(invoked).toContain('select_step')
+})
+
+test('一覧の見出しの上ではボタンの文言も入れ替わる', async () => {
+  await openDisclosure()
+  await moveSelectionTo(`task:${MANUSCRIPT}`)
+
+  expect(actionLabels()).toContain('このタスクのステップを見る')
+  expect(actionLabels()).not.toContain('ここへ現在地を移す')
+})
+
+test('休息中のボタンは休息の終了だけである', async () => {
+  await enterTheRestingSurface()
+
+  expect(actionLabels()).toContain('休息を終える')
+  expect(actionLabels()).not.toContain('切り替え')
+  expect(actionLabels()).not.toContain('完了して次を選ぶ')
+
+  actionButton('休息を終える').click()
+  await settle()
+  expect(invoked).toContain('end_rest')
+})
+
+test('作成の面のボタンは二つの確定と戻るだけである', async () => {
+  await openCreation()
+
+  expect(actionLabels()).toEqual(['作成', '作成して着手', '戻る'])
+
+  typeInto(titleField(), '原稿')
+  typeInto(stepsField(), '下書き')
+  await settle()
+  actionButton('作成して着手').click()
+  await settle()
+
+  expect(argsOf('create_task')).toEqual({
+    request: { title: '原稿', steps: '下書き', moveCurrentPosition: true },
+  })
+})
+
+test('「閉じる」のボタンは Esc と同じ経路を通る', async () => {
+  actionButton('閉じる').click()
+  await settle()
+
+  expect(invoked).toContain('hide_overlay')
 })

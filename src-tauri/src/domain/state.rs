@@ -474,6 +474,110 @@ impl Core {
         Ok(destination)
     }
 
+    /// **現在地**の**ステップ**の**完了**を宣言し、そこに留まる (CAP-7 / FR-4)。
+    ///
+    /// 離脱側の**中断メモ**の確定と**完了**の宣言を、**単一のトランザクション**で
+    /// 確定させる (AD-5)。[`Self::switch_current_position`] との違いは一つだけである —
+    /// **現在地**を動かさない。
+    ///
+    /// # なぜ次の**ステップ**へ進めないのか
+    ///
+    /// **完了**の次にどこへ行くかを決めるのは利用者である。同一**タスク**内の次の
+    /// **ステップ**へ自動で進めば、そのタスクを続ける以外の選択が「進んでしまった後の
+    /// 訂正」になり、訂正のたびに実際には作業していない**ステップ**からの離脱が
+    /// **切り替え履歴**に残る。移動は利用者が選んだ時点で
+    /// [`Self::select_step`] が確定させる。
+    ///
+    /// # なぜ**切り替え履歴**を残さないのか
+    ///
+    /// 用語集の**切り替え**は「**現在地**をあるステップから別のステップへ移す操作」で
+    /// あり、ここでは**現在地**が動かない。離脱はまだ起きていない。1 行積めば、続く
+    /// [`Self::select_step`] の 1 行と合わせて一度の離脱が二度数えられ、SM-C3 の分母が
+    /// 膨らむ。
+    ///
+    /// **その代償として、ここで書かれた**中断メモ**は SM-C3 の分子に入らない** —
+    /// 続く [`Self::select_step`] が `note_written` を常に偽で積むためである。この経路が
+    /// メモの機会を与える唯一の「履歴を残さない」操作であることは申し送りに残してある。
+    ///
+    /// # 引数
+    ///
+    /// - `note` — 離脱側に残す**中断メモ**。`None` は**省略**であり、**既存のメモを
+    ///   消さない** ([`Self::switch_current_position`] と同じ規則)。
+    ///
+    /// # Errors
+    ///
+    /// **現在地**が**未着手**のとき [`DomainError::NoCurrentPosition`]、指し先が
+    /// 見つからないとき [`DomainError::UnknownStep`]、永続化に失敗したとき
+    /// [`CoreError::Storage`]。いずれの場合もメモリ上の状態は変わらない。
+    pub fn complete_current_step(&self, note: Option<InterruptionNote>) -> Result<(), CoreError> {
+        let mut state = self.lock();
+        let now = self.clock.now();
+
+        let here = state
+            .current_position
+            .step_id()
+            .ok_or(DomainError::NoCurrentPosition)?;
+        let index = state
+            .tasks
+            .iter()
+            .position(|task| task.step(here).is_some())
+            .ok_or(DomainError::UnknownStep)?;
+
+        // 判断は複製の上で行い、永続化が成功したときにだけメモリへ反映する
+        // (`commit_task` と同じ順序)。
+        let mut draft = state.tasks[index].clone();
+        if note.is_some() {
+            draft.set_interruption_note(here, note)?;
+        }
+        draft.declare_completion(now, here)?;
+
+        // **何も変わらないなら書かない。** 既に**完了**しており、メモも省略された
+        // 二度目の宣言で、何も変えない要求が永続化の失敗で `Err` になりうる。
+        if draft == state.tasks[index] {
+            return Ok(());
+        }
+
+        self.storage.apply(&Commit::of_task(draft.clone()))?;
+        state.tasks[index] = draft;
+        Ok(())
+    }
+
+    /// **タスク**を直す — 題名と既存の**ステップ**の本文を書き換え、末尾へ**ステップ**を
+    /// 追記する (CAP-5 / FR-4 / FR-5)。
+    ///
+    /// 三つの変更は**単一のトランザクション**で確定する (AD-5)。別々に呼べば、題名だけが
+    /// 直って**ステップ**が元のまま残る状態が異常終了で残りうる。
+    ///
+    /// **消す経路は無い。** [`Commit`] は行を消す変更を持たず (`ports/storage.rs`)、v1 は
+    /// **タスク**も**ステップ**も削除しない。直せるのは本文だけである。
+    ///
+    /// **現在地**・**完了**・**中断メモ**のいずれにも触れない。指しているのが ID である
+    /// 以上、本文を直しても**現在地**は同じ作業単位を指し続ける (FR-5)。
+    ///
+    /// # Errors
+    ///
+    /// **タスク**が無いとき [`DomainError::UnknownTask`]、指定の**ステップ**がその
+    /// **タスク**に無いとき [`DomainError::UnknownStep`]、永続化に失敗したとき
+    /// [`CoreError::Storage`]。いずれの場合もメモリ上の状態は変わらない。
+    pub fn edit_task(
+        &self,
+        task_id: TaskId,
+        title: String,
+        contents: Vec<(StepId, String)>,
+        appended: Vec<String>,
+    ) -> Result<(), CoreError> {
+        self.mutate_task(task_id, |now, task| {
+            task.rename(title);
+            for (step_id, content) in contents {
+                task.set_step_content(step_id, content)?;
+            }
+            for content in appended {
+                task.append_step(now, content)?;
+            }
+            Ok(())
+        })
+    }
+
     /// **開示面からの切り替え** — 任意の**ステップ**へ**現在地**を移し、**切り替え履歴**を
     /// 追記する。二つは**単一のトランザクション**で確定する (CAP-9 / FR-19 / AD-5)。
     ///
@@ -941,6 +1045,161 @@ mod tests {
         let (core, _, _) = a_core();
         assert_eq!(core.current_position(), CurrentPosition::NotStarted);
         assert!(core.snapshot().tasks().is_empty());
+    }
+
+    /// **完了**の宣言は**現在地**を動かさず、1 コミットで確定する。
+    ///
+    /// **切り替え履歴**を積まないことが要である — 続く [`Core::select_step`] が 1 行
+    /// 積むため、ここでも積めば一度の離脱が二度数えられる。
+    #[test]
+    fn completing_the_current_step_stays_where_it_is() {
+        let (core, storage, _) = a_core();
+        let task = core
+            .create_task("原稿", contents(&["下書き", "推敲"]))
+            .expect("作れる");
+        let first = core.snapshot().task(task).expect("在る").steps()[0].id();
+        core.move_current_position(first).expect("着手できる");
+        let before = core.current_position();
+        let commits_before = storage.commits().len();
+
+        core.complete_current_step(Some(InterruptionNote::new("ここまで")))
+            .expect("宣言できる");
+
+        let commits = storage.commits();
+        assert_eq!(
+            commits.len(),
+            commits_before + 1,
+            "1 操作 = 1 トランザクション"
+        );
+        let commit = commits.last().expect("在る");
+        assert!(commit.current_position.is_none(), "現在地は動かない");
+        assert!(
+            commit.switch_record.is_none(),
+            "離脱していない以上、履歴も積まない"
+        );
+        assert_eq!(core.current_position(), before);
+
+        let step = core.snapshot().task(task).expect("在る").steps()[0].clone();
+        assert!(step.is_completed(), "完了は宣言されている");
+        assert_eq!(
+            step.interruption_note().map(InterruptionNote::text),
+            Some("ここまで"),
+            "メモも同じトランザクションで確定する"
+        );
+    }
+
+    /// **未着手**では宣言する相手が無く、何も書かれない。
+    #[test]
+    fn completing_without_a_current_position_is_refused_before_any_write() {
+        let (core, storage, _) = a_core();
+        assert_eq!(
+            core.complete_current_step(None),
+            Err(CoreError::Domain(DomainError::NoCurrentPosition))
+        );
+        assert!(storage.commits().is_empty(), "拒否は何も書かない");
+    }
+
+    /// 二度目の宣言は何も変えず、書き込みも起こさない。
+    #[test]
+    fn a_second_completion_writes_nothing() {
+        let (core, storage, _) = a_core();
+        let task = core
+            .create_task("原稿", contents(&["下書き"]))
+            .expect("作れる");
+        let first = core.snapshot().task(task).expect("在る").steps()[0].id();
+        core.move_current_position(first).expect("着手できる");
+        core.complete_current_step(None).expect("宣言できる");
+        let commits_before = storage.commits().len();
+
+        core.complete_current_step(None)
+            .expect("二度目も拒まれない");
+
+        assert_eq!(
+            storage.commits().len(),
+            commits_before,
+            "変わるものが無いなら書かない"
+        );
+    }
+
+    /// 修正は題名・本文・追記を 1 コミットで確定し、ID も完了も**現在地**も保つ。
+    #[test]
+    fn editing_a_task_commits_once_and_keeps_every_mark() {
+        let (core, storage, _) = a_core();
+        let task = core
+            .create_task("原稿", contents(&["下書き", "推敲"]))
+            .expect("作れる");
+        let steps: Vec<StepId> = core
+            .snapshot()
+            .task(task)
+            .expect("在る")
+            .steps()
+            .iter()
+            .map(Step::id)
+            .collect();
+        core.move_current_position(steps[1]).expect("着手できる");
+        core.declare_completion(steps[0]).expect("完了できる");
+        let before = core.current_position();
+        let commits_before = storage.commits().len();
+
+        core.edit_task(
+            task,
+            "原稿を仕上げる".to_string(),
+            vec![(steps[1], "推敲する".to_string())],
+            contents(&["投稿する"]),
+        )
+        .expect("直せる");
+
+        assert_eq!(
+            storage.commits().len(),
+            commits_before + 1,
+            "三つの変更で 1 トランザクション"
+        );
+        let state = core.snapshot();
+        let edited = state.task(task).expect("在る");
+        assert_eq!(edited.title(), "原稿を仕上げる");
+        assert_eq!(
+            edited.steps().iter().map(Step::content).collect::<Vec<_>>(),
+            vec!["下書き", "推敲する", "投稿する"]
+        );
+        assert_eq!(
+            edited.steps()[..2].iter().map(Step::id).collect::<Vec<_>>(),
+            steps,
+            "既存のステップの ID は変わらない"
+        );
+        assert!(edited.steps()[0].is_completed(), "完了は落ちない");
+        assert_eq!(core.current_position(), before, "現在地も動かない");
+    }
+
+    /// 無い**ステップ**を指した修正は、題名も含めて何も書かない。
+    #[test]
+    fn an_edit_naming_an_unknown_step_writes_nothing() {
+        let (core, storage, _) = a_core();
+        let task = core
+            .create_task("原稿", contents(&["下書き"]))
+            .expect("作れる");
+        let elsewhere = StepId::new(Timestamp::from_unix_millis(1_789_000_000_000));
+        let commits_before = storage.commits().len();
+
+        assert_eq!(
+            core.edit_task(
+                task,
+                "別の題名".to_string(),
+                vec![(elsewhere, "どこにも無い".to_string())],
+                Vec::new(),
+            ),
+            Err(CoreError::Domain(DomainError::UnknownStep))
+        );
+
+        assert_eq!(
+            storage.commits().len(),
+            commits_before,
+            "拒否は何も書かない"
+        );
+        assert_eq!(
+            core.snapshot().task(task).expect("在る").title(),
+            "原稿",
+            "題名も元のままである"
+        );
     }
 
     /// タスク作成は 1 コミットで確定する。

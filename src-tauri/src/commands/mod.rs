@@ -241,7 +241,11 @@ fn snapshot_of(hotkey: HotkeyStatus, state: Option<&CoreState>) -> OverlaySnapsh
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 #[serde(tag = "kind", rename_all = "camelCase")]
 pub enum DisclosureRow {
-    /// **タスク**の見出し。**タスク**が在る限り必ず現れる。
+    /// **タスク**の見出し。**一覧に並ぶ**タスク**は必ず見出しを持つ。
+    ///
+    /// **終わった**タスク**は一覧に並ばない** — 全**ステップ**の**完了**が宣言された
+    /// **タスク**は [`disclosure_of`] が落とす (設計上の賭け #3)。**現在地**を抱えて
+    /// いる間だけは残る。
     ///
     /// 確定すると開く**タスク**がこれに移り、直前に開いていた**タスク**は閉じる。
     /// **確定しても**現在地**は動かず、**切り替え履歴**も増えない** (spec Boundaries)。
@@ -353,12 +357,32 @@ fn disclosure_of(state: Option<&CoreState>, open_task_id: Option<&str>) -> Discl
     let current = state.current_position().step_id();
     // **現在地**を抱える**タスク**も同じく一度だけ読む。閉じていても見出しがそれを示す。
     let here = task_of_current_position(state);
+    // **終わった**タスク**は並べない** (設計上の賭け #3)。全**ステップ**の**完了**が
+    // 宣言された**タスク**は、それ以上**現在地**になる場所を持たない — 並べ続ければ、
+    // 一覧は済んだ仕事の山へ育ち、罪悪感を与えない約束が壊れる。
+    //
+    // **消すのは表示からだけである。** 行は残る (`ports/storage.rs` の [`Commit`] は
+    // 行を消す変更を持たない)。FR-19 の「**腐敗**した**タスク**を含まない」と同じ
+    // 場所に同じ形で立っており、CAP-20 の除外もここへ加わる。
+    //
+    // **現在地**を抱えている**タスク**だけは例外として残す。落とすと、最後の
+    // **ステップ**の**完了**を宣言した瞬間に**現在地**が一覧のどこにも現れなくなる
+    // (spec Boundaries「**現在地**が指す行がどれか分かること」)。次の**ステップ**を
+    // 選んで離れた時点で、その**タスク**は自然に消える。
+    let listed: Vec<&Task> = state
+        .tasks()
+        .iter()
+        .filter(|task| !task.is_fully_completed() || here == Some(task.id()))
+        .collect();
     // **開く**タスク**も一度だけ決める。** 高々一つしか真になりえないことを、この
-    // 一つの値が構造として負う。
-    let open = task_to_open(state, open_task_id);
+    // 一つの値が構造として負う。**並べない**タスク**は開かない** — 見出しの無い
+    // **ステップ**の列が宙に浮き、どの**タスク**のものか分からなくなる。
+    let open =
+        task_to_open(state, open_task_id).filter(|id| listed.iter().any(|task| task.id() == *id));
     let mut rows = Vec::new();
-    for task in state.tasks() {
-        // **見出しは常にすべて並ぶ。** 隠れるのは**ステップ**だけである。
+    for task in listed {
+        // **並べる**タスク**の見出しはすべて出る。** 開閉で隠れるのは**ステップ**
+        // だけである。
         let opened = open == Some(task.id());
         rows.push(DisclosureRow::Task {
             task_id: task.id().to_string(),
@@ -505,6 +529,226 @@ pub struct SelectStepOutcome {
     pub moved: bool,
 }
 
+/// `complete_current_step` が受け取る要求。**これがコマンドの引数型そのものである。**
+///
+/// フロントは `invoke('complete_current_step', { request: { note } })` と呼ぶ。
+///
+/// # なぜ「完了するか」の欄が無いのか
+///
+/// この経路は**完了**の宣言そのものである。真偽で分けられるなら
+/// [`switch_current_position`] と同じ形になり、宣言しない呼び出しが「メモだけ書いて
+/// 何も起こさない」という、どの操作にも対応しない結末を作る。
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CompleteStepRequest {
+    /// 確定する**中断メモ**。`null` および空欄は**省略**であり、既存のメモを変えない。
+    ///
+    /// [`SwitchRequest::note`] と同じ規則である。提示された既存メモをそのまま送り返して
+    /// はならない。
+    pub note: Option<String>,
+}
+
+/// **完了**の宣言の結末。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CompleteStepOutcome {
+    /// その**タスク**の**ステップ**が全部**完了**したか。
+    ///
+    /// 真なら、**現在地**が離れた時点でその**タスク**は一覧から消える
+    /// ([`disclosure_of`])。**黙って消さないために運ぶ** — 消えた理由が分からなければ、
+    /// 利用者は**タスク**を失ったと読む。**件数も割合も運ばない** (AD-15)。
+    pub task_finished: bool,
+}
+
+/// `get_task_draft` が受け取る要求。**これがコマンドの引数型そのものである。**
+///
+/// `null` は**現在地**の**タスク**である — 既定表示から直しに入ったときの形がこれで
+/// あり、**未着手**なら直す相手が無い。
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct TaskDraftRequest {
+    /// 直す**タスク**の ID。[`DisclosureRow::Task`] が運んだ文字列そのもの。
+    pub task_id: Option<String>,
+}
+
+/// 修正の面が下書きの出発点として受け取る、**ステップ**1 個。
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DraftStep {
+    /// **ステップ**の ID。**確定のときにそのまま送り返される。**
+    ///
+    /// **連番ではない。** 連番で指せば、追記や分割で番号が動いた瞬間に別の**ステップ**の
+    /// 本文が書き換わる (FR-5)。
+    pub step_id: String,
+    /// いまの本文。入力欄の初期値になる。
+    pub content: String,
+}
+
+/// 修正の面が描画に必要とするすべて (CAP-5 / FR-4 / FR-5)。
+///
+/// フィールド名は `src/overlay/Overlay.svelte` の `TaskDraft` 型と 1:1 で対応する。
+/// 契約は [`tests::the_task_draft_keeps_its_wire_contract`] が固定する。
+///
+/// **表示のたびに取り直される** (AD-3 鮮度規則)。隠れている間の下書きを持ち越さない。
+///
+/// # **中断メモ**も**完了**も運ばない
+///
+/// 直せるのは題名と本文だけである。**完了**の宣言と取り消しは別の行為であり (FR-4 /
+/// AD-2)、**中断メモ**は**切り替え**の儀式に属する (CAP-7)。欄が無ければ、修正の面が
+/// それらへ滑り出す経路が型として成立しない。
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskDraft {
+    /// コアが `manage` されていないときの理由。読めていれば `None`。
+    ///
+    /// **面は開き、理由を示す** (I/O マトリクス「コア不在」)。
+    pub state_error: Option<String>,
+    /// 直す**タスク**の ID。直す相手が無ければ `None`。
+    ///
+    /// **`null` のまま確定させない。** 相手が無いことと、相手はあるが題名が空である
+    /// ことは別の結末であり、フロントは前者では確定の手段そのものを出さない。
+    pub task_id: Option<String>,
+    /// いまの題名。相手が無ければ空文字である。
+    pub title: String,
+    /// いまの**ステップ**を `ordinal` 昇順で。相手が無ければ空である。
+    pub steps: Vec<DraftStep>,
+}
+
+/// `edit_task` が受け取る要求。**これがコマンドの引数型そのものである。**
+///
+/// フロントは
+/// `invoke('edit_task', { request: { taskId, title, steps, addedSteps } })` と呼ぶ。
+///
+/// # なぜ既存の**ステップ**だけ配列で受け取るのか
+///
+/// [`CreateTaskRequest`] が入力欄の文字列そのものを送るのは、「1 行 = 1 **ステップ**」を
+/// 切り分ける規則を一箇所に保つためである。こちらの既存の**ステップ**には切り分ける
+/// 行が無い — 欄が**ステップ**ごとに分かれており、それぞれが ID を持つ。**ID と本文の
+/// 対応を線の上で保つには、対応そのものを運ぶしかない。** 行で送れば、対応は並び順と
+/// いう暗黙の約束になり、1 行ずれた瞬間に別の**ステップ**の本文が書き換わる。
+///
+/// **追記の欄だけは文字列である。** そちらは 1 行 = 1 **ステップ**であり、
+/// [`step_contents_of`] が作成と同じ規則で切り分ける。
+///
+/// # 消す欄が無い
+///
+/// v1 は**タスク**も**ステップ**も削除しない (`ports/storage.rs` の [`Commit`])。
+/// 欄を置かないことで、それを構造として保証する。
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EditTaskRequest {
+    /// 直す**タスク**の ID。[`TaskDraft::task_id`] が運んだ文字列そのもの。
+    pub task_id: String,
+    /// 新しい題名。前後の空白を除いて空であってはならない (FR-4)。
+    pub title: String,
+    /// 既存の**ステップ**の ID と新しい本文の対。
+    pub steps: Vec<DraftStep>,
+    /// 末尾へ追記する**ステップ**の入力欄の文字列そのもの。1 行 = 1 **ステップ**。
+    ///
+    /// 空でよい。**追記は修正の一部であり、別の操作ではない** — 同じ確定で書かれる
+    /// (AD-5)。
+    pub added_steps: String,
+}
+
+/// 入力から組み立てた、**タスク**の修正内容。
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TaskEdit {
+    task_id: TaskId,
+    title: String,
+    contents: Vec<(StepId, String)>,
+    appended: Vec<String>,
+}
+
+/// 直す相手を特定できないことを示す理由。
+const TASK_UNREADABLE: &str = "直す対象のタスクを特定できない。一覧を開き直すこと。";
+
+/// **ステップ**の本文が空であることを示す理由 (I/O マトリクス「残る行が無い」の親戚)。
+///
+/// **空欄を削除として扱わない。** v1 に削除の経路は無く、空にした欄を黙って落とせば、
+/// 取り消せない削除が打ち間違いから生まれる。
+const STEP_CONTENT_MISSING: &str = "空のステップは残せない。消す経路はまだ無い。";
+
+/// **入力を**タスク**の修正内容へ整える純粋関数** ([`as_task_definition`] と同じ流儀)。
+///
+/// `AppHandle` を取らない。コマンドに埋め込んだままでは、ID の取り違えも空欄の扱いも
+/// 生きた Tauri アプリを起動しない限り一行も検証できない。
+///
+/// # 規則
+///
+/// - 題名は前後の空白を除く。除いて空なら直さない ([`as_title`])。
+/// - 既存の**ステップ**の本文も前後の空白を除く。除いて空なら直さない。
+/// - 追記の欄は 1 行 = 1 **ステップ**。空になる行は落ちる ([`step_contents_of`])。
+/// - **コアを要求する前にここを通す。** 逆にすると、題名を消しただけの利用者に
+///   「状態を読み込めていない」という無関係な理由が返りうる。
+fn as_task_edit(
+    task_id: &str,
+    title: &str,
+    steps: &[DraftStep],
+    added_steps: &str,
+) -> Result<TaskEdit, String> {
+    let task_id = TaskId::parse(task_id).map_err(|_| TASK_UNREADABLE.to_string())?;
+    let title = as_title(title)?;
+
+    let mut contents = Vec::with_capacity(steps.len());
+    for step in steps {
+        let step_id = StepId::parse(&step.step_id).map_err(|_| ROW_UNREADABLE.to_string())?;
+        let content = step.content.trim();
+        if content.is_empty() {
+            return Err(STEP_CONTENT_MISSING.to_string());
+        }
+        contents.push((step_id, content.to_string()));
+    }
+
+    Ok(TaskEdit {
+        task_id,
+        title,
+        contents,
+        appended: step_contents_of(added_steps),
+    })
+}
+
+/// **コア状態を修正の面の下書きへ落とす純粋関数** ([`disclosure_of`] と同じ流儀)。
+///
+/// `requested` が `None` のときは**現在地**の**タスク**である。
+///
+/// **終わった**タスク**も直せる。** 一覧から消えていても、**現在地**が抱えている間は
+/// 見出しが残っており、そこから直しに入れる。直す行為は**完了**に触れない。
+fn task_draft_of(state: Option<&CoreState>, requested: Option<&str>) -> TaskDraft {
+    let Some(state) = state else {
+        return TaskDraft {
+            state_error: Some(CORE_MISSING.to_string()),
+            task_id: None,
+            title: String::new(),
+            steps: Vec::new(),
+        };
+    };
+
+    // 開く相手の決め方は一覧と同じである。**二つの読み方を持たない** — 食い違えば、
+    // 一覧で選んだ見出しと違う**タスク**が直しの面に出る。
+    let Some(task) = task_to_open(state, requested).and_then(|id| state.task(id)) else {
+        return TaskDraft {
+            state_error: None,
+            task_id: None,
+            title: String::new(),
+            steps: Vec::new(),
+        };
+    };
+
+    TaskDraft {
+        state_error: None,
+        task_id: Some(task.id().to_string()),
+        title: task.title().to_string(),
+        steps: task
+            .steps()
+            .iter()
+            .map(|step| DraftStep {
+                step_id: step.id().to_string(),
+                content: step.content().to_string(),
+            })
+            .collect(),
+    }
+}
+
 /// **イベントを発行すべきか決める純粋関数** ([`outcome_of`] と同じ流儀)。
 ///
 /// 条件をコマンドに埋め込んだままでは、`if` を外して常時発行に変えても生きた Tauri
@@ -575,25 +819,43 @@ const STEP_SEPARATORS: [char; 4] = ['\n', '\r', '\u{2028}', '\u{2029}'];
 /// 行頭の空白や空行は「書いた形」ではなく入力の都合であり、そのまま**ステップ**の内容に
 /// すると連番と内容の両方がずれる。
 fn as_task_definition(title: &str, steps: &str) -> Result<TaskDefinition, String> {
-    let title = title.trim();
-    if title.is_empty() {
-        return Err(TITLE_MISSING.to_string());
-    }
+    let title = as_title(title)?;
 
-    let step_contents: Vec<String> = steps
-        .split(STEP_SEPARATORS)
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .map(str::to_string)
-        .collect();
+    let step_contents = step_contents_of(steps);
     if step_contents.is_empty() {
         return Err(STEPS_MISSING.to_string());
     }
 
     Ok(TaskDefinition {
-        title: title.to_string(),
+        title,
         step_contents,
     })
+}
+
+/// **題名を整える純粋関数。** 前後の空白を除いて空なら作らない (FR-4)。
+///
+/// 作成 ([`as_task_definition`]) と修正 ([`edit_task`]) が同じ規則を使う。二箇所に
+/// 書けば、片方だけが空の題名を通す形になりうる。
+fn as_title(title: &str) -> Result<String, String> {
+    let title = title.trim();
+    if title.is_empty() {
+        return Err(TITLE_MISSING.to_string());
+    }
+    Ok(title.to_string())
+}
+
+/// **1 行 = 1 **ステップ**を切り分ける純粋関数。** 空になる行は落とす。
+///
+/// 作成 ([`as_task_definition`]) と修正の追記欄 ([`edit_task`]) が同じ規則を使う。
+/// **落とす判断はここにしか無い** — フロントへ移せば、この関数が守っているものが
+/// 実際の経路から外れる。
+fn step_contents_of(steps: &str) -> Vec<String> {
+    steps
+        .split(STEP_SEPARATORS)
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(str::to_string)
+        .collect()
 }
 
 /// **着手すべき**ステップ**を選ぶ純粋関数** — 第 1 **ステップ**、すなわち連番が 1 の
@@ -821,6 +1083,92 @@ pub fn select_step<R: Runtime>(
         outcome.moved
     );
     Ok(outcome)
+}
+
+/// **完了**を宣言し、**現在地**をそこへ留める (CAP-7 / FR-4)。
+///
+/// 離脱側の**中断メモ**の確定と**完了**の宣言を、コア側の単一のトランザクションで
+/// 確定させる (AD-5)。**現在地**は動かない — 次にどの**ステップ**へ着手するかは利用者が
+/// **開示面**で選び、そこで [`select_step`] が移動を確定させる。
+///
+/// # なぜ `current_position_changed` を発行しないのか
+///
+/// **現在地**は動いていない。発行すれば、起きていない変化のために受け手が描き直す
+/// ([`switch_current_position`] が最終**ステップ**で発行しないのと同じ判断である)。
+/// 呼び出し側は戻り値を受け取った時点でスナップショットを取り直す (AD-3 鮮度規則)。
+///
+/// # Errors
+///
+/// コアが `manage` されていないとき、**現在地**が**未着手**のとき、または永続化に
+/// 失敗したとき。いずれの場合も状態は変わっていない。
+#[tauri::command]
+pub fn complete_current_step<R: Runtime>(
+    app: AppHandle<R>,
+    request: CompleteStepRequest,
+) -> Result<CompleteStepOutcome, String> {
+    let core = require_core(app.try_state::<Core>())?;
+
+    core.complete_current_step(as_interruption_note(request.note))
+        .map_err(|error| error.to_string())?;
+
+    // **確定した後の状態から読む。** 宣言の前に数えると、いま宣言した 1 個が落ちる。
+    let state = core.snapshot();
+    let task_finished = state
+        .current_position()
+        .step_id()
+        .and_then(|here| state.task_of_step(here))
+        .is_some_and(Task::is_fully_completed);
+
+    // 本文は書かない。書いてよいのは「起きた」という事実だけである。
+    log::info!("a completion was declared (task_finished={task_finished})");
+    Ok(CompleteStepOutcome { task_finished })
+}
+
+/// 修正の面が表示されるたびに呼ばれ、下書きの出発点を返す (CAP-5 / AD-3 鮮度規則)。
+///
+/// **コアが読めなくても失敗しない。** 面は開き、理由を [`TaskDraft::state_error`] として
+/// 運ぶ (I/O マトリクス「コア不在」)。失敗させると、開いた面が空白のまま出る。
+#[tauri::command]
+pub fn get_task_draft<R: Runtime>(app: AppHandle<R>, request: TaskDraftRequest) -> TaskDraft {
+    let state = app.try_state::<Core>().map(|core| core.snapshot());
+    task_draft_of(state.as_ref(), request.task_id.as_deref())
+}
+
+/// **タスク**を直す — 題名と既存の**ステップ**の本文を書き換え、末尾へ追記する
+/// (CAP-5 / FR-4 / FR-5)。
+///
+/// 三つの変更はコア側の単一のトランザクションで確定する (AD-5)。
+///
+/// **現在地**・**完了**・**中断メモ**のいずれにも触れない。**現在地**が指しているのは
+/// ID であり、本文を直しても同じ作業単位を指し続ける — したがって
+/// `current_position_changed` も発行しない。一覧と既定表示の文字が変わったことは
+/// `task_created` と同じ「作り変わった」の報せで伝える。
+///
+/// # Errors
+///
+/// 題名が空のとき、**ステップ**の本文が空のとき、ID が読めないとき、コアが `manage`
+/// されていないとき、**タスク**や**ステップ**が見つからないとき、または永続化に失敗した
+/// とき。**いずれの場合も何も保存されておらず、呼び出し側は面を閉じずに理由を提示して
+/// 入力を保持する** (I/O マトリクス)。
+#[tauri::command]
+pub fn edit_task<R: Runtime>(app: AppHandle<R>, request: EditTaskRequest) -> Result<(), String> {
+    // **コアを要求する前に入力を検める** (`create_task` と同じ順序)。
+    let edit = as_task_edit(
+        &request.task_id,
+        &request.title,
+        &request.steps,
+        &request.added_steps,
+    )?;
+    let core = require_core(app.try_state::<Core>())?;
+
+    core.edit_task(edit.task_id, edit.title, edit.contents, edit.appended)
+        .map_err(|error| error.to_string())?;
+    // 状態を変えた後は必ず event を発行する (AD-3)。ペイロードは持たない。
+    crate::announce_task_created(&app);
+
+    // 題名も**ステップ**の内容も書かない。書いてよいのは「起きた」という事実だけである。
+    log::info!("a task was edited");
+    Ok(())
 }
 
 /// 入力欄の文字列を**中断メモ**に変える。**空欄は省略である** (FR-7)。
@@ -2230,6 +2578,284 @@ mod tests {
         assert!(
             !json.contains("interruptionNote"),
             "欄そのものが無い: {json}"
+        );
+    }
+
+    /// 一覧に現れる見出しの題名。
+    fn listed_headings(surface: &DisclosureSurface) -> Vec<String> {
+        surface
+            .rows
+            .iter()
+            .filter_map(|row| match row {
+                DisclosureRow::Task { title, .. } => Some(title.clone()),
+                DisclosureRow::Step { .. } => None,
+            })
+            .collect()
+    }
+
+    /// 終わった**タスク**は一覧から消える (設計上の賭け #3)。
+    ///
+    /// **現在地**が別の**タスク**にある状態で全**ステップ**を**完了**させ、見出しごと
+    /// 落ちることを見る。
+    #[test]
+    fn a_finished_task_leaves_the_list() {
+        let core = Core::restore(
+            Box::new(FixedClock::at(1_789_000_000_000)),
+            Box::new(AcceptingStorage),
+        )
+        .expect("空の状態は復元できる");
+        let done = core
+            .create_task("原稿", contents(&["構成を決める", "下書きを書く"]))
+            .expect("作れる");
+        let living = core
+            .create_task("買い物", contents(&["米"]))
+            .expect("作れる");
+
+        let snapshot = core.snapshot();
+        let here = snapshot.task(living).expect("ある").steps()[0].id();
+        core.move_current_position(here).expect("移せる");
+        for step in snapshot.task(done).expect("ある").steps() {
+            core.declare_completion(step.id()).expect("宣言できる");
+        }
+
+        let surface = disclosure_of(Some(&core.snapshot()), None);
+        assert_eq!(
+            listed_headings(&surface),
+            vec!["買い物".to_string()],
+            "終わったタスクは見出しごと消える"
+        );
+    }
+
+    /// **現在地**を抱えている間は、終わった**タスク**も残る。
+    ///
+    /// 落とすと、最後の**ステップ**の**完了**を宣言した瞬間に**現在地**が一覧のどこにも
+    /// 現れなくなる (spec Boundaries)。
+    #[test]
+    fn a_finished_task_stays_while_it_holds_the_current_position() {
+        let core = Core::restore(
+            Box::new(FixedClock::at(1_789_000_000_000)),
+            Box::new(AcceptingStorage),
+        )
+        .expect("空の状態は復元できる");
+        let task = core
+            .create_task("原稿", contents(&["下書き"]))
+            .expect("作れる");
+        let only = core.snapshot().task(task).expect("ある").steps()[0].id();
+        core.move_current_position(only).expect("移せる");
+        core.declare_completion(only).expect("宣言できる");
+
+        let surface = disclosure_of(Some(&core.snapshot()), None);
+        assert_eq!(listed_headings(&surface), vec!["原稿".to_string()]);
+        assert_eq!(
+            heading_with_the_current_position(&surface),
+            Some("原稿".to_string()),
+            "現在地がどこにあるかは見え続ける"
+        );
+        assert_eq!(listed_steps(&surface), vec!["下書き".to_string()]);
+    }
+
+    /// 消えた**タスク**を名指しで開こうとしても、**ステップ**は宙に浮かない。
+    ///
+    /// 見出しの無い**ステップ**の列が並べば、どの**タスク**のものか分からなくなる。
+    #[test]
+    fn a_finished_task_cannot_be_opened_by_name() {
+        let core = Core::restore(
+            Box::new(FixedClock::at(1_789_000_000_000)),
+            Box::new(AcceptingStorage),
+        )
+        .expect("空の状態は復元できる");
+        let done = core
+            .create_task("原稿", contents(&["下書き"]))
+            .expect("作れる");
+        let living = core
+            .create_task("買い物", contents(&["米"]))
+            .expect("作れる");
+        let here = core.snapshot().task(living).expect("ある").steps()[0].id();
+        core.move_current_position(here).expect("移せる");
+        let finished = core.snapshot().task(done).expect("ある").steps()[0].id();
+        core.declare_completion(finished).expect("宣言できる");
+
+        let surface = disclosure_of(Some(&core.snapshot()), Some(&done.to_string()));
+
+        assert_eq!(listed_headings(&surface), vec!["買い物".to_string()]);
+        assert!(
+            listed_steps(&surface).is_empty(),
+            "並べない見出しのステップは開かない"
+        );
+    }
+
+    /// 修正の面は**現在地**の**タスク**から始まり、ID と本文の対を運ぶ。
+    #[test]
+    fn the_draft_starts_from_the_task_at_the_current_position() {
+        let state = a_state_with_two_tasks_and_five_steps();
+        let draft = task_draft_of(Some(&state), None);
+
+        assert_eq!(draft.state_error, None);
+        assert_eq!(draft.task_id, Some(task_id_in(&state, 1)));
+        assert_eq!(draft.title, "買い物");
+        assert_eq!(
+            draft
+                .steps
+                .iter()
+                .map(|step| step.content.clone())
+                .collect::<Vec<_>>(),
+            vec!["米", "味噌", "醤油"]
+        );
+        assert_eq!(draft.steps[0].step_id, step_id_in(&state, 1, 0));
+    }
+
+    /// 名指しすれば、**現在地**を抱えていない**タスク**も直せる。
+    #[test]
+    fn a_named_task_can_be_edited_without_moving_anywhere() {
+        let state = a_state_with_two_tasks_and_five_steps();
+        let draft = task_draft_of(Some(&state), Some(&task_id_in(&state, 0)));
+
+        assert_eq!(draft.title, "原稿");
+        assert_eq!(draft.steps.len(), 2);
+    }
+
+    /// **未着手**には直す相手が無い。**面は開くが確定の手段を持たない。**
+    #[test]
+    fn a_draft_without_a_task_is_not_an_error() {
+        let core = Core::restore(
+            Box::new(FixedClock::at(1_789_000_000_000)),
+            Box::new(AcceptingStorage),
+        )
+        .expect("空の状態は復元できる");
+
+        let draft = task_draft_of(Some(&core.snapshot()), None);
+
+        assert_eq!(draft.state_error, None, "読めていないわけではない");
+        assert_eq!(draft.task_id, None);
+        assert!(draft.steps.is_empty());
+    }
+
+    /// コアが読めないときも面は開き、理由を運ぶ (I/O マトリクス「コア不在」)。
+    #[test]
+    fn a_draft_carries_the_reason_when_the_core_is_missing() {
+        let draft = task_draft_of(None, None);
+        assert_eq!(draft.state_error.as_deref(), Some(CORE_MISSING));
+        assert_eq!(draft.task_id, None);
+    }
+
+    /// Rust → TS の契約。フィールド名を変えると修正の面が無言で空になる。
+    #[test]
+    fn the_task_draft_keeps_its_wire_contract() {
+        let json: serde_json::Value = serde_json::to_value(TaskDraft {
+            state_error: None,
+            task_id: Some("0198f0e0-0000-7000-8000-000000000000".to_string()),
+            title: "原稿".to_string(),
+            steps: vec![DraftStep {
+                step_id: "0198f0e0-0000-7000-8000-000000000001".to_string(),
+                content: "下書き".to_string(),
+            }],
+        })
+        .expect("直列化できる");
+
+        let fields: Vec<&String> = json
+            .as_object()
+            .expect("オブジェクトである")
+            .keys()
+            .collect();
+        assert_eq!(
+            fields,
+            vec!["stateError", "steps", "taskId", "title"],
+            "完了・中断メモ・連番に由来する欄を足さない (AD-15)"
+        );
+        let step_fields: Vec<&String> = json["steps"][0]
+            .as_object()
+            .expect("オブジェクトである")
+            .keys()
+            .collect();
+        assert_eq!(step_fields, vec!["content", "stepId"]);
+    }
+
+    /// 修正の入力は整えられ、ID と本文の対がそのまま運ばれる。
+    #[test]
+    fn an_edit_is_trimmed_and_keeps_the_pairing() {
+        let task = "0198f0e0-0000-7000-8000-000000000000";
+        let first = "0198f0e0-0000-7000-8000-000000000001";
+        let edit = as_task_edit(
+            task,
+            "  原稿を仕上げる  ",
+            &[DraftStep {
+                step_id: first.to_string(),
+                content: "  推敲する  ".to_string(),
+            }],
+            "\n投稿する\n\n  \n礼を言う\n",
+        )
+        .expect("整う");
+
+        assert_eq!(edit.task_id.to_string(), task);
+        assert_eq!(edit.title, "原稿を仕上げる");
+        assert_eq!(edit.contents.len(), 1);
+        assert_eq!(edit.contents[0].0.to_string(), first);
+        assert_eq!(edit.contents[0].1, "推敲する");
+        assert_eq!(edit.appended, contents(&["投稿する", "礼を言う"]));
+    }
+
+    /// 空にした**ステップ**は削除ではない。**取り消せない削除を打ち間違いから生まない。**
+    #[test]
+    fn a_blank_step_is_refused_rather_than_dropped() {
+        let error = as_task_edit(
+            "0198f0e0-0000-7000-8000-000000000000",
+            "原稿",
+            &[DraftStep {
+                step_id: "0198f0e0-0000-7000-8000-000000000001".to_string(),
+                content: "   ".to_string(),
+            }],
+            "",
+        )
+        .expect_err("拒まれる");
+        assert_eq!(error, STEP_CONTENT_MISSING);
+    }
+
+    /// 題名を消した修正は、作成と同じ理由で拒まれる (FR-4)。
+    #[test]
+    fn an_edit_without_a_title_is_refused() {
+        let error = as_task_edit("0198f0e0-0000-7000-8000-000000000000", "   ", &[], "")
+            .expect_err("拒まれる");
+        assert_eq!(error, TITLE_MISSING);
+    }
+
+    /// 読めない ID は、無関係な理由 (コア不在) ではなくそれと分かる理由で返る。
+    #[test]
+    fn an_unreadable_id_is_named_as_such() {
+        assert_eq!(
+            as_task_edit("タスクではない", "原稿", &[], "").expect_err("拒まれる"),
+            TASK_UNREADABLE
+        );
+        assert_eq!(
+            as_task_edit(
+                "0198f0e0-0000-7000-8000-000000000000",
+                "原稿",
+                &[DraftStep {
+                    step_id: "ステップではない".to_string(),
+                    content: "下書き".to_string(),
+                }],
+                "",
+            )
+            .expect_err("拒まれる"),
+            ROW_UNREADABLE
+        );
+    }
+
+    /// Rust → TS の契約。**完了**の結末の欄を変えると報せが無言で消える。
+    #[test]
+    fn the_completion_outcome_keeps_its_wire_contract() {
+        let json: serde_json::Value = serde_json::to_value(CompleteStepOutcome {
+            task_finished: true,
+        })
+        .expect("直列化できる");
+        let fields: Vec<&String> = json
+            .as_object()
+            .expect("オブジェクトである")
+            .keys()
+            .collect();
+        assert_eq!(
+            fields,
+            vec!["taskFinished"],
+            "件数も残りの数も運ばない (AD-15)"
         );
     }
 

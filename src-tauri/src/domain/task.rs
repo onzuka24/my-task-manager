@@ -253,10 +253,56 @@ impl Task {
         &self.steps
     }
 
+    /// 全**ステップ**の**完了**が宣言されているか。
+    ///
+    /// **1 個も**ステップ**を持たない**タスク**は存在しない** ([`Self::create`] /
+    /// [`Self::rehydrate`] が [`DomainError::EmptyTask`] で拒む) ため、空の**タスク**が
+    /// 「全部終わっている」に倒れることはない。
+    ///
+    /// これは進捗の指標ではない。**開示面**が終わった**タスク**を並べ続けないための
+    /// 述語であり、外へ運ばれるのはこの真偽だけである — 件数も割合も持たない (AD-15)。
+    #[must_use]
+    pub fn is_fully_completed(&self) -> bool {
+        self.steps.iter().all(Step::is_completed)
+    }
+
     /// ID から**ステップ**を引く。
     #[must_use]
     pub fn step(&self, id: StepId) -> Option<&Step> {
         self.steps.iter().find(|step| step.id == id)
+    }
+
+    /// 題名を書き換える (CAP-5 / FR-4)。
+    ///
+    /// **ID も**ステップ**も変わらない。** 題名は**タスク**の同一性を担っておらず、
+    /// 打ち間違いを直しても**現在地**・**完了**・**中断メモ**のいずれにも影響しない。
+    ///
+    /// 空白の扱いはここでは決めない。[`Self::create`] が題名を素通しするのと同じく、
+    /// 整えるのはコマンド境界の責務である。
+    pub fn rename(&mut self, title: impl Into<String>) {
+        self.title = title.into();
+    }
+
+    /// **ステップ**の本文を書き換える (CAP-5 / FR-4)。
+    ///
+    /// **ID・連番・完了・中断メモのいずれも変わらない。** 書き換えるのは本文だけで
+    /// ある — **現在地**が指しているのは ID であり、本文を直しても同じ作業単位を
+    /// 指し続ける ([`Self::split_step`] の前半と同じ理由)。
+    ///
+    /// **完了済みの**ステップ**も書き換えられる。** 分割 ([`Self::split_step`]) を
+    /// 拒むのは、**完了**が前半・後半のどちらに帰属するかをコアが決められないため
+    /// であり、本文の差し替えにはその曖昧さが無い。
+    ///
+    /// # Errors
+    ///
+    /// 指定の**ステップ**が無いとき [`DomainError::UnknownStep`]。
+    pub fn set_step_content(
+        &mut self,
+        step_id: StepId,
+        content: impl Into<String>,
+    ) -> Result<(), DomainError> {
+        self.step_mut(step_id)?.content = content.into();
+        Ok(())
     }
 
     /// 指定の位置へ**ステップ**を追記する (CAP-5 / FR-5)。
@@ -686,5 +732,76 @@ mod tests {
             task_id
         );
         assert!(StepId::parse("not-a-uuid").is_err());
+    }
+
+    /// 題名を直しても、**タスク**の同一性も**ステップ**も変わらない (CAP-5)。
+    #[test]
+    fn renaming_touches_nothing_but_the_title() {
+        let mut task = a_task();
+        let before = task.steps().to_vec();
+        let id = task.id();
+
+        task.rename("原稿を仕上げる (改)");
+
+        assert_eq!(task.title(), "原稿を仕上げる (改)");
+        assert_eq!(task.id(), id, "題名は同一性を担っていない");
+        assert_eq!(task.steps(), before, "ステップは一つも変わらない");
+    }
+
+    /// 本文を直しても ID・連番・完了・中断メモは残る。
+    ///
+    /// **現在地**が指しているのは ID である。ここで ID が変われば、打ち間違いを直した
+    /// だけで**現在地**が行方不明になる。
+    #[test]
+    fn editing_a_step_keeps_its_identity_and_its_marks() {
+        let mut task = a_task();
+        let target = task.steps()[1].id();
+        task.declare_completion(NOW, target).expect("完了できる");
+        task.set_interruption_note(target, Some(InterruptionNote::new("ここまで")))
+            .expect("メモを置ける");
+
+        task.set_step_content(target, "推敲する").expect("直せる");
+
+        let step = task.step(target).expect("残っている");
+        assert_eq!(step.content(), "推敲する");
+        assert_eq!(step.id(), target, "ID は変わらない");
+        assert_eq!(step.ordinal(), 2, "連番も変わらない");
+        assert!(step.is_completed(), "完了は落ちない");
+        assert_eq!(
+            step.interruption_note().map(InterruptionNote::text),
+            Some("ここまで"),
+            "中断メモも落ちない"
+        );
+    }
+
+    /// 無い**ステップ**の本文は直せない。
+    #[test]
+    fn editing_an_unknown_step_is_refused() {
+        let mut task = a_task();
+        assert_eq!(
+            task.set_step_content(StepId::new(NOW), "どこにも無い"),
+            Err(DomainError::UnknownStep)
+        );
+    }
+
+    /// 全部の**ステップ**が**完了**して初めて、**タスク**は終わっている。
+    ///
+    /// **ステップ**を持たない**タスク**は作れないため、真になる経路は「全部宣言した」
+    /// しか無い。
+    #[test]
+    fn a_task_is_finished_only_when_every_step_is() {
+        let mut task = a_task();
+        assert!(!task.is_fully_completed(), "何も宣言していない");
+
+        let ids: Vec<StepId> = task.steps().iter().map(Step::id).collect();
+        for (index, id) in ids.iter().enumerate() {
+            task.declare_completion(NOW, *id).expect("完了できる");
+            let last = index + 1 == ids.len();
+            assert_eq!(
+                task.is_fully_completed(),
+                last,
+                "最後の 1 個を宣言するまでは終わっていない"
+            );
+        }
     }
 }

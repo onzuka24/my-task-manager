@@ -3,8 +3,16 @@
 //! `LSUIElement` を立てたアプリは自前のメニューバーを表示しないため、ここで言う
 //! 「メニューバー項目」は `NSStatusItem` = Tauri の tray である。
 //!
-//! メニューの中身は 2 つだけである — 「終了」と、ホットキーの現在状態を示す非活性の
-//! 1 行。バッジ・件数・進捗・タスク一覧を出してはならない (AD-15、SPEC.md 非目標)。
+//! メニューの中身は 3 つだけである — 「開く」「終了」と、ホットキーの現在状態を示す
+//! 非活性の 1 行。バッジ・件数・進捗・タスク一覧を出してはならない (AD-15、SPEC.md
+//! 非目標)。
+//!
+//! **「開く」はホットキーの副の経路である。** ホットキーは唯一の呼び出し経路であり
+//! (CAP-1)、他のアプリに奪われれば**オーバーレイ**へ到達する手段が無くなる。状態行が
+//! 「登録できなかった」と述べられるのに、そこから開く手段が無いのでは報せが行き止まりに
+//! なる。**トグルではなく「開く」である** — メニューを開くには**オーバーレイ**から
+//! フォーカスが外れ、その時点で**オーバーレイ**は既に閉じている (AD-15 の一時的な面)。
+//! トグルにすれば、押すたびに「閉じる」に倒れて何も出ない。
 //!
 //! **`PredefinedMenuItem::quit` を使ってはならない。** `NSApplication terminate:` を
 //! 直接送り、`RunEvent::ExitRequested` を迂回するため、誤終了の阻止機構ごと素通りする。
@@ -17,6 +25,8 @@ use tauri::{AppHandle, Runtime};
 
 use crate::adapters::hotkey::HotkeyStatus;
 
+/// 「開く」項目の id。
+pub const OPEN_ITEM_ID: &str = "open";
 /// 「終了」項目の id。
 pub const QUIT_ITEM_ID: &str = "quit";
 /// ホットキーの状態を示す非活性の 1 行の id。
@@ -57,9 +67,12 @@ pub fn install<R: Runtime>(
         false,
         None::<&str>,
     )?;
+    // 「開く」にもアクセラレータを与えない。呼び出しの打鍵はグローバルホットキー
+    // 一つに集約されており (FR-1)、ここに二つ目を置けば案内と実際に効く打鍵が割れる。
+    let open = MenuItem::with_id(app, OPEN_ITEM_ID, "開く", true, None::<&str>)?;
     // 終了にもアクセラレータを与えない。Cmd+Q は無効化した対象そのものである。
     let quit = MenuItem::with_id(app, QUIT_ITEM_ID, "終了", true, None::<&str>)?;
-    let menu = Menu::with_items(app, &[&hotkey_line, &quit])?;
+    let menu = Menu::with_items(app, &[&hotkey_line, &open, &quit])?;
 
     TrayIconBuilder::new()
         .icon(Image::from_bytes(TEMPLATE_ICON)?)
@@ -67,13 +80,22 @@ pub fn install<R: Runtime>(
         .tooltip("My Task Manager")
         .menu(&menu)
         .show_menu_on_left_click(true)
-        .on_menu_event(|app, event| {
-            if event.id.as_ref() == QUIT_ITEM_ID {
+        .on_menu_event(|app, event| match event.id.as_ref() {
+            OPEN_ITEM_ID => {
+                log::info!("the overlay was asked for from the menu bar item");
+                // **トグルではなく表示である。** メニューを開いた時点で
+                // **オーバーレイ**はフォーカスを失って閉じている。
+                if let Err(error) = crate::adapters::presentation::show(app) {
+                    log::error!("failed to show the overlay from the menu bar item: {error}");
+                }
+            }
+            QUIT_ITEM_ID => {
                 log::info!("explicit quit requested from the menu bar item");
                 // AppHandle::exit は code: Some(0) で ExitRequested を発火する。
                 // 暗黙の終了 (code: None) だけを拒む第 3 層をここだけが通り抜ける。
                 app.exit(0);
             }
+            _ => {}
         })
         .build(app)
 }
@@ -110,9 +132,35 @@ mod tests {
         assert!(TEMPLATE_ICON.len() > 64, "空の素材に差し替わっていないこと");
     }
 
-    /// メニューの id は「終了」と状態行の 2 つだけであり、取り違えない。
+    /// メニューの id は「開く」「終了」と状態行の 3 つだけであり、取り違えない。
+    ///
+    /// **取り違えれば「開く」が常駐を終わらせる。** 二つの項目が同じ id を持てば、
+    /// 先に一致した分岐が両方の押下を受ける。
     #[test]
-    fn the_menu_has_exactly_two_distinct_ids() {
-        assert_ne!(QUIT_ITEM_ID, HOTKEY_STATUS_ITEM_ID);
+    fn the_menu_has_exactly_three_distinct_ids() {
+        let ids = [OPEN_ITEM_ID, QUIT_ITEM_ID, HOTKEY_STATUS_ITEM_ID];
+        for (index, id) in ids.iter().enumerate() {
+            for other in &ids[index + 1..] {
+                assert_ne!(id, other, "id が重なれば押下の意味が入れ替わる");
+            }
+        }
+    }
+
+    /// 「開く」がメニューを組み立てる側にも、押下を捌く側にも書かれていること。
+    ///
+    /// どちらか片方が消えても型検査は通る — 項目だけが残れば押しても何も起きず、
+    /// 分岐だけが残れば項目がどこにも現れない。**ホットキーが死んだときの副の経路が
+    /// これである以上、静かに失われてはならない。**
+    #[test]
+    fn the_open_item_is_still_wired_in_the_source() {
+        let source = include_str!("mod.rs");
+        assert!(
+            source.contains("MenuItem::with_id(app, OPEN_ITEM_ID"),
+            "「開く」の項目が組み立てから消えている"
+        );
+        assert!(
+            source.contains("presentation::show(app)"),
+            "「開く」の押下がオーバーレイの表示に繋がっていない"
+        );
     }
 }
