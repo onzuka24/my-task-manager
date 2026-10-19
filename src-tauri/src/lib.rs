@@ -373,7 +373,9 @@ fn start_ticking<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
                 continue;
             }
 
-            log::info!("the rest threshold was reached; raising an intervention");
+            // 休息の介入 (休息閾値) と復帰の介入 (休息の長さ) のどちらであるかは、パネルが
+            // スナップショットで読む (AD-3)。ここは出すだけである。
+            log::info!("an intervention is due; raising it");
             let raiser = handle.clone();
             if let Err(error) = handle.run_on_main_thread(move || {
                 if let Err(error) = intervention::raise(&raiser) {

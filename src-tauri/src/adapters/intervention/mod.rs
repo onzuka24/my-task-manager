@@ -36,7 +36,7 @@ use std::sync::{Mutex, MutexGuard};
 use tauri::{AppHandle, Manager, Runtime, WebviewWindow};
 
 use crate::adapters::hotkey;
-use crate::domain::rest::InterventionChoice;
+use crate::domain::rest::{InterventionChoice, InterventionKind};
 use crate::domain::state::Core;
 
 /// 介入パネルのウィンドウラベル。tauri.conf.json の `app.windows[].label` と一致する。
@@ -392,30 +392,86 @@ pub fn raise<R: Runtime>(app: &AppHandle<R>) -> Result<(), InterventionError> {
 /// 解除がプラグインの錠へ再入し、メインスレッドが停止する。パネルの操作はここから
 /// メインスレッドへ回す。
 ///
+/// # 応答の後に起きること
+///
+/// - **現在地**が動きうる応答 ([`InterventionChoice::Rest`] — 休息に入る / 休息を終える)
+///   では `current_position_changed` を発行する。オーバーレイの既定表示は「休息中」を
+///   描き分けるため、取り直しの契機が要る (AD-3)。ホットキー経由の応答もここを通る。
+/// - 復帰の**介入**で「休息を終える」が選ばれたら、**オーバーレイを開く**。利用者が
+///   明示的に選んだ直後であり、戻った先の**次の一手**を FR-8 の形で見せる。既に自分で
+///   戻っていた場合も開く — 選んだ以上、戻る先を見たいはずである。
+///
 /// # Errors
 ///
-/// **休息**への遷移を永続化できなかったとき。そのとき**状態は変わらず、介入も閉じない**
-/// (I/O マトリクス「休息に入る」)。
-pub fn answer<R: Runtime>(app: &AppHandle<R>, choice: InterventionChoice) -> Result<bool, String> {
+/// **現在地**の遷移を永続化できなかったとき。そのとき**状態は変わらず、介入も閉じない**
+/// (I/O マトリクス「休息に入る」「休息を終える」)。
+pub fn answer<R: Runtime>(
+    app: &AppHandle<R>,
+    choice: InterventionChoice,
+) -> Result<Option<InterventionKind>, String> {
     let Some(core) = app.try_state::<Core>() else {
         return Err("保存された状態を読み込めていない。介入に応答できない。".to_string());
     };
 
-    let answered = core
+    let Some(kind) = core
         .answer_intervention(choice)
-        .map_err(|error| error.to_string())?;
-    if !answered {
+        .map_err(|error| error.to_string())?
+    else {
         log::info!("an answer arrived with no intervention on screen; nothing was done");
-        return Ok(false);
-    }
+        return Ok(None);
+    };
 
     // **解除と非表示は応答が確定した後である。** 先に消すと、書き込みに失敗した応答の
     // ためにパネルだけが消える。
     hotkey::unregister_response(app);
     hide_on_main_thread(app);
 
-    log::info!("the intervention was answered ({choice:?})");
-    Ok(true)
+    let after = after_answer(kind, choice);
+    if after.announce_position {
+        crate::announce_current_position_changed(app);
+    }
+    if after.open_overlay {
+        show_overlay_on_main_thread(app);
+    }
+
+    log::info!("the intervention was answered ({kind:?}, {choice:?})");
+    Ok(Some(kind))
+}
+
+/// 応答が受け付けられた後に提示層が行うこと。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AfterAnswer {
+    /// `current_position_changed` を発行するか — **現在地**が動きうる応答 (休息に入る /
+    /// 休息を終える) である。
+    pub announce_position: bool,
+    /// オーバーレイを開くか — 復帰の**介入**で「休息を終える」を選んだときだけである。
+    pub open_overlay: bool,
+}
+
+/// **応答の後に何をするかを決める純粋関数。**
+///
+/// 休息の**介入**の応答でオーバーレイを開かない — 「休息に入る」の後に作業の面を
+/// 突きつけるのは逆向きであり、「猶予」は作業を続けるという選択である。どちらも
+/// 入力先を奪うだけになる (AD-6)。「もう少し休む」は**現在地**を動かさない。
+#[must_use]
+pub fn after_answer(kind: InterventionKind, choice: InterventionChoice) -> AfterAnswer {
+    let moves_position = choice == InterventionChoice::Rest;
+    AfterAnswer {
+        announce_position: moves_position,
+        open_overlay: moves_position && kind == InterventionKind::Return,
+    }
+}
+
+/// オーバーレイを開く。**ウィンドウはメインスレッドからしか触れない。**
+fn show_overlay_on_main_thread<R: Runtime>(app: &AppHandle<R>) {
+    let handle = app.clone();
+    if let Err(error) = app.run_on_main_thread(move || {
+        if let Err(error) = crate::adapters::presentation::show(&handle) {
+            log::error!("failed to open the overlay after the rest ended: {error}");
+        }
+    }) {
+        log::error!("failed to hand the overlay to the main thread: {error}");
+    }
 }
 
 /// [`answer`] を別のスレッドで行う。**ホットキーのハンドラ専用である** (AD-7)。
@@ -455,6 +511,48 @@ mod tests {
             INTERVENTION_LABEL,
             crate::adapters::presentation::OVERLAY_LABEL
         );
+    }
+
+    /// 応答の後に行うことの全表。**オーバーレイを開くのは「休息を終える」だけであり、
+    /// 現在地の報せは現在地が動きうる応答だけである。**
+    #[test]
+    fn what_follows_each_answer() {
+        let table = [
+            (
+                InterventionKind::Rest,
+                InterventionChoice::Rest,
+                true,
+                false,
+            ),
+            (
+                InterventionKind::Rest,
+                InterventionChoice::Grace,
+                false,
+                false,
+            ),
+            (
+                InterventionKind::Return,
+                InterventionChoice::Rest,
+                true,
+                true,
+            ),
+            (
+                InterventionKind::Return,
+                InterventionChoice::Grace,
+                false,
+                false,
+            ),
+        ];
+        for (kind, choice, announce_position, open_overlay) in table {
+            assert_eq!(
+                after_answer(kind, choice),
+                AfterAnswer {
+                    announce_position,
+                    open_overlay
+                },
+                "{kind:?} × {choice:?}"
+            );
+        }
     }
 
     /// 既に出ているなら出し直さない。既に隠れているなら引っ込め直さない。

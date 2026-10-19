@@ -16,7 +16,10 @@
 use std::sync::{Mutex, MutexGuard};
 
 use super::position::CurrentPosition;
-use super::rest::{self, Decision, Intervention, InterventionChoice, RestSettings, Tick};
+use super::rest::{
+    self, Decision, Intervention, InterventionChoice, InterventionKind, RestSettings, ReturnTick,
+    Tick,
+};
 use super::setting::Setting;
 use super::switch::SwitchRecord;
 use super::task::{InterruptionNote, Step, StepId, Task, TaskId};
@@ -49,6 +52,16 @@ pub struct CoreState {
     grace_until: Option<Timestamp>,
     /// 直前の刻みの時刻。**時計の飛び (スリープ) はこことの差で測る** (AD-8)。
     last_tick: Timestamp,
+    /// **休息**に入った時刻。**永続化しない** (AD-2)。**休息**中でなければ `None`。
+    ///
+    /// 復帰の**介入**はここから**休息の長さ**が経ったときに出る。スキーマを移行して
+    /// まで持つ値ではない — 失われれば ([`Core::restore`]) 起動時刻を開始とみなし、
+    /// 出るのが遅れるだけである。
+    rest_since: Option<Timestamp>,
+    /// 「もう少し休む」の後に復帰の**介入**を出し直す時刻。**永続化しない** (AD-2)。
+    ///
+    /// [`Self::grace_until`] の**休息**側の対である。
+    return_until: Option<Timestamp>,
 }
 
 impl Default for CoreState {
@@ -61,6 +74,8 @@ impl Default for CoreState {
             intervention: None,
             grace_until: None,
             last_tick: Timestamp::MIN,
+            rest_since: None,
+            return_until: None,
         }
     }
 }
@@ -127,6 +142,31 @@ impl CoreState {
     #[must_use]
     pub const fn is_resting(&self) -> bool {
         matches!(self.current_position, CurrentPosition::Inactive { .. })
+    }
+
+    /// **休息**の開始時刻と復帰の出直し期限を、**現在地**に合わせる。
+    ///
+    /// **休息**中でなければ両方を捨てる。**休息**中なのに開始時刻が無ければ `now` を
+    /// 開始とみなす — **休息**へ入る経路 ([`Core::begin_rest`] / 介入の応答) は開始を
+    /// 自ら記録するが、それ以外の経路で**非活性**になっても復帰の**介入**が黙らない
+    /// ための保険である。
+    fn follow_rest(&mut self, now: Timestamp) {
+        if self.is_resting() {
+            if self.rest_since.is_none() {
+                self.rest_since = Some(now);
+            }
+        } else {
+            self.rest_since = None;
+            self.return_until = None;
+        }
+    }
+
+    /// **休息**に入ったことを記録する。開始はいまであり、出直しの約束は残さない。
+    fn enter_rest(&mut self, now: Timestamp) {
+        self.rest_since = Some(now);
+        self.return_until = None;
+        // **休息**に入った以上、**猶予**の出直しの約束は残さない。
+        self.grace_until = None;
     }
 }
 
@@ -218,6 +258,11 @@ impl Core {
         // 時間**が黙ってリセットされる。プロセスが走っていなかった間の扱いは v1 の
         // 対象外であり、[`rest::decide`] が見るのは走っている間の飛びだけである。
         let last_tick = clock.now();
+        // **休息の開始時刻は永続化しない** (AD-2)。起動時に**休息**中なら、起動時刻を
+        // 開始とみなす — 常駐が走っていなかった間を数えれば、起動した瞬間に復帰の
+        // **介入**が出る。
+        let rest_since =
+            matches!(current_position, CurrentPosition::Inactive { .. }).then_some(last_tick);
         Ok(Self {
             state: Mutex::new(CoreState {
                 tasks,
@@ -227,6 +272,8 @@ impl Core {
                 intervention: None,
                 grace_until: None,
                 last_tick,
+                rest_since,
+                return_until: None,
             }),
             clock,
             storage,
@@ -712,6 +759,7 @@ impl Core {
     pub fn tick(&self) -> Result<TickEffect, CoreError> {
         let mut state = self.lock();
         let now = self.clock.now();
+        state.follow_rest(now);
 
         let decision = rest::decide(&Tick {
             position: state.current_position,
@@ -732,55 +780,93 @@ impl Core {
         state.last_tick = now;
         state.grace_until = decision.grace_until;
         if decision.raise {
-            state.intervention = Some(Intervention::raised_at(now));
+            state.intervention = Some(Intervention::raised(InterventionKind::Rest, now));
+            return Ok(TickEffect { raised: true });
         }
-        Ok(TickEffect {
-            raised: decision.raise,
-        })
+
+        // **復帰の介入** — **休息**中だけを見る。[`rest::decide`] は**非活性**では何も
+        // 発しないため、二つが同じ刻みで両方発することは無い。
+        let returning = rest::decide_return(&ReturnTick {
+            resting: state.is_resting(),
+            rest_since: state.rest_since,
+            now,
+            settings: state.rest_settings(),
+            return_until: state.return_until,
+            // **表示中なら後発は待つ** (AD-7)。
+            showing: state.intervention.is_some(),
+        });
+        if returning {
+            state.return_until = None;
+            state.intervention = Some(Intervention::raised(InterventionKind::Return, now));
+        }
+        Ok(TickEffect { raised: returning })
     }
 
     /// **介入への応答** (CAP-10 / FR-15)。**介入を閉じる唯一の経路である** (AD-7)。
+    ///
+    /// 休息の**介入** ([`InterventionKind::Rest`]):
     ///
     /// - [`InterventionChoice::Rest`] — **現在地**は値を保ったまま**非活性**になり、
     ///   計数が止まる (FR-6)。
     /// - [`InterventionChoice::Grace`] — **現在地**は**活性**のまま、**猶予**の後に
     ///   出直す。**上限は無い** (spec Design Notes)。
     ///
+    /// 復帰の**介入** ([`InterventionKind::Return`]):
+    ///
+    /// - [`InterventionChoice::Rest`] — 「休息を終える」。**現在地**は**活性**へ戻り、
+    ///   **連続作業時間**はそこから数え直される ([`Self::end_rest`] と同じ遷移)。既に
+    ///   自分で戻っていれば何も書かない。
+    /// - [`InterventionChoice::Grace`] — 「もう少し休む」。**休息**は続き、**休息の長さ**
+    ///   の後に出直す。**上限は無い**。既に自分で戻っていれば何も予約しない。
+    ///
     /// # 戻り値
     ///
-    /// 応答すべき**介入**が表示されていたか。表示されていなければ `false` であり、
-    /// **何も起きない** — ホットキーの二重発火や、応答と同時に届いた別経路の応答が
-    /// **現在地**を二度非活性にすることを防ぐ。
+    /// 応答した**介入**の種類。表示されていなければ `None` であり、**何も起きない** —
+    /// ホットキーの二重発火や、応答と同時に届いた別経路の応答が**現在地**を二度動かす
+    /// ことを防ぐ。
     ///
     /// # Errors
     ///
-    /// **休息**への遷移を永続化できなかったとき。そのとき**状態は何も変わらず、介入も
-    /// 閉じない** (I/O マトリクス「休息に入る」)。閉じてしまえば、選んだはずの休息が
-    /// どこにも残らないまま画面から消える。
-    pub fn answer_intervention(&self, choice: InterventionChoice) -> Result<bool, CoreError> {
+    /// **現在地**の遷移を永続化できなかったとき。そのとき**状態は何も変わらず、介入も
+    /// 閉じない** (I/O マトリクス「休息に入る」「休息を終える」)。閉じてしまえば、
+    /// 選んだはずの遷移がどこにも残らないまま画面から消える。
+    pub fn answer_intervention(
+        &self,
+        choice: InterventionChoice,
+    ) -> Result<Option<InterventionKind>, CoreError> {
         let mut state = self.lock();
-        if state.intervention.is_none() {
-            return Ok(false);
-        }
+        let Some(shown) = state.intervention else {
+            return Ok(None);
+        };
         let now = self.clock.now();
 
-        match choice {
-            InterventionChoice::Rest => {
+        match (shown.kind(), choice) {
+            (InterventionKind::Rest, InterventionChoice::Rest) => {
                 let next = state.current_position.deactivate();
                 if next != state.current_position {
                     self.storage.apply(&Commit::of_current_position(next))?;
                     state.current_position = next;
+                    state.enter_rest(now);
                 }
-                // **休息**に入った以上、出直しの約束は残さない。
-                state.grace_until = None;
             }
-            InterventionChoice::Grace => {
+            (InterventionKind::Rest, InterventionChoice::Grace) => {
                 state.grace_until = Some(after(now, state.rest_settings().grace_period_millis()));
+            }
+            (InterventionKind::Return, InterventionChoice::Rest) => {
+                // **表示中に自分で戻っていれば、二重には何も起きない。**
+                self.leave_rest(&mut state, now)?;
+            }
+            (InterventionKind::Return, InterventionChoice::Grace) => {
+                // **休息**中でなければ何も予約しない — 戻った後に「休む」の約束が残る。
+                if state.is_resting() {
+                    state.return_until =
+                        Some(after(now, state.rest_settings().rest_length_millis()));
+                }
             }
         }
 
         state.intervention = None;
-        Ok(true)
+        Ok(Some(shown.kind()))
     }
 
     /// **介入を取り下げる** (AD-7)。提示そのものに失敗したときの経路である。
@@ -792,11 +878,20 @@ impl Core {
     /// **応答ではない。** 利用者は何も選んでおらず、**現在地**にも触れない。
     pub fn withdraw_intervention(&self) -> bool {
         let mut state = self.lock();
-        if state.intervention.take().is_none() {
+        let Some(withdrawn) = state.intervention.take() else {
             return false;
-        }
+        };
         let now = self.clock.now();
-        state.grace_until = Some(after(now, state.rest_settings().grace_period_millis()));
+        let settings = state.rest_settings();
+        match withdrawn.kind() {
+            InterventionKind::Rest => {
+                state.grace_until = Some(after(now, settings.grace_period_millis()));
+            }
+            // 復帰の**介入**は**休息の長さ**の後に出直す (「もう少し休む」と同じ間合い)。
+            InterventionKind::Return => {
+                state.return_until = Some(after(now, settings.rest_length_millis()));
+            }
+        }
         true
     }
 
@@ -838,8 +933,9 @@ impl Core {
         self.storage.apply(&Commit::of_current_position(next))?;
         state.current_position = next;
         // **休息**に入った以上、出直しの約束は残さない
-        // ([`Self::answer_intervention`] の `Rest` と同じ)。
-        state.grace_until = None;
+        // ([`Self::answer_intervention`] の `Rest` と同じ)。開始はいまであり、復帰の
+        // **介入**はここから数える。
+        state.enter_rest(self.clock.now());
         Ok(true)
     }
 
@@ -857,13 +953,25 @@ impl Core {
     /// 永続化に失敗したとき。状態は変わらない。
     pub fn end_rest(&self) -> Result<bool, CoreError> {
         let mut state = self.lock();
+        let now = self.clock.now();
+        // **表示中の介入は取り下げない** (AD-7) — 後から応答されても
+        // [`Self::answer_intervention`] は二重には何も起こさない。
+        self.leave_rest(&mut state, now)
+    }
+
+    /// **休息**を終える遷移 ([`Self::end_rest`] と復帰の**介入**の「休息を終える」が
+    /// 共有する)。**活性**へ戻し、**猶予**と復帰の約束を捨てる。
+    ///
+    /// **休息**中でなければ何も書かず `false` を返す。永続化に失敗すれば状態は変わらない。
+    fn leave_rest(&self, state: &mut CoreState, now: Timestamp) -> Result<bool, CoreError> {
         if !state.is_resting() {
             return Ok(false);
         }
-        let next = state.current_position.activate(self.clock.now());
+        let next = state.current_position.activate(now);
         self.storage.apply(&Commit::of_current_position(next))?;
         state.current_position = next;
         state.grace_until = None;
+        state.follow_rest(now);
         Ok(true)
     }
 
@@ -896,7 +1004,8 @@ impl Core {
         transition: impl FnOnce(CurrentPosition, super::Timestamp) -> CurrentPosition,
     ) -> Result<(), CoreError> {
         let mut state = self.lock();
-        let next = transition(state.current_position, self.clock.now());
+        let now = self.clock.now();
+        let next = transition(state.current_position, now);
         if next == state.current_position {
             // 書くものが無い。無変更のコミットを投げると、失敗しうる I/O が増えるだけで
             // 得るものが無い。
@@ -904,6 +1013,7 @@ impl Core {
         }
         self.storage.apply(&Commit::of_current_position(next))?;
         state.current_position = next;
+        state.follow_rest(now);
         Ok(())
     }
 
@@ -986,7 +1096,8 @@ impl Core {
 /// それをどう見せるかはアダプタの仕事である (AD-1)。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TickEffect {
-    /// **介入**を発したか。真ならアダプタがパネルを出し、応答のホットキーを登録する。
+    /// **介入** (休息・復帰のいずれか) を発したか。真ならアダプタがパネルを出し、
+    /// 応答のホットキーを登録する。種類はパネルがスナップショットで読む (AD-3)。
     pub raised: bool,
 }
 
@@ -2314,8 +2425,8 @@ mod tests {
     // --- 休息介入 (CAP-10 / FR-15) ---------------------------------------------
 
     use crate::domain::rest::{
-        Intervention, InterventionChoice, RestSettings, GRACE_PERIOD_KEY, REST_THRESHOLD_KEY,
-        TICK_INTERVAL_MILLIS,
+        Intervention, InterventionChoice, InterventionKind, RestSettings, GRACE_PERIOD_KEY,
+        REST_LENGTH_KEY, REST_THRESHOLD_KEY, TICK_INTERVAL_MILLIS,
     };
     use crate::domain::setting::Setting;
 
@@ -2393,7 +2504,8 @@ mod tests {
 
         assert!(core
             .answer_intervention(InterventionChoice::Rest)
-            .expect("応答できる"));
+            .expect("応答できる")
+            .is_some());
 
         let position = core.current_position();
         assert!(!position.is_active(), "非活性になる");
@@ -2409,7 +2521,10 @@ mod tests {
         assert_eq!(storage.commits().len(), commits + 1, "1 トランザクション");
     }
 
-    /// 受け入れ条件「休息中に 60 分経過 → 介入は発せられない」。
+    /// 受け入れ条件「休息中に 60 分経過 → 休息の介入は発せられない」。
+    ///
+    /// **休息**中に出うるのは復帰の**介入**だけである。それも「もう少し休む」で
+    /// 退けながら 60 分を過ごし、休息の**介入**が一度も出ないことを見る。
     #[test]
     fn no_intervention_is_raised_while_resting() {
         let (core, _, clock) = a_core_at_work();
@@ -2417,10 +2532,19 @@ mod tests {
         core.answer_intervention(InterventionChoice::Rest)
             .expect("応答できる");
 
-        for _ in 0..6 {
-            assert!(!tick_for(&core, &clock, 10 * MINUTE), "休息中は計数しない");
+        for _ in 0..6 * 60 {
+            tick_once(&core, &clock);
+            assert_ne!(
+                shown_kind(&core),
+                Some(InterventionKind::Rest),
+                "休息中は計数しない"
+            );
+            if shown_kind(&core) == Some(InterventionKind::Return) {
+                core.answer_intervention(InterventionChoice::Grace)
+                    .expect("応答できる");
+            }
         }
-        assert!(core.snapshot().intervention().is_none());
+        assert!(core.snapshot().is_resting());
     }
 
     /// 受け入れ条件「休息中に終了を宣言 → 現在地が活性へ戻り、起点が更新される」。
@@ -2476,8 +2600,13 @@ mod tests {
         let (core, _, clock) = a_core_at_work();
         assert!(core.begin_rest().expect("入れる"));
 
-        for _ in 0..6 {
-            assert!(!tick_for(&core, &clock, 10 * MINUTE), "休息中は計数しない");
+        for _ in 0..6 * 60 {
+            tick_once(&core, &clock);
+            assert_ne!(
+                shown_kind(&core),
+                Some(InterventionKind::Rest),
+                "休息中は計数しない"
+            );
         }
 
         let resumed_at = clock.now();
@@ -2527,7 +2656,8 @@ mod tests {
         let before = core.current_position();
         assert!(core
             .answer_intervention(InterventionChoice::Rest)
-            .expect("応答できる"));
+            .expect("応答できる")
+            .is_some());
         assert_eq!(core.current_position(), before);
     }
 
@@ -2549,7 +2679,8 @@ mod tests {
 
         assert!(core
             .answer_intervention(InterventionChoice::Grace)
-            .expect("応答できる"));
+            .expect("応答できる")
+            .is_some());
         assert!(core.current_position().is_active(), "現在地は活性のまま");
         assert!(core.snapshot().intervention().is_none());
 
@@ -2683,10 +2814,12 @@ mod tests {
 
         assert!(!core
             .answer_intervention(InterventionChoice::Rest)
-            .expect("失敗しない"));
+            .expect("失敗しない")
+            .is_some());
         assert!(!core
             .answer_intervention(InterventionChoice::Grace)
-            .expect("失敗しない"));
+            .expect("失敗しない")
+            .is_some());
         assert!(core.current_position().is_active());
         assert_eq!(storage.commits().len(), commits);
     }
@@ -2699,11 +2832,13 @@ mod tests {
 
         assert!(core
             .answer_intervention(InterventionChoice::Rest)
-            .expect("応答できる"));
+            .expect("応答できる")
+            .is_some());
         assert!(
             !core
                 .answer_intervention(InterventionChoice::Grace)
-                .expect("失敗しない"),
+                .expect("失敗しない")
+                .is_some(),
             "二つ目の応答は何も起こさない"
         );
         assert!(core.snapshot().is_resting(), "休息のままである");
@@ -2722,6 +2857,293 @@ mod tests {
 
         assert!(!tick_for(&core, &clock, 14 * MINUTE), "すぐには出直さない");
         assert!(tick_for(&core, &clock, MINUTE));
+    }
+
+    // --- 復帰の介入 ---------------------------------------------------------------
+
+    /// 表示中の**介入**の種類。
+    fn shown_kind(core: &Core) -> Option<InterventionKind> {
+        core.snapshot().intervention().map(|shown| shown.kind())
+    }
+
+    /// I/O マトリクス「復帰を促す」— 休息に入って 10 分で出る。**休息は終わらない。**
+    #[test]
+    fn the_return_intervention_comes_after_the_rest_length() {
+        let (core, _, clock) = a_core_at_work();
+        assert!(core.begin_rest().expect("入れる"));
+
+        assert!(
+            !tick_for(&core, &clock, 10 * MINUTE - TICK_INTERVAL_MILLIS),
+            "10 分に満たなければ出ない"
+        );
+        assert!(tick_once(&core, &clock), "10 分で出る");
+        assert_eq!(shown_kind(&core), Some(InterventionKind::Return));
+        assert!(
+            core.snapshot().is_resting(),
+            "時間が来ても休息は終わらない — 促すだけである (FR-15)"
+        );
+    }
+
+    /// I/O マトリクス「休息を終える」— **活性**へ戻り、**連続作業時間**を 0 から数え直す。
+    #[test]
+    fn ending_the_rest_from_the_panel_takes_up_the_work_again() {
+        let (core, storage, clock) = a_core_at_work();
+        let step_id = core.current_position().step_id();
+        assert!(core.begin_rest().expect("入れる"));
+        assert!(tick_for(&core, &clock, 10 * MINUTE));
+        let commits = storage.commits().len();
+
+        let answered = core
+            .answer_intervention(InterventionChoice::Rest)
+            .expect("応答できる");
+
+        assert_eq!(answered, Some(InterventionKind::Return));
+        let position = core.current_position();
+        assert!(position.is_active(), "活性へ戻る");
+        assert_eq!(position.step_id(), step_id, "戻る先は同じステップである");
+        assert_eq!(
+            position.activated_at(),
+            Some(clock.now()),
+            "非活性→活性の遷移で起点が更新される (AD-8)"
+        );
+        assert!(core.snapshot().intervention().is_none(), "パネルは閉じる");
+        assert_eq!(storage.commits().len(), commits + 1, "1 トランザクション");
+
+        assert!(
+            !tick_for(&core, &clock, 49 * MINUTE),
+            "連続作業時間は 0 から数え直されている"
+        );
+        assert!(tick_for(&core, &clock, MINUTE));
+        assert_eq!(shown_kind(&core), Some(InterventionKind::Rest));
+    }
+
+    /// I/O マトリクス「休息を終える」の失敗 — **状態を変えず、パネルも残す。**
+    #[test]
+    fn a_failed_return_changes_nothing_and_keeps_the_intervention() {
+        let (core, storage, clock) = a_core_at_work();
+        assert!(core.begin_rest().expect("入れる"));
+        assert!(tick_for(&core, &clock, 10 * MINUTE));
+        let before = core.current_position();
+
+        storage.set_failing(true);
+        let outcome = core.answer_intervention(InterventionChoice::Rest);
+
+        assert!(matches!(outcome, Err(CoreError::Storage(_))));
+        assert_eq!(core.current_position(), before, "休息のままである");
+        assert_eq!(shown_kind(&core), Some(InterventionKind::Return));
+    }
+
+    /// I/O マトリクス「もう少し休む」— 休息は続き、10 分後に再び出る。**何度でも。**
+    #[test]
+    fn more_rest_can_be_taken_without_limit() {
+        let (core, _, clock) = a_core_at_work();
+        assert!(core.begin_rest().expect("入れる"));
+        assert!(tick_for(&core, &clock, 10 * MINUTE));
+
+        for round in 0..5 {
+            assert_eq!(
+                core.answer_intervention(InterventionChoice::Grace)
+                    .expect("応答できる"),
+                Some(InterventionKind::Return)
+            );
+            assert!(core.snapshot().is_resting(), "休息は続く");
+            assert!(core.snapshot().intervention().is_none());
+            assert!(
+                !tick_for(&core, &clock, 10 * MINUTE - TICK_INTERVAL_MILLIS),
+                "{round} 回目: すぐには出直さない"
+            );
+            assert!(tick_once(&core, &clock), "{round} 回目: 10 分後に出直す");
+            assert_eq!(shown_kind(&core), Some(InterventionKind::Return));
+        }
+    }
+
+    /// I/O マトリクス「介入経由で休息」— 休息介入で休息に入っても、同じく出る。
+    #[test]
+    fn a_rest_taken_from_the_intervention_also_gets_a_return() {
+        let (core, _, clock) = a_core_at_work();
+        assert!(tick_for(&core, &clock, 50 * MINUTE));
+        assert_eq!(
+            core.answer_intervention(InterventionChoice::Rest)
+                .expect("応答できる"),
+            Some(InterventionKind::Rest)
+        );
+
+        assert!(!tick_for(&core, &clock, 10 * MINUTE - TICK_INTERVAL_MILLIS));
+        assert!(tick_once(&core, &clock));
+        assert_eq!(shown_kind(&core), Some(InterventionKind::Return));
+    }
+
+    /// I/O マトリクス「先に自分で戻る」— 出る前に休息を終えれば、復帰の介入は出ない。
+    #[test]
+    fn returning_first_cancels_the_return_intervention() {
+        let (core, _, clock) = a_core_at_work();
+        assert!(core.begin_rest().expect("入れる"));
+        assert!(!tick_for(&core, &clock, 5 * MINUTE));
+
+        assert!(core.end_rest().expect("終えられる"));
+
+        assert!(!tick_for(&core, &clock, 20 * MINUTE), "復帰の介入は出ない");
+        assert!(core.snapshot().intervention().is_none());
+    }
+
+    /// I/O マトリクス「表示中に自分で戻る」— パネルは残り、後から「休息を終える」を
+    /// 選んでも二重には何も起きない。
+    #[test]
+    fn ending_the_rest_after_returning_by_oneself_writes_nothing() {
+        let (core, storage, clock) = a_core_at_work();
+        assert!(core.begin_rest().expect("入れる"));
+        assert!(tick_for(&core, &clock, 10 * MINUTE));
+
+        assert!(core.end_rest().expect("終えられる"));
+        assert_eq!(
+            shown_kind(&core),
+            Some(InterventionKind::Return),
+            "パネルは残る (AD-7)"
+        );
+        let resumed = core.current_position();
+        let commits = storage.commits().len();
+
+        clock.advance(TICK_INTERVAL_MILLIS);
+        assert_eq!(
+            core.answer_intervention(InterventionChoice::Rest)
+                .expect("応答できる"),
+            Some(InterventionKind::Return),
+            "応答は受け付ける — アダプタはオーバーレイを開くだけである"
+        );
+        assert_eq!(core.current_position(), resumed, "起点は動かない");
+        assert_eq!(storage.commits().len(), commits, "何も書かない");
+        assert!(core.snapshot().intervention().is_none());
+    }
+
+    /// I/O マトリクス「表示中に自分で戻る」— 後から「もう少し休む」を選んでも何も
+    /// 予約されない。
+    #[test]
+    fn more_rest_after_returning_by_oneself_schedules_nothing() {
+        let (core, _, clock) = a_core_at_work();
+        assert!(core.begin_rest().expect("入れる"));
+        assert!(tick_for(&core, &clock, 10 * MINUTE));
+        assert!(core.end_rest().expect("終えられる"));
+
+        assert_eq!(
+            core.answer_intervention(InterventionChoice::Grace)
+                .expect("応答できる"),
+            Some(InterventionKind::Return)
+        );
+
+        let snapshot = core.snapshot();
+        assert!(snapshot.return_until.is_none(), "何も予約されない");
+        assert!(snapshot.rest_since.is_none());
+        assert!(snapshot.current_position().is_active());
+        assert!(!tick_for(&core, &clock, 20 * MINUTE));
+    }
+
+    /// I/O マトリクス「休息介入の表示中」— 休息介入が応答されるまで復帰の介入は出ない。
+    #[test]
+    fn the_return_intervention_waits_for_the_rest_intervention() {
+        let (core, _, clock) = a_core_at_work();
+        assert!(tick_for(&core, &clock, 50 * MINUTE));
+        let raised = core.snapshot().intervention().expect("出ている");
+
+        assert!(core.begin_rest().expect("入れる"));
+        assert!(!tick_for(&core, &clock, 15 * MINUTE), "後発は待つ (AD-7)");
+        assert_eq!(
+            core.snapshot().intervention(),
+            Some(raised),
+            "休息介入は差し替わらない"
+        );
+
+        assert_eq!(
+            core.answer_intervention(InterventionChoice::Rest)
+                .expect("応答できる"),
+            Some(InterventionKind::Rest)
+        );
+        assert!(tick_once(&core, &clock), "応答されれば次の刻みで出る");
+        assert_eq!(shown_kind(&core), Some(InterventionKind::Return));
+    }
+
+    /// I/O マトリクス「スリープ」— **スリープ中の時間も休息に含める。** 起床後の最初の
+    /// 刻みで出る。
+    #[test]
+    fn sleep_counts_towards_the_rest() {
+        let (core, _, clock) = a_core_at_work();
+        assert!(core.begin_rest().expect("入れる"));
+        assert!(!tick_for(&core, &clock, MINUTE));
+
+        clock.advance(30 * MINUTE);
+        assert!(core.tick().expect("刻める").raised, "起床後の最初の刻み");
+        assert_eq!(shown_kind(&core), Some(InterventionKind::Return));
+    }
+
+    /// I/O マトリクス「再起動」— **休息の開始時刻は永続化しない。** 起動時に休息中なら
+    /// 起動時刻を開始とみなし、起動から 10 分で出る。
+    #[test]
+    fn a_restart_while_resting_counts_from_the_launch() {
+        let (core, _, clock) = a_core_at_work();
+        assert!(core.begin_rest().expect("入れる"));
+        let saved = core.snapshot();
+
+        // 翌日の起動。
+        clock.advance(24 * 60 * MINUTE);
+        let storage = Arc::new(RecordingStorage {
+            restored: RestoredState {
+                tasks: saved.tasks().to_vec(),
+                current_position: saved.current_position(),
+                settings: Vec::new(),
+            },
+            ..RecordingStorage::default()
+        });
+        let restarted = core_with(storage, clock.clone());
+        assert!(restarted.snapshot().is_resting());
+        assert!(
+            restarted.snapshot().intervention().is_none(),
+            "起動した瞬間には出ない"
+        );
+
+        assert!(!tick_for(
+            &restarted,
+            &clock,
+            10 * MINUTE - TICK_INTERVAL_MILLIS
+        ));
+        assert!(tick_once(&restarted, &clock), "起動から 10 分で出る");
+        assert_eq!(shown_kind(&restarted), Some(InterventionKind::Return));
+    }
+
+    /// I/O マトリクス「設定」— `rest_length_seconds` = 300 なら 5 分で出る (AD-11)。
+    #[test]
+    fn a_stored_rest_length_is_honoured() {
+        let (core, _, clock) = a_core_at_work();
+        core.store_setting(Setting::new(REST_LENGTH_KEY, "300"))
+            .expect("書ける");
+        assert!(core.begin_rest().expect("入れる"));
+
+        assert!(!tick_for(&core, &clock, 5 * MINUTE - TICK_INTERVAL_MILLIS));
+        assert!(tick_once(&core, &clock), "5 分で出る");
+    }
+
+    /// 取り下げた復帰の介入は**休息の長さ**の後に出直す。**休息**には触れない。
+    #[test]
+    fn a_withdrawn_return_comes_back_after_the_rest_length() {
+        let (core, _, clock) = a_core_at_work();
+        assert!(core.begin_rest().expect("入れる"));
+        assert!(tick_for(&core, &clock, 10 * MINUTE));
+
+        assert!(core.withdraw_intervention());
+        assert!(core.snapshot().is_resting(), "休息には触れない");
+        assert!(!tick_for(&core, &clock, 10 * MINUTE - TICK_INTERVAL_MILLIS));
+        assert!(tick_once(&core, &clock));
+        assert_eq!(shown_kind(&core), Some(InterventionKind::Return));
+    }
+
+    /// 復帰の介入が出ている間も、休息介入は待つ。**同時に一つだけである** (AD-7)。
+    #[test]
+    fn the_rest_intervention_waits_for_the_return_intervention() {
+        let (core, _, clock) = a_core_at_work();
+        assert!(core.begin_rest().expect("入れる"));
+        assert!(tick_for(&core, &clock, 10 * MINUTE));
+        assert!(core.end_rest().expect("終えられる"));
+
+        assert!(!tick_for(&core, &clock, 60 * MINUTE), "後発は待つ");
+        assert_eq!(shown_kind(&core), Some(InterventionKind::Return));
     }
 
     /// 表示されていない**介入**は取り下げられない。
@@ -2852,8 +3274,11 @@ mod tests {
             "「活性のまま休息中」という状態が作られていない"
         );
         assert!(
-            !(snapshot.intervention().is_some() && snapshot.is_resting()),
-            "休息に入った以上、介入は残らない"
+            !(snapshot
+                .intervention()
+                .is_some_and(|shown| shown.kind() == InterventionKind::Rest)
+                && snapshot.is_resting()),
+            "休息に入った以上、休息の介入は残らない"
         );
     }
 

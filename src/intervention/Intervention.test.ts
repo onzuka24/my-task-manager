@@ -25,6 +25,7 @@ const SNAPSHOT = {
   },
   stateError: null,
   shown: true,
+  kind: 'rest',
 }
 
 type EventPluginInternals = { unregisterListener?: (event: string, id: number) => void }
@@ -33,6 +34,10 @@ let invoked: string[] = []
 let calls: { cmd: string; args: Record<string, unknown> }[] = []
 let snapshot: Record<string, unknown> = { ...SNAPSHOT }
 let answerOutcome = { answered: true }
+/** 真なら取得が失敗する。**IPC を張り替えずに**同じパネルで失敗させるための切り替え。 */
+let snapshotFails = false
+/** 値があれば取得はこれを返す (宙に浮かせる検査に使う)。 */
+let snapshotPending: Promise<unknown> | null = null
 let component: Record<string, unknown> | undefined
 
 function stubEventInternals(): void {
@@ -51,7 +56,11 @@ function installIPC(): void {
     (cmd, args) => {
       invoked.push(cmd)
       calls.push({ cmd, args: (args ?? {}) as Record<string, unknown> })
-      if (cmd === 'get_intervention_snapshot') return snapshot
+      if (cmd === 'get_intervention_snapshot') {
+        if (snapshotFails) throw new Error('常駐プロセスが応答しない')
+        if (snapshotPending) return snapshotPending
+        return snapshot
+      }
       if (cmd === 'answer_intervention') return answerOutcome
       return null
     },
@@ -94,6 +103,8 @@ beforeEach(async () => {
   calls = []
   snapshot = { ...SNAPSHOT }
   answerOutcome = { answered: true }
+  snapshotFails = false
+  snapshotPending = null
   mockWindows('intervention')
   installIPC()
   stubEventInternals()
@@ -232,7 +243,12 @@ test('介入が発せられた報せでスナップショットを取り直す (
 })
 
 test('コアが読めていなければ、面は出したうえで理由を述べる', async () => {
-  snapshot = { hotkey: null, stateError: '保存された状態を読み込めていない。', shown: false }
+  snapshot = {
+    hotkey: null,
+    stateError: '保存された状態を読み込めていない。',
+    shown: false,
+    kind: null,
+  }
   await emit('intervention_raised', null)
   await settle()
 
@@ -264,3 +280,112 @@ test('スナップショットを取れなくても空白のまま出さない',
   // **面は消えない。** 理由も示さずに居座るより、理由を添えて居座るほうが正しい。
   expect(choices()).toHaveLength(2)
 }, 10_000)
+
+// --- 復帰の介入 -------------------------------------------------------------
+
+async function raiseReturn(): Promise<void> {
+  snapshot = { ...SNAPSHOT, kind: 'return' }
+  await emit('intervention_raised', null)
+  await settle()
+}
+
+test('復帰の介入は「休息を終える」「もう少し休む」の二択を示す', async () => {
+  await raiseReturn()
+
+  expect(choices()).toHaveLength(2)
+  const labels = choices().map((button) => button.querySelector('.label')?.textContent?.trim())
+  expect(labels).toEqual(['休息を終える', 'もう少し休む'])
+  expect(document.querySelector('.prompt')?.textContent).toContain('戻る頃合い')
+})
+
+test('復帰の介入も同じ二つの打鍵を案内する (AD-7)', async () => {
+  await raiseReturn()
+
+  const text = document.body.textContent ?? ''
+  expect(text).toContain('Control + Option + R')
+  expect(text).toContain('Control + Option + G')
+})
+
+test('「休息を終える」は rest、「もう少し休む」は grace を送る', async () => {
+  await raiseReturn()
+
+  choiceLabeled('休息を終える').click()
+  await settle()
+  expect(argsOf('answer_intervention')).toEqual({ request: { choice: 'rest' } })
+
+  calls = []
+  choiceLabeled('もう少し休む').click()
+  await settle()
+  expect(argsOf('answer_intervention')).toEqual({ request: { choice: 'grace' } })
+})
+
+test('復帰の介入は数値を一つも描かない (spec Never / AD-15)', async () => {
+  await raiseReturn()
+
+  const text = (document.body.textContent ?? '').replaceAll(/Control \+ Option \+ [RG]/g, '')
+  expect(text).not.toMatch(/[0-9０-９]/)
+  // 「自分」「十分」のような語は禁じない。数 (算用・漢数字) に続く分・秒を禁じる。
+  expect(text).not.toMatch(/[0-9０-９〇一二三四五六七八九十百]+\s*(分|秒)/)
+  for (const forbidden of ['残り', '経過', '%']) {
+    expect(text).not.toContain(forbidden)
+  }
+})
+
+test('復帰の介入でもパネルは自ら隠れず、オーバーレイも自ら開かない — どちらもコアが行う', async () => {
+  await raiseReturn()
+
+  choiceLabeled('休息を終える').click()
+  await settle()
+
+  // オーバーレイを開閉するコマンド (`hide_overlay` / `mark_overlay_hidden` など) を
+  // パネルは一つも呼ばない。開くのはコアである。
+  expect(invoked.filter((cmd) => cmd.includes('overlay'))).toEqual([])
+  expect(invoked.filter((cmd) => cmd === 'answer_intervention')).toHaveLength(1)
+})
+
+const MEANINGFUL_LABELS = ['休息に入る', '猶予の後に出直す', '休息を終える', 'もう少し休む']
+
+function labels(): string[] {
+  return choices().map((button) => button.querySelector('.label')?.textContent?.trim() ?? '')
+}
+
+test('種類が分からなければ、どちらの意味も主張しない', async () => {
+  snapshot = { ...SNAPSHOT, kind: null }
+  await emit('intervention_raised', null)
+  await settle()
+
+  expect(choices()).toHaveLength(2)
+  for (const label of MEANINGFUL_LABELS) expect(labels()).not.toContain(label)
+  expect(labels()).toEqual(['Control + Option + R', 'Control + Option + G'])
+})
+
+test('復帰の介入に応答した後、次の介入の取得に失敗しても前の種類の文言を持ち越さない', async () => {
+  await raiseReturn()
+  choiceLabeled('休息を終える').click()
+  await settle()
+
+  // 同じパネルのまま、次の介入の取得だけが失敗する。
+  snapshotFails = true
+  await emit('intervention_raised', null)
+  // 再試行を使い切るまで待つ (10 回 × 100ms)。
+  await settle(1300)
+
+  expect(noticeText()).toContain('常駐プロセスが応答しない')
+  expect(choices()).toHaveLength(2)
+  for (const label of MEANINGFUL_LABELS) expect(labels()).not.toContain(label)
+}, 10_000)
+
+test('介入の報せを受けたら、取り直しが済むまで前の種類の文言を出さない', async () => {
+  await raiseReturn()
+  expect(labels()).toContain('休息を終える')
+
+  let release: (value: unknown) => void = () => {}
+  snapshotPending = new Promise((resolve) => (release = resolve))
+  await emit('intervention_raised', null)
+  await settle()
+
+  for (const label of MEANINGFUL_LABELS) expect(labels()).not.toContain(label)
+  release({ ...SNAPSHOT, kind: 'rest' })
+  await settle()
+  expect(labels()).toEqual(['休息に入る', '猶予の後に出直す'])
+})
