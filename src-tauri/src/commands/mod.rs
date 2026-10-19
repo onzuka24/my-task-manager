@@ -36,7 +36,7 @@ use tauri::{AppHandle, Manager, Runtime, State};
 
 use crate::adapters::hotkey::{HotkeyStatus, ResponseHotkeyStatus};
 use crate::adapters::{intervention, presentation};
-use crate::domain::rest::InterventionChoice;
+use crate::domain::rest::{InterventionChoice, InterventionKind};
 use crate::domain::state::{Core, CoreState};
 use crate::domain::task::{InterruptionNote, Step, StepId, Task, TaskId};
 
@@ -1235,6 +1235,10 @@ pub struct InterventionSnapshot {
     /// 偽であれば、応答しても何も起きない。パネルだけが残っている状態を利用者に
     /// 伝えるための欄である。
     pub shown: bool,
+    /// 表示中の**介入**の種類。パネルはこれで文言と二択のラベルを出し分ける。
+    ///
+    /// 表示中でなければ `None`。そのときパネルは休息の**介入**の文言で描く。
+    pub kind: Option<InterventionKind>,
 }
 
 /// **コア状態を介入パネルのスナップショットへ落とす純粋関数** ([`snapshot_of`] と同じ流儀)。
@@ -1247,12 +1251,15 @@ fn intervention_snapshot_of(
             hotkey,
             state_error: Some(CORE_MISSING.to_string()),
             shown: false,
+            kind: None,
         };
     };
+    let shown = state.intervention();
     InterventionSnapshot {
         hotkey,
         state_error: None,
-        shown: state.intervention().is_some(),
+        shown: shown.is_some(),
+        kind: shown.map(|intervention| intervention.kind()),
     }
 }
 
@@ -1328,20 +1335,18 @@ pub fn get_intervention_snapshot<R: Runtime>(
 ///
 /// # Errors
 ///
-/// コアが `manage` されていないとき、または**休息**への遷移を永続化できなかったとき。
-/// **いずれの場合も状態は変わらず、介入も閉じない。**
+/// コアが `manage` されていないとき、または**休息**への遷移 (休息に入る) か**休息**の
+/// 終了 (休息を終える) を永続化できなかったとき。**いずれの場合も状態は変わらず、介入も
+/// 閉じない。**
 #[tauri::command]
 pub fn answer_intervention<R: Runtime>(
     app: AppHandle<R>,
     request: AnswerInterventionRequest,
 ) -> Result<AnswerInterventionOutcome, String> {
-    let answered = intervention::answer(&app, request.choice)?;
-
-    // **現在地**が**非活性**になったのは状態の変化である。既定表示は「休息中」を
-    // 描くため、取り直しの契機を送る (AD-3)。
-    if answered && request.choice == InterventionChoice::Rest {
-        crate::announce_current_position_changed(&app);
-    }
+    // **現在地**の変化の報せ (`current_position_changed`) と、「休息を終える」の後に
+    // オーバーレイを開くことは [`intervention::answer`] が行う — ホットキー経由の応答も
+    // 同じ経路を通るためである。
+    let answered = intervention::answer(&app, request.choice)?.is_some();
     Ok(AnswerInterventionOutcome { answered })
 }
 
@@ -1538,6 +1543,39 @@ mod tests {
             .get("stateError")
             .is_some_and(serde_json::Value::is_null));
         assert!(json.get("shown").is_some_and(|v| v.is_boolean()));
+        assert!(
+            json.get("kind").is_some_and(serde_json::Value::is_null),
+            "`kind` は表示中でなければ null である"
+        );
+    }
+
+    /// 表示中の**介入**の種類が `kind` に載る。綴りは Intervention.svelte が読む値である。
+    #[test]
+    fn the_intervention_snapshot_names_the_return_intervention() {
+        let clock = FixedClock::at(1_789_000_000_000);
+        let core = Core::restore(Box::new(clock.clone()), Box::new(AcceptingStorage))
+            .expect("空の状態は復元できる");
+        let task_id = core
+            .create_task("原稿", contents(&["下書き", "推敲"]))
+            .expect("作れる");
+        let first = core.snapshot().task(task_id).expect("ある").steps()[0].id();
+        core.move_current_position(first).expect("移せる");
+        core.begin_rest().expect("休息へ入れる");
+        // **実際の刻みの間隔で進める。** 時計だけ飛ばしても出るが、それはスリープの経路である。
+        let mut raised = false;
+        for _ in 0..60 {
+            clock.advance(crate::domain::rest::TICK_INTERVAL_MILLIS);
+            raised |= core.tick().expect("刻める").raised;
+        }
+        assert!(raised, "休息の長さで復帰の介入が出る");
+
+        let json = serde_json::to_value(intervention_snapshot_of(
+            Some(ResponseHotkeyStatus::registered()),
+            Some(&core.snapshot()),
+        ))
+        .expect("直列化できる");
+        assert_eq!(json.get("kind"), Some(&serde_json::json!("return")));
+        assert_eq!(json.get("shown"), Some(&serde_json::json!(true)));
     }
 
     /// **介入パネルの境界に、経過時間も残り時間も閾値も無い** (spec Never / AD-15)。
@@ -1558,8 +1596,8 @@ mod tests {
             .collect();
         assert_eq!(
             fields,
-            vec!["hotkey", "shown", "stateError"],
-            "残り時間・経過時間・閾値・猶予のいずれの欄も足さない (AD-15)"
+            vec!["hotkey", "kind", "shown", "stateError"],
+            "残り時間・経過時間・閾値・猶予・休息の長さのいずれの欄も足さない (AD-15)"
         );
     }
 

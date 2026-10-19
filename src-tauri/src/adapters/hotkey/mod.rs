@@ -29,10 +29,12 @@ use crate::domain::rest::InterventionChoice;
 /// (Ctrl+Space / Cmd+Space) とも衝突しない。
 pub const ACCELERATOR: &str = "Control + Option + Space";
 
-/// 「**休息**に入る」の表記 (CAP-10)。
+/// 二択の一つ目の表記 — 休息の**介入**では「**休息**に入る」、復帰の**介入**では
+/// 「**休息**を終える」(CAP-10)。**介入**の種類によらず同じ打鍵を使う (AD-7)。
 pub const REST_ACCELERATOR: &str = "Control + Option + R";
 
-/// 「**猶予**の後に再提示する」の表記 (CAP-10)。
+/// 二択の二つ目の表記 — 休息の**介入**では「**猶予**の後に再提示する」、復帰の
+/// **介入**では「もう少し休む」(CAP-10)。
 pub const GRACE_ACCELERATOR: &str = "Control + Option + G";
 
 /// オーバーレイを呼び出すグローバルホットキー。
