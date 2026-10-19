@@ -548,8 +548,10 @@ test('メモを書き足して Enter — 今回書いた本文だけが送られ
   expect(argsOf('switch_current_position')).toEqual({
     request: { note: '接続詞を整える途中 / 次は結論', declareCompletion: false },
   })
-  // 移動できたので離脱する。
-  expect(invoked).toContain('hide_overlay')
+  // 移動できても閉じない。移った先を確かめてから閉じるのは利用者である。
+  expect(invoked).not.toContain('hide_overlay')
+  // 欄は移った先のメモで埋め直されるため、打った本文が記録されたことを述べる。
+  expect(noticeText()).toBe('切り替えた。メモを記録し、現在地を次のステップへ移した。')
 })
 
 test('提示されたメモに触れずに Enter — 記入として送らない (SM-C3)', async () => {
@@ -560,7 +562,8 @@ test('提示されたメモに触れずに Enter — 記入として送らない
   expect(argsOf('switch_current_position')).toEqual({
     request: { note: null, declareCompletion: false },
   })
-  expect(invoked).toContain('hide_overlay')
+  expect(invoked).not.toContain('hide_overlay')
+  expect(noticeText()).toBe('切り替えた。現在地を次のステップへ移した。')
 })
 
 test('⌘Enter は完了の宣言 — 同じ一連の操作から 1 打鍵で、メモも同時に確定する', async () => {
@@ -632,15 +635,16 @@ test('メモを空にしたまま確定しても切り替えは完了する', as
   expect(argsOf('switch_current_position')).toEqual({
     request: { note: '', declareCompletion: false },
   })
-  expect(invoked).toContain('hide_overlay')
+  expect(invoked).not.toContain('hide_overlay')
+  expect(noticeText()).toBe('切り替えた。現在地を次のステップへ移した。')
 })
 
 test('呼び出しからメモ確定・離脱までが 5 打鍵以内 (FR-7)', async () => {
   // 1 打鍵目はホットキーによる呼び出し。webview からは観測できないため数に含める。
   const HOTKEY_PRESS = 1
   // **実際に窓へ届いた打鍵を数える。** テストが自分で持つ数ではなく、離脱まで何回
-  // 押す必要があったかを見る — 二度の確定を要する実装になれば、1 回目の Enter では
-  // `hide_overlay` に届かず落ちる。
+  // 押す必要があったかを見る。切り替えは閉じずに移った先を見せるため、離脱は
+  // 確認の後の Esc である — 呼び出し・Enter・Esc の 3 打鍵。
   const observed: string[] = []
   const count = (event: KeyboardEvent) => observed.push(event.key)
   window.addEventListener('keydown', count)
@@ -651,13 +655,167 @@ test('呼び出しからメモ確定・離脱までが 5 打鍵以内 (FR-7)', a
 
     press('Enter')
     await settle()
-
     expect(invoked).toContain('switch_current_position')
+    expect(invoked).not.toContain('hide_overlay')
+
+    press('Escape')
+    await settle()
+
     expect(invoked).toContain('hide_overlay')
     expect(HOTKEY_PRESS + observed.length).toBeLessThanOrEqual(5)
   } finally {
     window.removeEventListener('keydown', count)
   }
+})
+
+// --- 切り替えで閉じない (spec-switch-stays-open) ------------------------------
+
+/** 第 3/全 6 から移った先。第 4 ステップであり、既存のメモを持つ。 */
+const FOURTH = {
+  ...SNAPSHOT,
+  stepContent: '結論の段落を書く',
+  stepOrdinal: 4,
+  interruptionNote: '主張を一文に絞る途中',
+}
+
+test('切り替えは閉じず、移った先の次の一手と位置情報と切り替えた旨を見せる', async () => {
+  snapshot = { ...FOURTH }
+
+  press('Enter')
+  await settle()
+
+  expect(invoked).toContain('switch_current_position')
+  expect(invoked).not.toContain('hide_overlay')
+  // 取り直した既定表示が移った先を示す (AD-3 鮮度規則)。
+  expect(invoked.indexOf('get_overlay_snapshot')).toBeGreaterThan(
+    invoked.indexOf('switch_current_position'),
+  )
+  const text = document.body.textContent ?? ''
+  expect(text).toContain('結論の段落を書く')
+  expect(text).toContain('第 4 ステップ / 全 6 ステップ')
+  expect(noticeText()).toContain('切り替えた')
+})
+
+test('切り替え直後の表示に、離脱したステップの内容は現れない (FR-2)', async () => {
+  snapshot = { ...FOURTH }
+  typeNote('接続詞を整える途中 / 次は結論')
+  await settle()
+
+  press('Enter')
+  await settle()
+
+  const text = document.body.textContent ?? ''
+  expect(text).not.toContain('3 段落目を書き直す')
+  expect(text).not.toContain('第 3 ステップ')
+  // 離脱側へ書いたメモも移った先の欄に持ち越さない。
+  expect(noteField().value).toBe('主張を一文に絞る途中')
+})
+
+test('移った先にメモがあれば入力欄に入り、カーソルは末尾にある (FR-8)', async () => {
+  snapshot = { ...FOURTH }
+
+  press('Enter')
+  await settle()
+
+  const input = noteField()
+  expect(input.value).toBe('主張を一文に絞る途中')
+  expect(document.activeElement).toBe(input)
+  expect(input.selectionStart).toBe(input.value.length)
+  expect(input.selectionEnd).toBe(input.value.length)
+})
+
+test('切り替え直後の Esc で閉じ、現在地は動かさない', async () => {
+  snapshot = { ...FOURTH }
+  press('Enter')
+  await settle()
+  invoked = []
+
+  press('Escape')
+  await settle()
+
+  expect(invoked).toContain('hide_overlay')
+  expect(invoked).not.toContain('switch_current_position')
+})
+
+test('切り替え直後にもう一度 Enter を押すと、さらに次へ移り、やはり閉じない', async () => {
+  snapshot = { ...FOURTH }
+  press('Enter')
+  await settle()
+
+  snapshot = { ...FOURTH, stepContent: '参考文献を揃える', stepOrdinal: 5, interruptionNote: null }
+  press('Enter')
+  await settle()
+
+  expect(invoked.filter((cmd) => cmd === 'switch_current_position')).toHaveLength(2)
+  expect(invoked).not.toContain('hide_overlay')
+  const text = document.body.textContent ?? ''
+  expect(text).toContain('参考文献を揃える')
+  expect(text).toContain('第 5 ステップ / 全 6 ステップ')
+  expect(text).not.toContain('結論の段落を書く')
+  // 二度目も提示されたメモに触れていないので、記入として送らない (SM-C3)。
+  expect(lastArgsOf('switch_current_position')).toEqual({
+    request: { note: null, declareCompletion: false },
+  })
+  // 切り替えた旨は 1 行だけである。
+  expect(
+    [...document.querySelectorAll('[role="alert"]')].filter((node) =>
+      (node.textContent ?? '').includes('切り替えた'),
+    ),
+  ).toHaveLength(1)
+})
+
+test('切り替えた旨は次回の呼び出しに残らない', async () => {
+  snapshot = { ...FOURTH }
+  press('Enter')
+  await settle()
+  expect(noticeText()).toContain('切り替えた')
+
+  await emit('tauri://blur', null)
+  await settle()
+  await emit('tauri://focus', null)
+  await settle()
+
+  expect(document.body.textContent ?? '').not.toContain('切り替えた')
+  expect(document.body.textContent ?? '').toContain('結論の段落を書く')
+})
+
+test('切り替えの後の取り直しが失敗しても、切り替えた旨は残る', async () => {
+  let switchedAlready = false
+  mockIPC(
+    (cmd, args) => {
+      invoked.push(cmd)
+      calls.push({ cmd, args: (args ?? {}) as Record<string, unknown> })
+      if (cmd === 'switch_current_position') {
+        switchedAlready = true
+        return { moved: true }
+      }
+      if (cmd === 'get_overlay_snapshot') {
+        if (switchedAlready) throw new Error('常駐プロセスが応答しない')
+        return snapshot
+      }
+      return null
+    },
+    { shouldMockEvents: true },
+  )
+
+  press('Enter')
+  // 再試行 (10 回 × 100ms) を使い切るまで待つ。
+  await settle(SNAPSHOT_RETRIES * SNAPSHOT_RETRY_INTERVAL_MS + 200)
+
+  expect(document.querySelector('textarea.note')).toBeNull()
+  const text = document.body.textContent ?? ''
+  expect(text).toContain('状態を取得できなかった')
+  expect(text).toContain('切り替えた。現在地を次のステップへ移した。')
+})
+
+test('最終ステップでは切り替えた旨を述べない', async () => {
+  switchOutcome = { moved: false }
+
+  press('Enter')
+  await settle()
+
+  expect(document.body.textContent ?? '').not.toContain('切り替えた')
+  expect(noticeText()).toContain('次のステップが無い')
 })
 
 test('最終ステップでは離脱せず、確定したものを述べる — メモのみ', async () => {
@@ -720,6 +878,7 @@ test('切り替えに失敗したら理由を面に出し、閉じない', async
   expect(document.querySelector('[role="alert"]')?.textContent ?? '').toContain(
     '切り替えを確定できなかった',
   )
+  expect(document.body.textContent ?? '').not.toContain('切り替えた')
 })
 
 test('IME の変換確定の Enter を切り替えと取り違えない', async () => {
@@ -2219,7 +2378,9 @@ test('「切り替え」のボタンは Enter と同じ経路を通る', async (
   expect(argsOf('switch_current_position')).toEqual({
     request: { note: '接続詞を整える途中 / 次は結論', declareCompletion: false },
   })
-  expect(invoked).toContain('hide_overlay')
+  // Enter と同じく閉じずに移った先を見せる。
+  expect(invoked).not.toContain('hide_overlay')
+  expect(noticeText()).toContain('切り替えた')
 })
 
 test('「完了して次を選ぶ」のボタンは ⌘Enter と同じ経路を通る', async () => {
