@@ -43,7 +43,7 @@ jobs:
       - name: Node を用意する
         uses: actions/setup-node@v4
         with:
-          node-version: '22'
+          node-version: '22.23.4'
           cache: pnpm
 
       # rust-toolchain.toml を唯一の正とする。channel / components / targets の
