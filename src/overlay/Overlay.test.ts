@@ -31,6 +31,9 @@ const SNAPSHOT = {
   stepCount: 6,
   interruptionNote: '接続詞を整える途中',
   resting: false,
+  waiting: false,
+  waitLabel: null,
+  waitLengthMinutes: 5,
 }
 
 /**
@@ -132,6 +135,33 @@ function captureIdea(args: unknown): null | Promise<null> {
   return null
 }
 
+/**
+ * `begin_wait` の応答。Rust 側の `as_wait_minutes` と同じく、正の整数でなければ拒む。
+ * 入れたら、コアが確定させた後の状態をスナップショットへ写す。
+ */
+let beginWaitOutcome = { waiting: true }
+function beginWait(args: unknown): { waiting: boolean } {
+  const request =
+    ((args ?? {}) as { request?: { minutes?: string; label?: string | null } }).request ?? {}
+  const minutes = (request.minutes ?? '').trim()
+  if (!/^[0-9]+$/.test(minutes) || Number(minutes) === 0) {
+    throw new Error('待つ分数は正の整数で書くこと。待機には入っていない。')
+  }
+  if (beginWaitOutcome.waiting) {
+    snapshot = { ...snapshot, waiting: true, waitLabel: request.label ?? null }
+  }
+  return beginWaitOutcome
+}
+
+/** `return_from_wait` の応答。戻ったら待機を畳んだ状態をスナップショットへ写す。 */
+let returnOutcome = { returned: true, moved: true }
+let returnFails = false
+function returnFromWait(): { returned: boolean; moved: boolean } {
+  if (returnFails) throw new Error('状態の書き込みに失敗した')
+  if (returnOutcome.returned) snapshot = { ...snapshot, waiting: false, waitLabel: null }
+  return returnOutcome
+}
+
 /** `@tauri-apps/api` の mock が用意しないイベント内部実装の穴。 */
 type EventPluginInternals = { unregisterListener?: (event: string, id: number) => void }
 
@@ -215,6 +245,8 @@ function installIPC(): void {
       }
       if (cmd === 'edit_task') return null
       if (cmd === 'capture_idea') return captureIdea(args)
+      if (cmd === 'begin_wait') return beginWait(args)
+      if (cmd === 'return_from_wait') return returnFromWait()
       return null
     },
     { shouldMockEvents: true },
@@ -447,6 +479,9 @@ beforeEach(async () => {
   captureFails = false
   holdCapture = false
   releaseCapture = null
+  beginWaitOutcome = { waiting: true }
+  returnOutcome = { returned: true, moved: true }
+  returnFails = false
   mockWindows('main')
   installIPC()
   stubEventInternals()
@@ -2582,6 +2617,7 @@ test('既定表示の操作はボタンからも到達できる', async () => {
     '切り替え',
     '完了して次を選ぶ',
     '休息に入る',
+    '待機',
     'このタスクを直す',
     '新しいタスク',
     '一覧',
@@ -3077,3 +3113,270 @@ test('置く応答が面を畳んだ後に着いても、既定表示に報せ�
 
   expect(document.body.textContent ?? '').not.toContain('思いつきを置いた。')
 })
+
+// ---------------------------------------------------------------------------
+// 待機 — 主作業を戻り先として覚えたまま短い別作業をする
+// ---------------------------------------------------------------------------
+
+function waitMinutesField(): HTMLInputElement | null {
+  return document.querySelector<HTMLInputElement>('input.wait-minutes')
+}
+
+function waitLabelField(): HTMLInputElement | null {
+  return document.querySelector<HTMLInputElement>('input.wait-label')
+}
+
+async function openWait(): Promise<void> {
+  press('d', { metaKey: true })
+  await settle()
+}
+
+/** 待機中の既定表示へ入る。コアは既に待機中である。 */
+async function enterTheWaitingSurface(label: string | null = 'AI の出力'): Promise<void> {
+  snapshot = { ...SNAPSHOT, waiting: true, waitLabel: label }
+  await emit('tauri://focus', null)
+  await settle()
+  invoked = []
+  calls = []
+}
+
+test('待機の面は初期表示に無く、⌘D で分数 (既定値) と一行の欄が開く', async () => {
+  expect(waitMinutesField()).toBeNull()
+
+  await openWait()
+
+  expect(waitMinutesField()?.value).toBe('5')
+  expect(waitLabelField()?.value).toBe('')
+  expect(document.activeElement).toBe(waitLabelField())
+  expect(document.querySelector('.hint')?.textContent ?? '').toContain('Enter で待機に入る')
+  expect(invoked).not.toContain('begin_wait')
+})
+
+test('既定表示の案内に ⌘D が載っている', async () => {
+  expect(document.querySelector('.hint')?.textContent ?? '').toContain('⌘D で待機')
+})
+
+test('I/O「入る」— 「AI の出力」で Enter → 待機中。次の一手は主作業のまま、閉じない', async () => {
+  typeNote('接続詞を整える途中 / 次は結論')
+  await settle()
+  await openWait()
+  typeInto(waitLabelField() as HTMLInputElement, 'AI の出力')
+  press('Enter')
+  await settle()
+
+  expect(argsOf('begin_wait')).toEqual({ request: { minutes: '5', label: 'AI の出力' } })
+  expect(invoked).not.toContain('hide_overlay')
+  expect(invoked).not.toContain('switch_current_position')
+  expect(waitLabelField()).toBeNull()
+  expect(document.querySelector('.next-action')?.textContent).toBe('3 段落目を書き直す')
+  expect(document.querySelector('.waiting')?.textContent).toBe('待機中 — AI の出力')
+  expect(noteField().value).toBe('接続詞を整える途中 / 次は結論')
+  expect(document.querySelector('.hint')?.textContent ?? '').toContain('⌘D で主作業に戻る')
+})
+
+test('「何を待っているか」が空なら null を送り、「待機中」とだけ添える', async () => {
+  await openWait()
+  typeInto(waitLabelField() as HTMLInputElement, '   ')
+  press('Enter')
+  await settle()
+
+  expect(argsOf('begin_wait')).toEqual({ request: { minutes: '5', label: null } })
+  expect(document.querySelector('.waiting')?.textContent).toBe('待機中')
+})
+
+test('I/O「分数が不正」— 「0」「abc」では確定せず、面を残して理由を 1 行示す', async () => {
+  for (const broken of ['0', 'abc']) {
+    await openWait()
+    typeInto(waitMinutesField() as HTMLInputElement, broken)
+    press('Enter')
+    await settle()
+
+    expect(waitMinutesField()).not.toBeNull()
+    expect(waitMinutesField()?.value).toBe(broken)
+    expect(noticeText()).toContain('待機に入れなかった')
+    expect(noticeText()).toContain('正の整数')
+    expect(document.querySelector('.waiting')).toBeNull()
+
+    press('Escape')
+    await settle()
+  }
+})
+
+test('I/O「設定」— 待機の長さが 1 分なら分数の初期値は 1', async () => {
+  snapshot = { ...SNAPSHOT, waitLengthMinutes: 1 }
+  await emit('tauri://focus', null)
+  await settle()
+
+  await openWait()
+  expect(waitMinutesField()?.value).toBe('1')
+})
+
+test('待機の面の Esc は既定表示へ戻るだけで、閉じも入りもしない', async () => {
+  await openWait()
+  typeInto(waitLabelField() as HTMLInputElement, 'AI の出力')
+  press('Escape')
+  await settle()
+
+  expect(waitLabelField()).toBeNull()
+  expect(invoked).not.toContain('begin_wait')
+  expect(invoked).not.toContain('hide_overlay')
+  expect(document.querySelector('.next-action')?.textContent).toBe('3 段落目を書き直す')
+})
+
+test('I/O「IME」— 変換中の Enter では待機に入らない', async () => {
+  await openWait()
+  typeInto(waitLabelField() as HTMLInputElement, 'えーあい')
+  press('Enter', { isComposing: true } as KeyboardEventInit)
+  await settle()
+
+  expect(invoked).not.toContain('begin_wait')
+  expect(waitLabelField()).not.toBeNull()
+})
+
+test('フォーカスを失えば待機の下書きは捨てられ、次の呼び出しは初期表示である', async () => {
+  await openWait()
+  typeInto(waitLabelField() as HTMLInputElement, '途中')
+  await emit('tauri://blur', null)
+  await settle()
+  await emit('tauri://focus', null)
+  await settle()
+
+  expect(waitLabelField()).toBeNull()
+  expect(invoked).not.toContain('begin_wait')
+})
+
+test('I/O「入れない」— 休息中・未着手では ⌘D が何もしない', async () => {
+  await enterTheRestingSurface()
+  await openWait()
+  expect(waitLabelField()).toBeNull()
+  expect(invoked).not.toContain('begin_wait')
+  expect(invoked).not.toContain('return_from_wait')
+  expect(actionLabels()).not.toContain('待機')
+
+  snapshot = { ...SNAPSHOT, stepContent: null, stepOrdinal: null, stepCount: null }
+  await emit('tauri://focus', null)
+  await settle()
+  await openWait()
+  expect(waitLabelField()).toBeNull()
+  expect(actionLabels()).not.toContain('待機')
+})
+
+test('受け入れ条件 — 待機中の既定表示に残り時間・経過・回数が現れない', async () => {
+  await enterTheWaitingSurface()
+
+  const text = document.body.textContent ?? ''
+  expect(text).toContain('待機中 — AI の出力')
+  for (const forbidden of ['残り', '経過', '回目', '%']) expect(text).not.toContain(forbidden)
+  // 数字は位置情報 (第 N / 全 M) とホットキーの表記だけである。
+  const waitingLine = document.querySelector('.waiting')?.textContent ?? ''
+  expect(waitingLine).not.toMatch(/[0-9０-９]/)
+})
+
+test('I/O「早めに戻る」— 待機中の ⌘D で書きかけのメモを送り、主作業へ戻る', async () => {
+  await enterTheWaitingSurface()
+  // 別タスクにいる体で、そのステップのメモを書きかける。
+  typeNote('米は 5kg')
+  await settle()
+
+  await openWait()
+
+  expect(argsOf('return_from_wait')).toEqual({ request: { note: '米は 5kg' } })
+  expect(invoked).not.toContain('begin_wait')
+  expect(invoked).not.toContain('hide_overlay')
+  expect(document.querySelector('.waiting')).toBeNull()
+  // 移ったため下書きは確定済みであり、主作業のメモで初期化し直される。
+  expect(noteField().value).toBe('接続詞を整える途中')
+  expect(document.activeElement).toBe(noteField())
+})
+
+test('早めに戻るとき、提示されたメモを読み返しただけなら null を送る', async () => {
+  await enterTheWaitingSurface()
+  await openWait()
+  expect(argsOf('return_from_wait')).toEqual({ request: { note: null } })
+})
+
+test('戻り先にいたままなら、書きかけのメモは欄に残る', async () => {
+  returnOutcome = { returned: true, moved: false }
+  await enterTheWaitingSurface()
+  typeNote('書きかけ')
+  await settle()
+
+  await openWait()
+
+  expect(document.querySelector('.waiting')).toBeNull()
+  expect(noteField().value).toBe('書きかけ')
+})
+
+test('I/O「早めに戻る」の失敗 — 移らず理由を 1 行示し、閉じない', async () => {
+  returnFails = true
+  await enterTheWaitingSurface()
+  typeNote('米は 5kg')
+  await settle()
+
+  await openWait()
+
+  expect(noticeText()).toContain('主作業に戻れなかった')
+  expect(noticeText()).toContain('状態の書き込みに失敗した')
+  expect(invoked).not.toContain('hide_overlay')
+  expect(document.querySelector('.waiting')?.textContent).toBe('待機中 — AI の出力')
+  expect(noteField().value).toBe('米は 5kg')
+})
+
+test('待機の操作はボタンからも到達できる', async () => {
+  actionButton('待機').click()
+  await settle()
+  expect(waitLabelField()).not.toBeNull()
+  expect(actionLabels()).toEqual(['待機に入る', '戻る'])
+
+  actionButton('待機に入る').click()
+  await settle()
+  expect(invoked).toContain('begin_wait')
+
+  expect(actionLabels()).toContain('主作業に戻る')
+  expect(actionLabels()).not.toContain('待機')
+  actionButton('主作業に戻る').click()
+  await settle()
+  expect(invoked).toContain('return_from_wait')
+})
+
+test('待機中も一覧から別タスクへ移れる — 待機は続いて見える', async () => {
+  await enterTheWaitingSurface()
+  await openDisclosure()
+  expect(invoked).toContain('get_disclosure_surface')
+  expect(invoked).not.toContain('return_from_wait')
+})
+
+test('待機の面の案内は分数の欄への行き方を述べ、分数を 10 に変えれば "10" を送る', async () => {
+  await openWait()
+  expect(document.querySelector('.hint')?.textContent ?? '').toContain('Tab で分数')
+
+  typeInto(waitMinutesField() as HTMLInputElement, '10')
+  press('Enter')
+  await settle()
+
+  expect(argsOf('begin_wait')).toEqual({ request: { minutes: '10', label: null } })
+})
+
+test('待機に入れなかったら、そう述べて面を畳み、待機中の行を描かない', async () => {
+  beginWaitOutcome = { waiting: false }
+  await openWait()
+  press('Enter')
+  await settle()
+
+  expect(noticeText()).toContain('待機に入れなかった')
+  expect(waitLabelField()).toBeNull()
+  expect(document.querySelector('.waiting')).toBeNull()
+})
+
+test('待機中でなかったら、そう述べて書きかけのメモを残す', async () => {
+  returnOutcome = { returned: false, moved: false }
+  await enterTheWaitingSurface()
+  typeNote('書きかけ')
+  await settle()
+
+  await openWait()
+
+  expect(noticeText()).toContain('待機中ではなかった')
+  expect(noteField().value).toBe('書きかけ')
+})
+

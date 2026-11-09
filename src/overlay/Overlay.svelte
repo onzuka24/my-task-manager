@@ -21,6 +21,34 @@
     stepCount: number | null
     interruptionNote: string | null
     resting: boolean
+    // 待機中か・何を待っているか・待機の面の分数の初期値 (設定値)。
+    // **残り時間・経過・回数は運ばれてこない** (AD-15)。
+    waiting: boolean
+    waitLabel: string | null
+    waitLengthMinutes: number
+  }
+
+  // src-tauri/src/commands/mod.rs の `BeginWaitRequest` / `BeginWaitOutcome` と 1:1。
+  //
+  // **分数は入力欄の文字列そのものを送る。** 「正の整数でなければ確定しない」の規則は
+  // Rust 側の `as_wait_minutes` にしか無い。
+  type BeginWaitRequest = {
+    minutes: string
+    label: string | null
+  }
+
+  type BeginWaitOutcome = {
+    waiting: boolean
+  }
+
+  // src-tauri/src/commands/mod.rs の `ReturnFromWaitRequest` / `ReturnFromWaitOutcome` と 1:1。
+  type ReturnFromWaitRequest = {
+    note: string | null
+  }
+
+  type ReturnFromWaitOutcome = {
+    returned: boolean
+    moved: boolean
   }
 
   // src-tauri/src/commands/mod.rs の `BeginRestOutcome` / `EndRestOutcome` と 1:1。
@@ -310,6 +338,38 @@
   let ideaCaptured = $state(false)
 
   /**
+   * 待機中か・何を待っているか・面の分数の初期値。**スナップショットの写しである。**
+   *
+   * 戻り先も期限もコアだけが持つ。フロントは計時をしない (AD-8)。
+   */
+  let waiting = $state(false)
+  let waitLabel = $state<string | null>(null)
+  /** 待機の面の分数の初期値。**コアが決める** — 取れていなければ `null` で、欄は空になる。 */
+  let waitLengthMinutes = $state<number | null>(null)
+
+  /**
+   * 待機の面の開閉と、入力途中の分数・一行 — 揮発ビュー状態 (AD-2 の状態表)。
+   *
+   * 思いつきの面と同じ作法である。**初期表示に現れず**、明示的な打鍵 (⌘D) を経てのみ
+   * 到達する。Esc・フォーカス喪失で破棄される。中断メモの下書きはこの面の間も生きている。
+   */
+  let enteringWait = $state(false)
+  let waitMinutesDraft = $state('')
+  let waitLabelDraft = $state('')
+  let waitLabelInput = $state<HTMLInputElement | null>(null)
+  let waitError = $state<string | null>(null)
+  /** 待機の開始の要求が飛んでいる間。二重確定を防ぐ。 */
+  let beginningWait = $state(false)
+  /** 主作業へ戻る要求が飛んでいる間。二重確定を防ぐ。 */
+  let returningFromWait = $state(false)
+  /**
+   * 待機について述べる 1 行。**既定表示の枝の外に出す** (休息の報せと同じ理由)。
+   */
+  let waitNotice = $state<string | null>(null)
+  /** その理由の生の文字列。例外から来たときだけ埋まる。 */
+  let waitErrorDetail = $state<string | null>(null)
+
+  /**
    * 修正の面の開閉状態と下書き — 揮発ビュー状態 (AD-2 の状態表)。
    *
    * **`editing` が初期値で偽であることが FR-2 の実体である。** 修正の面は初期表示に
@@ -496,6 +556,10 @@
     // **確認できていない休息を描かない。** 残せば、終了の宣言がコアの知らない状態に
     // 対して撃たれる。
     resting = false
+    // **確認できていない待機を描かない。** 残せば、⌘D がコアの知らない待機に対して
+    // 戻りを撃てる。
+    waiting = false
+    waitLabel = null
     notePrefill = ''
     noteDraft = ''
   }
@@ -533,6 +597,9 @@
         stepOrdinal = snapshot.stepOrdinal
         stepCount = snapshot.stepCount
         resting = snapshot.resting === true
+        waiting = snapshot.waiting === true
+        waitLabel = snapshot.waitLabel ?? null
+        waitLengthMinutes = snapshot.waitLengthMinutes ?? null
 
         const preserve = keepDirtyDraft && noteIsDirty
         notePrefill = snapshot.interruptionNote ?? ''
@@ -614,6 +681,8 @@
     completionNotice = null
     edited = false
     ideaCaptured = false
+    waitNotice = null
+    waitErrorDetail = null
   }
 
   /**
@@ -640,6 +709,18 @@
     capturing = false
     ideaDraft = ''
     captureError = null
+  }
+
+  /**
+   * 待機の下書きを捨て、待機の面を畳む。**`discardIdeaDraft` の双子である。**
+   *
+   * 畳む契機は Esc・フォーカス喪失・待機に入った成功の三つだけである。
+   */
+  function discardWaitDraft(): void {
+    enteringWait = false
+    waitMinutesDraft = ''
+    waitLabelDraft = ''
+    waitError = null
   }
 
   /**
@@ -1135,6 +1216,98 @@
   }
 
   /**
+   * 待機の面へ入る。**初期表示には現れない** — 明示的な打鍵 (⌘D) だけがここへ至る。
+   *
+   * **作業中だけである** — 現在地があり、休息中でないとき。分数の欄は待機の長さ
+   * (設定値) で初期化し、入力位置は「何を待っているか」の欄に置く。
+   */
+  async function openWait(): Promise<void> {
+    if (stepContent === null || resting || waiting || stateError) return
+    if (enteringWait || beginningWait) return
+    dismissNotices()
+    enteringWait = true
+    waitMinutesDraft = waitLengthMinutes === null ? '' : String(waitLengthMinutes)
+    waitLabelDraft = ''
+    waitError = null
+    await tick()
+    focusAtEnd(waitLabelInput)
+  }
+
+  /**
+   * 待機の面から出る。**オーバーレイは閉じない。** 既定表示へ戻り、中断メモの下書きは
+   * そのまま残る。
+   */
+  async function leaveWait(): Promise<void> {
+    discardWaitDraft()
+    await focusNoteAtEnd()
+  }
+
+  /**
+   * 待機に入る。その時点の現在地をコアが戻り先として覚える。
+   *
+   * **閉じない。** 取り直した既定表示に「待機中」の 1 行が添わることが、入れた唯一の
+   * 手応えである。分数の検めは Rust 側の純粋関数が持つ — ここで先回りして弾くと規則が
+   * 二箇所に分かれる。失敗すれば面を残して理由を 1 行示す。
+   */
+  async function confirmWait(): Promise<void> {
+    if (beginningWait) return
+    beginningWait = true
+    waitError = null
+    const label = waitLabelDraft.trim()
+    const request: BeginWaitRequest = {
+      minutes: waitMinutesDraft,
+      label: label === '' ? null : label,
+    }
+    try {
+      const outcome = await invoke<BeginWaitOutcome>('begin_wait', { request })
+      if (!enteringWait) return
+      discardWaitDraft()
+      // 中断メモの下書きは捨てない — 待機は現在地もメモも変えない。
+      await refresh({ keepDirtyDraft: true })
+      await focusNoteAtEnd()
+      if (!outcome.waiting) {
+        waitNotice = '待機に入れなかった。現在地が無いか、休息中か、既に待機中である。'
+      }
+    } catch (error) {
+      console.error('failed to begin the wait', error)
+      if (!enteringWait) return
+      waitError = String(error)
+    } finally {
+      beginningWait = false
+    }
+  }
+
+  /**
+   * 早めに主作業へ戻る — 待機中の ⌘D。
+   *
+   * 中断メモの欄に未確定の下書きがあれば、それを送る。現在地が戻り先と違えば、コアが
+   * 離れる側のステップの中断メモとして確定する (切り替えと同じ扱い)。同じなら確定せず、
+   * 下書きは欄に残る。**提示されたメモをそのまま送り返さない** (`confirmSwitch` と同じ)。
+   */
+  async function returnFromWait(): Promise<void> {
+    if (!waiting || returningFromWait) return
+    returningFromWait = true
+    dismissNotices()
+    const request: ReturnFromWaitRequest = { note: noteIsDirty ? noteDraft : null }
+    try {
+      const outcome = await invoke<ReturnFromWaitOutcome>('return_from_wait', { request })
+      // 移ったなら下書きは確定しているため捨て、主作業の中断メモで初期化し直す。
+      // 移っていなければ何も確定していないため、下書きを残す。
+      await refresh({ keepDirtyDraft: !outcome.moved })
+      await focusNoteAtEnd()
+      if (!outcome.returned) {
+        waitNotice = '待機中ではなかった。何も変えていない。'
+      }
+    } catch (error) {
+      console.error('failed to return from the wait', error)
+      waitNotice = '主作業に戻れなかった。状態は変わっていない。'
+      waitErrorDetail = String(error)
+    } finally {
+      returningFromWait = false
+    }
+  }
+
+  /**
    * 作成の面から出る。**オーバーレイは閉じない** (I/O マトリクス「Esc」)。
    *
    * 既定表示へ戻り、入力位置を中断メモの欄へ返す。
@@ -1390,7 +1563,7 @@
    */
   function isSurfaceKey(
     event: KeyboardEvent,
-    letter: 'n' | 'l' | 'e' | 'r' | 't' | 'i',
+    letter: 'n' | 'l' | 'e' | 'r' | 't' | 'i' | 'd',
   ): boolean {
     return (
       event.key.toLowerCase() === letter &&
@@ -1421,6 +1594,12 @@
       return
     }
 
+    // 待機の面も自前の打鍵を持つ。入力中の Enter を切り替えへ持ち込まない。
+    if (enteringWait) {
+      onWaitKeydown(event)
+      return
+    }
+
     // 開示面も自前の打鍵を持つ。既定表示の Enter (切り替え) をここへ持ち込まない —
     // 一覧の Enter は選んだ行の確定であって、同一タスク内の次のステップへの切り替え
     // ではない。**この分岐が作成の面との排他でもある** — どちらの面も、出ている間は
@@ -1440,7 +1619,7 @@
     if (event.key === 'Escape') {
       // 確定の途中では閉じない。閉じてしまうと、失敗したときの理由を読む機会が
       // 画面ごと消える。
-      if (switching || endingRest) return
+      if (switching || endingRest || returningFromWait) return
       event.preventDefault()
       // 下書きは確定されない。永続化もされない (AD-5)。
       void close()
@@ -1486,6 +1665,19 @@
       event.preventDefault()
       if (switching) return
       void openCapture()
+      return
+    }
+
+    // 待機 — 作業中なら待機の面へ入り、待機中なら主作業へ戻る。**休息中・未着手では
+    // 何もしない。** 打鍵は飲む (webview の既定動作へ抜けさせない)。
+    if (isSurfaceKey(event, 'd')) {
+      event.preventDefault()
+      if (event.repeat || switching) return
+      if (waiting) {
+        void returnFromWait()
+        return
+      }
+      void openWait()
       return
     }
 
@@ -1595,6 +1787,27 @@
   }
 
   /**
+   * 待機の面の打鍵。**IME ガードは呼び出し元が既に通している** (AD-6)。
+   *
+   * 思いつきの面と同じく一行の欄だけであり、確定は素の Enter である。
+   */
+  function onWaitKeydown(event: KeyboardEvent): void {
+    if (event.key === 'Escape') {
+      if (beginningWait) return
+      event.preventDefault()
+      void leaveWait()
+      return
+    }
+
+    if (event.key !== 'Enter') return
+    if (event.repeat) return
+    if (event.metaKey || event.shiftKey || event.altKey || event.ctrlKey) return
+
+    event.preventDefault()
+    void confirmWait()
+  }
+
+  /**
    * 開示面の打鍵。**IME ガードは呼び出し元が既に通している** (AD-6)。
    *
    * # なぜ確定が素の Enter なのか
@@ -1693,6 +1906,7 @@
         dismissNotices()
         discardTaskDraft()
         discardIdeaDraft()
+        discardWaitDraft()
         discardDisclosure()
         discardTaskEdit()
         void refresh()
@@ -1704,6 +1918,7 @@
         // 伴わない再表示が、作成の面を出したままの初期表示になる (FR-2 が禁じる)。
         discardTaskDraft()
         discardIdeaDraft()
+        discardWaitDraft()
         discardDisclosure()
         discardTaskEdit()
         void close()
@@ -1814,6 +2029,39 @@
       <p class="alert" role="alert">
         思いつきを置けなかった。何も保存されていない。
         <span class="detail">{captureError}</span>
+      </p>
+    {/if}
+  {:else if enteringWait}
+    <!--
+      待機の面。**分数と一行だけである。** 分数の欄は待機の長さ (設定値) で始まる。
+      残り時間も経過も描かない (AD-15)。
+    -->
+    <!-- 入力位置は一行の欄から始まり、Tab で分数の欄へ進む (案内と同じ順に並べる)。 -->
+    <input
+      class="wait-label"
+      type="text"
+      bind:this={waitLabelInput}
+      bind:value={waitLabelDraft}
+      spellcheck="false"
+      placeholder="何を待っているか (省略可)"
+      aria-label="何を待っているか"
+    />
+    <label class="wait-field">
+      <input
+        class="wait-minutes"
+        type="text"
+        inputmode="numeric"
+        bind:value={waitMinutesDraft}
+        spellcheck="false"
+        aria-label="待つ分数"
+      />
+      分
+    </label>
+
+    {#if waitError}
+      <p class="alert" role="alert">
+        待機に入れなかった。
+        <span class="detail">{waitError}</span>
       </p>
     {/if}
   {:else if editing}
@@ -2073,6 +2321,13 @@
   {:else}
     <p class="next-action">{stepContent}</p>
     <p class="position">第 {stepOrdinal} ステップ / 全 {stepCount} ステップ</p>
+    {#if waiting}
+      <!--
+        待機中。**残り時間・経過・回数を出さない** (AD-15)。現在地が別タスクへ移って
+        いても、戻り先はコアが覚えている。
+      -->
+      <p class="waiting">{waitLabel ? `待機中 — ${waitLabel}` : '待機中'}</p>
+    {/if}
 
     <!--
       入力欄は既存の中断メモで初期化し、カーソルを末尾に置く (FR-7)。同じ欄が
@@ -2159,6 +2414,17 @@
   {/if}
 
   <!--
+    待機について述べる唯一の場所。**既定表示の枝の外に置く** — 取り直しの後でも
+    結末を確かめられるように (休息の報せと同じ理由)。
+  -->
+  {#if !creating && !capturing && !enteringWait && !disclosing && !editing && waitNotice}
+    <p class="alert" role="alert">
+      {waitNotice}
+      {#if waitErrorDetail}<span class="detail">{waitErrorDetail}</span>{/if}
+    </p>
+  {/if}
+
+  <!--
     マウスで到達できる操作 (I/O マトリクス「ボタン」)。**案内の打鍵と同じものしか
     置かない** — 打鍵に無い操作をボタンだけが持てば、面ごとに二つの操作体系が並ぶ。
 
@@ -2173,6 +2439,9 @@
     {:else if capturing}
       <button type="button" onmousedown={preventStealingFocus} onclick={() => confirmCapture()}>置く</button>
       <button type="button" onmousedown={preventStealingFocus} onclick={() => leaveCapture()}>戻る</button>
+    {:else if enteringWait}
+      <button type="button" onmousedown={preventStealingFocus} onclick={() => confirmWait()}>待機に入る</button>
+      <button type="button" onmousedown={preventStealingFocus} onclick={() => leaveWait()}>戻る</button>
     {:else if editing}
       {#if editTaskId !== null}
         <button type="button" onmousedown={preventStealingFocus} onclick={() => confirmEdit()}>保存</button>
@@ -2197,6 +2466,11 @@
         <button type="button" onmousedown={preventStealingFocus} onclick={() => confirmSwitch()}>切り替え</button>
         <button type="button" onmousedown={preventStealingFocus} onclick={() => completeAndChooseNext()}>完了して次を選ぶ</button>
         <button type="button" onmousedown={preventStealingFocus} onclick={() => declareRest()}>休息に入る</button>
+        {#if waiting}
+          <button type="button" onmousedown={preventStealingFocus} onclick={() => returnFromWait()}>主作業に戻る</button>
+        {:else}
+          <button type="button" onmousedown={preventStealingFocus} onclick={() => openWait()}>待機</button>
+        {/if}
         <button type="button" onmousedown={preventStealingFocus} onclick={() => openEdit(null)}>このタスクを直す</button>
       {/if}
       <button type="button" onmousedown={preventStealingFocus} onclick={() => openCreation()}>新しいタスク</button>
@@ -2215,6 +2489,8 @@
     </p>
   {:else if capturing}
     <p class="hint">Enter で置く · Esc で戻る</p>
+  {:else if enteringWait}
+    <p class="hint">Enter で待機に入る · Tab で分数 · Esc で戻る</p>
   {:else if editing}
     <!--
       案内と実際に効く打鍵が食い違ってはならない。相手が無ければ保存の打鍵も効かない。
@@ -2249,7 +2525,7 @@
       休息の終了の宣言だけを意味する (CAP-10)。案内と実際に効く打鍵を食い違わせない。
     -->
     <p class="hint">
-      {#if resting}Enter で休息を終える · ⌘T で休息のすすめ · {:else if stepContent !== null}Enter で切り替え · ⌘Enter で完了して次を選ぶ · ⌘R で休息に入る · ⌘E でこのタスクを直す · {/if}⌘N で新しいタスク · ⌘I で思いつき · ⌘L で一覧 · Esc で閉じる{#if hotkey && hotkey.registered} · {hotkey.accelerator} で開閉{/if} · 開く・終了はメニューバー項目からも
+      {#if resting}Enter で休息を終える · ⌘T で休息のすすめ · {:else if stepContent !== null}Enter で切り替え · ⌘Enter で完了して次を選ぶ · ⌘R で休息に入る · {waiting ? '⌘D で主作業に戻る' : '⌘D で待機'} · ⌘E でこのタスクを直す · {/if}⌘N で新しいタスク · ⌘I で思いつき · ⌘L で一覧 · Esc で閉じる{#if hotkey && hotkey.registered} · {hotkey.accelerator} で開閉{/if} · 開く・終了はメニューバー項目からも
     </p>
   {/if}
 </main>
@@ -2291,6 +2567,29 @@
     margin: 0;
     font-size: 0.82rem;
     color: var(--overlay-muted);
+  }
+
+  /* 待機中の 1 行。`.position` と同じ控えめな文字で添える — 強調色を足さない。 */
+  .waiting {
+    margin: 0;
+    font-size: 0.82rem;
+    color: var(--overlay-muted);
+    /* 長い一行が案内とボタンを窓 (640×280) の外へ押し出さないよう、1 行で切る。 */
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  /* 待機の面の分数の欄。数字が数桁入る幅だけを取る。 */
+  .wait-field {
+    display: flex;
+    align-items: center;
+    gap: 0.4rem;
+    font-size: 0.92rem;
+  }
+
+  .wait-field .wait-minutes {
+    width: 5rem;
   }
 
   /*
@@ -2375,6 +2674,8 @@
   .note,
   .title,
   .idea,
+  .wait-minutes,
+  .wait-label,
   .steps,
   .step-edit {
     margin: 0;
@@ -2394,6 +2695,7 @@
   .note::placeholder,
   .title::placeholder,
   .idea::placeholder,
+  .wait-label::placeholder,
   .steps::placeholder,
   .step-edit::placeholder {
     color: var(--overlay-muted);
@@ -2402,6 +2704,8 @@
   .note:focus,
   .title:focus,
   .idea:focus,
+  .wait-minutes:focus,
+  .wait-label:focus,
   .steps:focus,
   .step-edit:focus {
     outline: 1px solid var(--overlay-focus);

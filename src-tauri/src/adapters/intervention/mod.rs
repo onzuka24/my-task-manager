@@ -400,6 +400,8 @@ pub fn raise<R: Runtime>(app: &AppHandle<R>) -> Result<(), InterventionError> {
 /// - 復帰の**介入**で「休息を終える」が選ばれたら、**オーバーレイを開く**。利用者が
 ///   明示的に選んだ直後であり、戻った先の**次の一手**を FR-8 の形で見せる。既に自分で
 ///   戻っていた場合も開く — 選んだ以上、戻る先を見たいはずである。
+/// - 待機の**介入**で「主作業に戻る」が選ばれたときも同じく開く。主作業の**次の一手**と
+///   **中断メモ**の欄を見せる。
 ///
 /// # Errors
 ///
@@ -438,13 +440,28 @@ pub fn answer<R: Runtime>(
     Ok(Some(kind))
 }
 
+/// **コアが取り下げた待機の介入のパネルを隠す** (利用者の裁定・レビュー後)。
+///
+/// 待機が応答以外の経路 (早めに戻る ⌘D・休息に入る) で終わると、コアは表示中の待機の
+/// **介入**を取り下げる ([`Core::take_withdrawn_wait_panel`])。取り下げられていれば、
+/// 応答の後と同じくホットキーを解除してパネルを引っ込める — 閉じる手順は [`answer`]
+/// と同じものを使う。取り下げていなければ何もしない。
+pub fn hide_withdrawn<R: Runtime>(app: &AppHandle<R>, core: &Core) {
+    if !core.take_withdrawn_wait_panel() {
+        return;
+    }
+    hotkey::unregister_response(app);
+    hide_on_main_thread(app);
+    log::info!("the wait intervention was withdrawn because the wait ended");
+}
+
 /// 応答が受け付けられた後に提示層が行うこと。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AfterAnswer {
     /// `current_position_changed` を発行するか — **現在地**が動きうる応答 (休息に入る /
-    /// 休息を終える) である。
+    /// 休息を終える / 主作業に戻る) である。
     pub announce_position: bool,
-    /// オーバーレイを開くか — 復帰の**介入**で「休息を終える」を選んだときだけである。
+    /// オーバーレイを開くか — 「休息を終える」と「主作業に戻る」を選んだときだけである。
     pub open_overlay: bool,
 }
 
@@ -452,13 +469,14 @@ pub struct AfterAnswer {
 ///
 /// 休息の**介入**の応答でオーバーレイを開かない — 「休息に入る」の後に作業の面を
 /// 突きつけるのは逆向きであり、「猶予」は作業を続けるという選択である。どちらも
-/// 入力先を奪うだけになる (AD-6)。「もう少し休む」は**現在地**を動かさない。
+/// 入力先を奪うだけになる (AD-6)。「もう少し休む」「あと少し」は**現在地**を動かさない。
 #[must_use]
 pub fn after_answer(kind: InterventionKind, choice: InterventionChoice) -> AfterAnswer {
     let moves_position = choice == InterventionChoice::Rest;
     AfterAnswer {
         announce_position: moves_position,
-        open_overlay: moves_position && kind == InterventionKind::Return,
+        open_overlay: moves_position
+            && matches!(kind, InterventionKind::Return | InterventionKind::Wait),
     }
 }
 
@@ -513,8 +531,8 @@ mod tests {
         );
     }
 
-    /// 応答の後に行うことの全表。**オーバーレイを開くのは「休息を終える」だけであり、
-    /// 現在地の報せは現在地が動きうる応答だけである。**
+    /// 応答の後に行うことの全表。**オーバーレイを開くのは「休息を終える」と「主作業に
+    /// 戻る」だけであり、現在地の報せは現在地が動きうる応答だけである。**
     #[test]
     fn what_follows_each_answer() {
         let table = [
@@ -538,6 +556,13 @@ mod tests {
             ),
             (
                 InterventionKind::Return,
+                InterventionChoice::Grace,
+                false,
+                false,
+            ),
+            (InterventionKind::Wait, InterventionChoice::Rest, true, true),
+            (
+                InterventionKind::Wait,
                 InterventionChoice::Grace,
                 false,
                 false,

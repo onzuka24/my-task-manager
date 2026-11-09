@@ -13,13 +13,14 @@
 //! [`CoreState`] は**現在地**を 1 個のフィールドとして持つ。集合として持たないため、
 //! 「二つの現在地」を表現する値が存在しない (FR-6)。
 
+use std::num::NonZeroU32;
 use std::sync::{Mutex, MutexGuard};
 
 use super::idea::{self, Idea, IdeaId};
 use super::position::CurrentPosition;
 use super::rest::{
     self, Decision, Intervention, InterventionChoice, InterventionKind, RestSettings, ReturnTick,
-    Tick,
+    Tick, WaitTick,
 };
 use super::setting::Setting;
 use super::switch::SwitchRecord;
@@ -68,6 +69,60 @@ pub struct CoreState {
     ///
     /// [`Self::grace_until`] の**休息**側の対である。
     return_until: Option<Timestamp>,
+    /// **待機**。**永続化しない** (AD-2)。**待機**中でなければ `None`。
+    ///
+    /// 戻り先・期限・何を待っているかは、常駐を終えれば消える (利用者の裁定)。
+    /// そのとき**現在地**はその時点のまま残る — 失われるのは戻るきっかけだけである。
+    wait: Option<Wait>,
+    /// **待機**が終わったときに、表示中の待機の**介入**を取り下げたか。
+    ///
+    /// 提示層が [`Core::take_withdrawn_wait_panel`] で一度だけ読み、パネルを隠す
+    /// (利用者の裁定・レビュー後)。取り残したパネルは他の**介入**を塞ぎ、休息中に
+    /// オーバーレイを開き、新しい**待機**を終えうるためである。
+    wait_panel_withdrawn: bool,
+}
+
+/// **待機** — 主作業を戻り先として覚えたまま、短い別作業をしている状態。
+///
+/// **現在地**とは別の値である。待機中に**現在地**を一覧から別の**ステップ**へ移しても、
+/// 戻り先は変わらない。**連続作業時間**には触れない (数え続ける)。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Wait {
+    /// 戻り先 — **待機**に入った時点の**現在地**。
+    return_to: (TaskId, StepId),
+    /// 待機の**介入**を出す時刻。「あと少し」と取り下げで先へ延びる。
+    until: Timestamp,
+    /// **待機の長さ** (確定時の分数)。「あと少し」はこの長さの後に出直す。
+    length_millis: i64,
+    /// 何を待っているか。空なら `None`。
+    label: Option<String>,
+}
+
+impl Wait {
+    /// 戻り先の**ステップ**。
+    #[must_use]
+    pub const fn return_to(&self) -> StepId {
+        self.return_to.1
+    }
+
+    /// 何を待っているか。
+    #[must_use]
+    pub fn label(&self) -> Option<&str> {
+        self.label.as_deref()
+    }
+}
+
+/// [`Core::return_from_wait`] の結末。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WaitReturn {
+    /// **待機**中ではなかった。何も起きていない。
+    NotWaiting,
+    /// **現在地**を動かさず、何も書かずに**待機**を終えた。**現在地**が戻り先と同じ
+    /// **タスク**の中にある (主作業を進めていた場合を含む) とき、および戻り先が
+    /// 見つからない・**現在地**が無いとき (v1 では起きないはずの状態) である。
+    Stayed,
+    /// **現在地**を戻り先へ移し (**切り替え履歴**を 1 行)、**待機**を終えた。
+    Moved,
 }
 
 impl Default for CoreState {
@@ -83,6 +138,8 @@ impl Default for CoreState {
             last_tick: Timestamp::MIN,
             rest_since: None,
             return_until: None,
+            wait: None,
+            wait_panel_withdrawn: false,
         }
     }
 }
@@ -157,6 +214,15 @@ impl CoreState {
         matches!(self.current_position, CurrentPosition::Inactive { .. })
     }
 
+    /// **待機**。**待機**中でなければ `None`。
+    ///
+    /// 読み手が受け取れるのは戻り先と何を待っているかだけである。**期限を外へ出さない**
+    /// — 残り時間・経過を描く値を境界へ運ばないため (AD-15)。
+    #[must_use]
+    pub const fn wait(&self) -> Option<&Wait> {
+        self.wait.as_ref()
+    }
+
     /// **休息**の開始時刻と復帰の出直し期限を、**現在地**に合わせる。
     ///
     /// **休息**中でなければ両方を捨てる。**休息**中なのに開始時刻が無ければ `now` を
@@ -171,6 +237,19 @@ impl CoreState {
         } else {
             self.rest_since = None;
             self.return_until = None;
+        }
+    }
+
+    /// **待機**を終える。表示中の待機の**介入**があれば取り下げ、提示層へ隠すよう
+    /// 伝える印を立てる (利用者の裁定・レビュー後)。
+    fn end_wait(&mut self) {
+        self.wait = None;
+        if self
+            .intervention
+            .is_some_and(|shown| shown.kind() == InterventionKind::Wait)
+        {
+            self.intervention = None;
+            self.wait_panel_withdrawn = true;
         }
     }
 
@@ -289,6 +368,9 @@ impl Core {
                 last_tick,
                 rest_since,
                 return_until: None,
+                // **待機は永続化しない** (利用者の裁定)。
+                wait: None,
+                wait_panel_withdrawn: false,
             }),
             clock,
             storage,
@@ -878,6 +960,19 @@ impl Core {
             return Ok(TickEffect { raised: true });
         }
 
+        // **待機の介入** — 時間だけを見る。表示中なら待つ (AD-7)。期限は応答
+        // (「主作業に戻る」で終わる・「あと少し」で延びる) と取り下げが動かす。
+        let waiting = rest::decide_wait(&WaitTick {
+            waiting: state.wait.is_some(),
+            until: state.wait.as_ref().map(|wait| wait.until),
+            now,
+            showing: state.intervention.is_some(),
+        });
+        if waiting {
+            state.intervention = Some(Intervention::raised(InterventionKind::Wait, now));
+            return Ok(TickEffect { raised: true });
+        }
+
         // **寿命を過ぎた思いつきを消す。** 何も知らせない (AD-15)。**介入**の判断と
         // 直前の刻みの時刻の更新を済ませた後に置く — 削除の失敗が**介入**も計時も
         // 止めないためである。失敗すれば思いつきは残り、次の刻みが同じ判定をやり直す。
@@ -907,6 +1002,14 @@ impl Core {
     /// - [`InterventionChoice::Grace`] — 「もう少し休む」。**休息**は続き、**休息の長さ**
     ///   の後に出直す。**上限は無い**。既に自分で戻っていれば何も予約しない。
     ///
+    /// 待機の**介入** ([`InterventionKind::Wait`]):
+    ///
+    /// - [`InterventionChoice::Rest`] — 「主作業に戻る」。**現在地**が戻り先と別の
+    ///   **タスク**にあれば戻り先へ移し (**切り替え履歴**を 1 行、`note_written` は偽)、**待機**を終える
+    ///   ([`Self::return_from_wait`] と同じ遷移)。既に自分で戻っていれば何も書かない。
+    /// - [`InterventionChoice::Grace`] — 「あと少し」。**待機**は続き、**待機の長さ**
+    ///   (確定時の分数) の後に出直す。**上限は無い**。既に戻っていれば何も予約しない。
+    ///
     /// # 戻り値
     ///
     /// 応答した**介入**の種類。表示されていなければ `None` であり、**何も起きない** —
@@ -930,12 +1033,8 @@ impl Core {
 
         match (shown.kind(), choice) {
             (InterventionKind::Rest, InterventionChoice::Rest) => {
-                let next = state.current_position.deactivate();
-                if next != state.current_position {
-                    self.storage.apply(&Commit::of_current_position(next))?;
-                    state.current_position = next;
-                    state.enter_rest(now);
-                }
+                // **待機中なら先に戻り先へ戻してから休息に入る** (利用者の裁定)。
+                self.rest_from(&mut state, now)?;
             }
             (InterventionKind::Rest, InterventionChoice::Grace) => {
                 state.grace_until = Some(after(now, state.rest_settings().grace_period_millis()));
@@ -951,9 +1050,22 @@ impl Core {
                         Some(after(now, state.rest_settings().rest_length_millis()));
                 }
             }
+            (InterventionKind::Wait, InterventionChoice::Rest) => {
+                // **表示中に自分で戻っていれば、二重には何も起きない。** パネルからの
+                // 戻りはメモの機会を与えていないため、`note_written` は偽である。
+                self.leave_wait(&mut state, None, now)?;
+            }
+            (InterventionKind::Wait, InterventionChoice::Grace) => {
+                // **待機**中でなければ何も予約しない — 戻った後に「待つ」の約束が残る。
+                if let Some(wait) = state.wait.as_mut() {
+                    wait.until = after(now, wait.length_millis);
+                }
+            }
         }
 
         state.intervention = None;
+        // 応答した介入はこの経路が閉じる (パネルは応答の後処理が隠す)。取り下げの印を残さない。
+        state.wait_panel_withdrawn = false;
         Ok(Some(shown.kind()))
     }
 
@@ -978,6 +1090,12 @@ impl Core {
             // 復帰の**介入**は**休息の長さ**の後に出直す (「もう少し休む」と同じ間合い)。
             InterventionKind::Return => {
                 state.return_until = Some(after(now, settings.rest_length_millis()));
+            }
+            // 待機の**介入**は**待機の長さ**の後に出直す (「あと少し」と同じ間合い)。
+            InterventionKind::Wait => {
+                if let Some(wait) = state.wait.as_mut() {
+                    wait.until = after(now, wait.length_millis);
+                }
             }
         }
         true
@@ -1012,18 +1130,46 @@ impl Core {
     /// 永続化に失敗したとき。状態は変わらない。
     pub fn begin_rest(&self) -> Result<bool, CoreError> {
         let mut state = self.lock();
-        let next = state.current_position.deactivate();
+        let now = self.clock.now();
+        self.rest_from(&mut state, now)
+    }
+
+    /// **休息**に入る遷移 ([`Self::begin_rest`] と休息の**介入**の「休息に入る」が
+    /// 共有する)。
+    ///
+    /// **待機中なら、先に**現在地**を戻り先へ戻してから休息に入り、待機を終える**
+    /// (利用者の裁定)。同じ**タスク**の中にいれば戻さない。表示中の待機の**介入**は
+    /// 取り下げる ([`Self::take_withdrawn_wait_panel`])。休息明けに主作業へ戻れるようにするためである。戻り先への移動・
+    /// **切り替え履歴** (メモの機会を与えていないため `note_written` は偽)・**非活性**化は
+    /// 単一のトランザクションで確定する (AD-5)。
+    ///
+    /// **未着手**と、既に**休息**中のときは何も書かず `false` を返す。永続化に失敗すれば
+    /// 状態は変わらない (**待機**も続く)。
+    fn rest_from(&self, state: &mut CoreState, now: Timestamp) -> Result<bool, CoreError> {
+        let returned = state
+            .wait
+            .as_ref()
+            .and_then(|wait| return_move(state, wait, now));
+        let base = returned.map_or(state.current_position, |(position, _)| position);
+        let next = base.deactivate();
         // **未着手**と、既に**休息**中。どちらも値が変わらない — 書けば、何も変えない
         // 要求が永続化の失敗で `Err` になりうる。
         if next == state.current_position {
             return Ok(false);
         }
-        self.storage.apply(&Commit::of_current_position(next))?;
+        self.storage.apply(&Commit {
+            task: None,
+            current_position: Some(next),
+            switch_record: returned.map(|(_, departed)| SwitchRecord::new(now, departed, false)),
+            settings: Vec::new(),
+            idea: None,
+            deleted_ideas: Vec::new(),
+        })?;
         state.current_position = next;
-        // **休息**に入った以上、出直しの約束は残さない
-        // ([`Self::answer_intervention`] の `Rest` と同じ)。開始はいまであり、復帰の
+        state.end_wait();
+        // **休息**に入った以上、出直しの約束は残さない。開始はいまであり、復帰の
         // **介入**はここから数える。
-        state.enter_rest(self.clock.now());
+        state.enter_rest(now);
         Ok(true)
     }
 
@@ -1061,6 +1207,127 @@ impl Core {
         state.grace_until = None;
         state.follow_rest(now);
         Ok(true)
+    }
+
+    // --- 待機 ---------------------------------------------------------------------
+
+    /// **待機**が終わったときに取り下げた待機の**介入**があったか。**読むと下ろす。**
+    ///
+    /// 提示層は待機を終えうる操作 ([`Self::return_from_wait`] / [`Self::begin_rest`]) の
+    /// 後にこれを読み、真ならパネルを隠してホットキーを解除する (AD-7 の閉じる経路を
+    /// 一つに保つため、隠すのは提示層の単一の経路である)。
+    pub fn take_withdrawn_wait_panel(&self) -> bool {
+        std::mem::take(&mut self.lock().wait_panel_withdrawn)
+    }
+
+    /// **待機に入る。** その時点の**現在地**を戻り先として覚え、`minutes` 分の後に
+    /// 待機の**介入**を出す。
+    ///
+    /// **何も書かない** — 戻り先・期限・何を待っているかは永続化しない (利用者の裁定 /
+    /// AD-2)。**連続作業時間**にも触れない (数え続ける)。
+    ///
+    /// # 戻り値
+    ///
+    /// **待機**に入ったか。**現在地**が**活性**でない (**未着手**・**休息**中) とき、
+    /// また既に**待機**中のときは `false` であり、何も変えない。
+    pub fn begin_wait(&self, minutes: NonZeroU32, label: Option<String>) -> bool {
+        let mut state = self.lock();
+        if state.wait.is_some() {
+            return false;
+        }
+        let CurrentPosition::Active {
+            task_id, step_id, ..
+        } = state.current_position
+        else {
+            return false;
+        };
+        // 分数は上限で頭打ちにする ([`rest::MAX_WAIT_MINUTES`])。
+        let length_millis = i64::from(minutes.get())
+            .min(rest::MAX_WAIT_MINUTES)
+            .saturating_mul(60_000);
+        let label = label
+            .map(|text| text.trim().to_string())
+            .filter(|text| !text.is_empty());
+        state.wait = Some(Wait {
+            return_to: (task_id, step_id),
+            until: after(self.clock.now(), length_millis),
+            length_millis,
+            label,
+        });
+        true
+    }
+
+    /// **主作業に戻る** — 待機中のオーバーレイの ⌘D (早めに戻る)。
+    ///
+    /// **現在地**が戻り先と別の**タスク**にあれば、離れる側の**中断メモ**の確定
+    /// (`note` があれば)・戻り先への移動・**切り替え履歴**の追記を単一のトランザクションで
+    /// 確定させ (AD-5)、**待機**を終える。**切り替え**と同じ扱いである。同じ**タスク**の
+    /// 中にいれば (主作業を進めていた場合を含む) 何も書かずに**待機**を終える — そのとき
+    /// `note` は確定しない (主作業を離れていない)。
+    ///
+    /// **表示中の待機の介入は取り下げる** (利用者の裁定・レビュー後)。提示層は
+    /// [`Self::take_withdrawn_wait_panel`] を読んでパネルを隠す。
+    ///
+    /// # Errors
+    ///
+    /// 永続化に失敗したとき。そのとき**現在地**は動かず、**待機**は続く。
+    pub fn return_from_wait(
+        &self,
+        note: Option<InterruptionNote>,
+    ) -> Result<WaitReturn, CoreError> {
+        let mut state = self.lock();
+        let now = self.clock.now();
+        self.leave_wait(&mut state, note, now)
+    }
+
+    /// **待機**を終えて戻り先へ戻る遷移 ([`Self::return_from_wait`] と待機の**介入**の
+    /// 「主作業に戻る」が共有する)。
+    fn leave_wait(
+        &self,
+        state: &mut CoreState,
+        note: Option<InterruptionNote>,
+        now: Timestamp,
+    ) -> Result<WaitReturn, CoreError> {
+        let Some(wait) = state.wait.as_ref() else {
+            return Ok(WaitReturn::NotWaiting);
+        };
+        let Some((moved, departed)) = return_move(state, wait, now) else {
+            state.end_wait();
+            return Ok(WaitReturn::Stayed);
+        };
+
+        // 離れる側の**中断メモ**。判断は複製の上で行い、永続化が成功したときにだけ
+        // メモリへ反映する (`switch_current_position` と同じ順序)。
+        let note_written = note.is_some();
+        let drafted = match note {
+            Some(note) => {
+                let index = state
+                    .tasks
+                    .iter()
+                    .position(|task| task.step(departed).is_some())
+                    .ok_or(DomainError::UnknownStep)?;
+                let mut draft = state.tasks[index].clone();
+                draft.set_interruption_note(departed, Some(note))?;
+                Some((index, draft))
+            }
+            None => None,
+        };
+
+        self.storage.apply(&Commit {
+            task: drafted.as_ref().map(|(_, draft)| draft.clone()),
+            current_position: Some(moved),
+            switch_record: Some(SwitchRecord::new(now, departed, note_written)),
+            settings: Vec::new(),
+            idea: None,
+            deleted_ideas: Vec::new(),
+        })?;
+
+        if let Some((index, draft)) = drafted {
+            state.tasks[index] = draft;
+        }
+        state.current_position = moved;
+        state.end_wait();
+        Ok(WaitReturn::Moved)
     }
 
     /// **設定値**を書き換える (AD-11)。
@@ -1203,6 +1470,31 @@ fn adjusted_position(position: CurrentPosition, decision: &Decision) -> Option<C
         position.step_id()?,
         position.is_active(),
         activated_at,
+    ))
+}
+
+/// 戻り先への移動。**現在地**が戻り先と同じ**タスク**の中にあれば `None`。
+///
+/// **主作業を進めていた (第 3 → 第 4) なら引き戻さない** (利用者の裁定・レビュー後)。
+/// 別の**タスク**にいるときだけ、覚えた**ステップ**へ戻す。
+///
+/// 返すのは移動後の**現在地**と離れる側の**ステップ**である。戻り先の**タスク**が
+/// 見つからなければ (v1 は**ステップ**を消さないため起きないはずだが) 移さない。
+fn return_move(
+    state: &CoreState,
+    wait: &Wait,
+    now: Timestamp,
+) -> Option<(CurrentPosition, StepId)> {
+    let departed = state.current_position.step_id()?;
+    let (task_id, step_id) = wait.return_to;
+    if state.current_position.task_id() == Some(task_id) {
+        return None;
+    }
+    state.task(task_id)?.step(step_id)?;
+    // **活性**のまま移るため**連続作業時間**はリセットされない (AD-8)。
+    Some((
+        state.current_position.move_to(task_id, step_id, now),
+        departed,
     ))
 }
 
@@ -3698,6 +3990,581 @@ mod tests {
             let before = storage.commits().len();
             tick_once(&core, &clock);
             assert_eq!(storage.commits().len(), before);
+        }
+    }
+
+    // --- 待機 ---------------------------------------------------------------------
+
+    mod waiting {
+        use super::*;
+        use std::num::NonZeroU32;
+
+        fn minutes(value: u32) -> NonZeroU32 {
+            NonZeroU32::new(value).expect("正の分数")
+        }
+
+        /// 主作業 (原稿) の第 3 **ステップ**で働いているコアと、別**タスク** (買い物) の
+        /// 第 1 **ステップ**。
+        fn a_core_on_the_main_work() -> (Core, Arc<RecordingStorage>, FixedClock, StepId, StepId) {
+            let (core, storage, clock) = a_core();
+            let main = core
+                .create_task("原稿", contents(&["一", "二", "三", "四"]))
+                .expect("作れる");
+            let other = core
+                .create_task("買い物", contents(&["米", "味噌"]))
+                .expect("作れる");
+            let snapshot = core.snapshot();
+            let third = snapshot.task(main).expect("ある").steps()[2].id();
+            let rice = snapshot.task(other).expect("ある").steps()[0].id();
+            core.move_current_position(third).expect("移せる");
+            (core, storage, clock, third, rice)
+        }
+
+        fn waiting_label(core: &Core) -> Option<Option<String>> {
+            core.snapshot()
+                .wait()
+                .map(|wait| wait.label().map(str::to_string))
+        }
+
+        /// I/O マトリクス「入る」— 待機中になり、**現在地**は第 3 のまま。何も書かない。
+        #[test]
+        fn entering_a_wait_remembers_the_main_work_and_writes_nothing() {
+            let (core, storage, _, third, _) = a_core_on_the_main_work();
+            let before = storage.commits().len();
+            let position = core.current_position();
+
+            assert!(core.begin_wait(minutes(5), Some("AI の出力".to_string())));
+
+            assert_eq!(waiting_label(&core), Some(Some("AI の出力".to_string())));
+            assert_eq!(
+                core.snapshot().wait().map(Wait::return_to),
+                Some(third),
+                "戻り先は入った時点の現在地"
+            );
+            assert_eq!(core.current_position(), position, "現在地は動かない");
+            assert_eq!(storage.commits().len(), before, "永続化しない");
+        }
+
+        /// 空白だけの「何を待っているか」は無いものとして扱う。
+        #[test]
+        fn a_blank_label_is_no_label() {
+            let (core, _, _, _, _) = a_core_on_the_main_work();
+            assert!(core.begin_wait(minutes(5), Some("   ".to_string())));
+            assert_eq!(waiting_label(&core), Some(None));
+        }
+
+        /// I/O マトリクス「入れない」— **休息**中・**未着手**では何もしない。
+        #[test]
+        fn a_wait_needs_an_active_position() {
+            let (core, _, _) = a_core();
+            assert!(!core.begin_wait(minutes(5), None), "未着手");
+            assert!(core.snapshot().wait().is_none());
+
+            let (core, _, _, _, _) = a_core_on_the_main_work();
+            assert!(core.begin_rest().expect("入れる"));
+            assert!(!core.begin_wait(minutes(5), None), "休息中");
+            assert!(core.snapshot().wait().is_none());
+        }
+
+        /// 既に待機中なら入り直さない — 戻り先が上書きされない。
+        #[test]
+        fn a_second_wait_does_not_replace_the_first() {
+            let (core, _, _, third, rice) = a_core_on_the_main_work();
+            assert!(core.begin_wait(minutes(5), Some("一つ目".to_string())));
+            core.select_step(rice).expect("移せる");
+
+            assert!(!core.begin_wait(minutes(9), Some("二つ目".to_string())));
+            assert_eq!(core.snapshot().wait().map(Wait::return_to), Some(third));
+            assert_eq!(waiting_label(&core), Some(Some("一つ目".to_string())));
+        }
+
+        /// I/O マトリクス「別タスクへ」— **現在地**は移り、戻り先は変わらない。
+        #[test]
+        fn moving_elsewhere_keeps_the_return_point() {
+            let (core, _, _, third, rice) = a_core_on_the_main_work();
+            assert!(core.begin_wait(minutes(5), None));
+
+            assert!(core.select_step(rice).expect("移せる"));
+
+            assert_eq!(core.current_position().step_id(), Some(rice));
+            assert_eq!(core.snapshot().wait().map(Wait::return_to), Some(third));
+        }
+
+        /// I/O マトリクス「時間が来る」— 5 分で待機の介入が出る。**待機は終わらない。**
+        #[test]
+        fn the_wait_intervention_comes_after_the_wait_length() {
+            let (core, _, clock, _, _) = a_core_on_the_main_work();
+            assert!(core.begin_wait(minutes(5), None));
+
+            assert!(
+                !tick_for(&core, &clock, 5 * MINUTE - TICK_INTERVAL_MILLIS),
+                "5 分に満たなければ出ない"
+            );
+            assert!(tick_once(&core, &clock), "5 分で出る");
+            assert_eq!(shown_kind(&core), Some(InterventionKind::Wait));
+            assert!(
+                core.snapshot().wait().is_some(),
+                "時間が来ても待機は終わらない — 促すだけである"
+            );
+        }
+
+        /// I/O マトリクス「戻る (移っていた)」— 主作業 第 3 へ戻り、履歴 1 行 (メモ無し)。
+        #[test]
+        fn returning_from_the_panel_takes_the_main_work_back() {
+            let (core, storage, clock, third, rice) = a_core_on_the_main_work();
+            let activated_at = core.current_position().activated_at();
+            assert!(core.begin_wait(minutes(5), None));
+            core.select_step(rice).expect("移せる");
+            assert!(tick_for(&core, &clock, 5 * MINUTE));
+            let before = storage.commits().len();
+
+            let answered = core
+                .answer_intervention(InterventionChoice::Rest)
+                .expect("応答できる");
+
+            assert_eq!(answered, Some(InterventionKind::Wait));
+            let position = core.current_position();
+            assert_eq!(position.step_id(), Some(third), "主作業 第 3 へ戻る");
+            assert!(position.is_active());
+            assert_eq!(
+                position.activated_at(),
+                activated_at,
+                "連続作業時間はリセットされない"
+            );
+            assert!(core.snapshot().wait().is_none(), "待機は終わる");
+            assert!(core.snapshot().intervention().is_none(), "パネルは閉じる");
+
+            let commits = storage.commits();
+            assert_eq!(commits.len(), before + 1, "1 トランザクション");
+            let commit = commits.last().expect("ある");
+            let record = commit.switch_record.as_ref().expect("切り替え履歴が 1 行");
+            assert_eq!(record.departed_step_id(), rice, "離れたのは別タスク");
+            assert!(
+                !record.note_written(),
+                "パネル経由はメモの機会を与えていない"
+            );
+            assert!(commit.task.is_none(), "メモは書かない");
+        }
+
+        /// I/O マトリクス「戻る (移っていた)」の失敗 — **待機は続き**、パネルも残る。
+        #[test]
+        fn a_failed_return_keeps_the_wait_and_the_intervention() {
+            let (core, storage, clock, _, rice) = a_core_on_the_main_work();
+            assert!(core.begin_wait(minutes(5), None));
+            core.select_step(rice).expect("移せる");
+            assert!(tick_for(&core, &clock, 5 * MINUTE));
+
+            storage.set_failing(true);
+            let outcome = core.answer_intervention(InterventionChoice::Rest);
+
+            assert!(matches!(outcome, Err(CoreError::Storage(_))));
+            assert_eq!(core.current_position().step_id(), Some(rice), "移らない");
+            assert!(core.snapshot().wait().is_some(), "待機は続く");
+            assert_eq!(shown_kind(&core), Some(InterventionKind::Wait));
+        }
+
+        /// I/O マトリクス「戻る (移っていない)」— 何も書かず、待機を終える。
+        #[test]
+        fn returning_while_still_on_the_main_work_writes_nothing() {
+            let (core, storage, clock, third, _) = a_core_on_the_main_work();
+            assert!(core.begin_wait(minutes(5), None));
+            assert!(tick_for(&core, &clock, 5 * MINUTE));
+            let before = storage.commits().len();
+
+            assert_eq!(
+                core.answer_intervention(InterventionChoice::Rest)
+                    .expect("応答できる"),
+                Some(InterventionKind::Wait)
+            );
+
+            assert_eq!(storage.commits().len(), before, "何も書かない");
+            assert_eq!(core.current_position().step_id(), Some(third));
+            assert!(core.snapshot().wait().is_none(), "待機は終わる");
+        }
+
+        /// I/O マトリクス「あと少し」— 5 分後に出直す。**何度でも。**
+        #[test]
+        fn a_little_longer_can_be_taken_without_limit() {
+            let (core, _, clock, _, _) = a_core_on_the_main_work();
+            assert!(core.begin_wait(minutes(5), None));
+            assert!(tick_for(&core, &clock, 5 * MINUTE));
+
+            for round in 0..5 {
+                assert_eq!(
+                    core.answer_intervention(InterventionChoice::Grace)
+                        .expect("応答できる"),
+                    Some(InterventionKind::Wait)
+                );
+                assert!(core.snapshot().wait().is_some(), "待機は続く");
+                assert!(
+                    !tick_for(&core, &clock, 5 * MINUTE - TICK_INTERVAL_MILLIS),
+                    "{round} 回目: すぐには出直さない"
+                );
+                assert!(tick_once(&core, &clock), "{round} 回目: 5 分後に出直す");
+                assert_eq!(shown_kind(&core), Some(InterventionKind::Wait));
+            }
+        }
+
+        /// 「あと少し」は**確定時の分数**の後に出直す — 設定の既定ではない。
+        #[test]
+        fn a_little_longer_uses_the_confirmed_minutes() {
+            let (core, _, clock, _, _) = a_core_on_the_main_work();
+            assert!(core.begin_wait(minutes(2), None));
+            assert!(tick_for(&core, &clock, 2 * MINUTE));
+            core.answer_intervention(InterventionChoice::Grace)
+                .expect("応答できる");
+
+            assert!(!tick_for(&core, &clock, 2 * MINUTE - TICK_INTERVAL_MILLIS));
+            assert!(tick_once(&core, &clock), "2 分後に出直す");
+        }
+
+        /// I/O マトリクス「早めに戻る」— 書きかけのメモを別タスクの**ステップ**に確定し、
+        /// 主作業へ戻る。**切り替えと同じく 1 トランザクションである** (AD-5)。
+        #[test]
+        fn returning_early_commits_the_note_where_it_was_written() {
+            let (core, storage, _, third, rice) = a_core_on_the_main_work();
+            assert!(core.begin_wait(minutes(5), None));
+            core.select_step(rice).expect("移せる");
+            let before = storage.commits().len();
+
+            let outcome = core
+                .return_from_wait(Some(InterruptionNote::new("米は 5kg")))
+                .expect("戻れる");
+
+            assert_eq!(outcome, WaitReturn::Moved);
+            assert_eq!(core.current_position().step_id(), Some(third));
+            assert!(core.snapshot().wait().is_none());
+            let note = core
+                .snapshot()
+                .task_of_step(rice)
+                .and_then(|task| task.step(rice))
+                .and_then(|step| step.interruption_note().map(|note| note.text().to_string()));
+            assert_eq!(note.as_deref(), Some("米は 5kg"), "離れる側のメモになる");
+
+            let commits = storage.commits();
+            assert_eq!(commits.len(), before + 1, "1 トランザクション");
+            let commit = commits.last().expect("ある");
+            assert!(commit.task.is_some(), "メモはこのコミットに載る");
+            let record = commit.switch_record.as_ref().expect("切り替え履歴が 1 行");
+            assert_eq!(record.departed_step_id(), rice);
+            assert!(record.note_written(), "メモを書いた切り替えである");
+        }
+
+        /// 早めに戻るときメモが無ければ、メモに触れず `note_written` は偽。
+        #[test]
+        fn returning_early_without_a_note_keeps_the_previous_note() {
+            let (core, storage, _, _, rice) = a_core_on_the_main_work();
+            core.set_interruption_note(rice, Some(InterruptionNote::new("前のメモ")))
+                .expect("置ける");
+            assert!(core.begin_wait(minutes(5), None));
+            core.select_step(rice).expect("移せる");
+
+            assert_eq!(
+                core.return_from_wait(None).expect("戻れる"),
+                WaitReturn::Moved
+            );
+
+            let commit = storage.commits().last().cloned().expect("ある");
+            assert!(commit.task.is_none());
+            assert!(!commit.switch_record.expect("履歴").note_written());
+        }
+
+        /// I/O マトリクス「早めに戻る」の失敗 — 移らず、メモも書かれず、待機は続く。
+        #[test]
+        fn a_failed_early_return_changes_nothing() {
+            let (core, storage, _, _, rice) = a_core_on_the_main_work();
+            assert!(core.begin_wait(minutes(5), None));
+            core.select_step(rice).expect("移せる");
+            let before = core.snapshot();
+
+            storage.set_failing(true);
+            let outcome = core.return_from_wait(Some(InterruptionNote::new("米は 5kg")));
+
+            assert!(matches!(outcome, Err(CoreError::Storage(_))));
+            assert_eq!(core.snapshot(), before, "メモも現在地も待機もそのまま");
+        }
+
+        /// 主作業から離れていなければ、何も書かずに待機を終える。**メモは確定しない。**
+        #[test]
+        fn returning_early_from_the_main_work_writes_nothing() {
+            let (core, storage, _, third, _) = a_core_on_the_main_work();
+            assert!(core.begin_wait(minutes(5), None));
+            let before = storage.commits().len();
+
+            let outcome = core
+                .return_from_wait(Some(InterruptionNote::new("書きかけ")))
+                .expect("戻れる");
+
+            assert_eq!(outcome, WaitReturn::Stayed);
+            assert_eq!(storage.commits().len(), before);
+            assert_eq!(core.current_position().step_id(), Some(third));
+            assert!(core.snapshot().wait().is_none());
+        }
+
+        /// 待機中でなければ何もしない。
+        #[test]
+        fn returning_without_a_wait_does_nothing() {
+            let (core, storage, _, _, _) = a_core_on_the_main_work();
+            let before = storage.commits().len();
+            assert_eq!(
+                core.return_from_wait(Some(InterruptionNote::new("x")))
+                    .expect("失敗しない"),
+                WaitReturn::NotWaiting
+            );
+            assert_eq!(storage.commits().len(), before);
+        }
+
+        /// I/O マトリクス「早めに戻った後のパネル」— パネルは取り下げられ、以後、休息の
+        /// 介入は通常どおり出る (利用者の裁定・レビュー後)。
+        #[test]
+        fn returning_early_withdraws_the_wait_panel() {
+            let (core, _, clock, third, rice) = a_core_on_the_main_work();
+            assert!(core.begin_wait(minutes(5), None));
+            core.select_step(rice).expect("移せる");
+            assert!(tick_for(&core, &clock, 5 * MINUTE));
+            assert!(
+                !core.take_withdrawn_wait_panel(),
+                "まだ何も取り下げていない"
+            );
+
+            core.return_from_wait(None).expect("戻れる");
+
+            assert_eq!(core.current_position().step_id(), Some(third));
+            assert!(core.snapshot().intervention().is_none(), "パネルは消える");
+            assert!(core.take_withdrawn_wait_panel(), "提示層へ隠すよう伝える");
+            assert!(!core.take_withdrawn_wait_panel(), "読むと下りる");
+
+            assert!(
+                tick_for(&core, &clock, 45 * MINUTE),
+                "休息の介入は通常どおり出る"
+            );
+            assert_eq!(shown_kind(&core), Some(InterventionKind::Rest));
+        }
+
+        /// I/O マトリクス「休息に入った後のパネル」— パネルが消え、休息に入る。
+        #[test]
+        fn resting_withdraws_the_wait_panel() {
+            let (core, _, clock, third, rice) = a_core_on_the_main_work();
+            assert!(core.begin_wait(minutes(5), None));
+            core.select_step(rice).expect("移せる");
+            assert!(tick_for(&core, &clock, 5 * MINUTE));
+
+            assert!(core.begin_rest().expect("入れる"));
+
+            assert!(core.snapshot().is_resting());
+            assert_eq!(core.current_position().step_id(), Some(third));
+            assert!(core.snapshot().intervention().is_none(), "パネルは消える");
+            assert!(core.take_withdrawn_wait_panel());
+        }
+
+        /// 応答で終わった待機は印を立てない — パネルは応答の後処理が隠す。
+        /// 待機の介入以外のパネルは取り下げない。
+        #[test]
+        fn only_a_wait_panel_left_behind_is_withdrawn() {
+            let (core, _, clock, _, _) = a_core_on_the_main_work();
+            assert!(core.begin_wait(minutes(5), None));
+            assert!(tick_for(&core, &clock, 5 * MINUTE));
+            core.answer_intervention(InterventionChoice::Rest)
+                .expect("応答できる");
+            assert!(!core.take_withdrawn_wait_panel());
+
+            // 休息の介入の表示中に早めに戻っても、休息の介入は残る。
+            assert!(core.begin_wait(minutes(120), None));
+            assert!(tick_for(&core, &clock, 45 * MINUTE));
+            assert_eq!(shown_kind(&core), Some(InterventionKind::Rest));
+            core.return_from_wait(None).expect("戻れる");
+            assert_eq!(shown_kind(&core), Some(InterventionKind::Rest));
+            assert!(!core.take_withdrawn_wait_panel());
+        }
+
+        /// I/O マトリクス「主作業を進めていた」— 第 3 で待機 → 第 4 へ切り替え →
+        /// 「主作業に戻る」で第 4 のまま。何も書かず、待機を終える。
+        #[test]
+        fn progress_within_the_main_work_is_not_undone() {
+            let (core, storage, clock, _, _) = a_core_on_the_main_work();
+            assert!(core.begin_wait(minutes(5), None));
+            let fourth = core
+                .switch_current_position(None, false)
+                .expect("切り替えられる")
+                .expect("第 4 がある");
+            assert!(tick_for(&core, &clock, 5 * MINUTE));
+            let before = storage.commits().len();
+
+            assert_eq!(
+                core.answer_intervention(InterventionChoice::Rest)
+                    .expect("応答できる"),
+                Some(InterventionKind::Wait)
+            );
+
+            assert_eq!(
+                core.current_position().step_id(),
+                Some(fourth),
+                "第 4 のまま"
+            );
+            assert_eq!(storage.commits().len(), before, "何も書かない");
+            assert!(core.snapshot().wait().is_none(), "待機は終わる");
+
+            // ⌘D と休息に入るときの戻しも同じ規則である。
+            assert!(core.begin_wait(minutes(5), None));
+            core.switch_current_position(None, false)
+                .expect("切り替えられる");
+            assert_eq!(
+                core.return_from_wait(Some(InterruptionNote::new("x")))
+                    .expect("戻れる"),
+                WaitReturn::Stayed
+            );
+            let position = core.current_position();
+            assert!(core.begin_wait(minutes(5), None));
+            assert!(core.begin_rest().expect("入れる"));
+            assert_eq!(core.current_position().step_id(), position.step_id());
+            assert!(storage
+                .commits()
+                .last()
+                .expect("ある")
+                .switch_record
+                .is_none());
+        }
+
+        /// I/O マトリクス「休息と重なる」— 休息の介入への応答の後に出る (AD-7)。
+        #[test]
+        fn the_wait_intervention_waits_for_the_rest_intervention() {
+            let (core, _, clock, _, _) = a_core_on_the_main_work();
+            assert!(!tick_for(&core, &clock, 46 * MINUTE));
+            assert!(core.begin_wait(minutes(5), None));
+
+            assert!(
+                tick_for(&core, &clock, 4 * MINUTE),
+                "50 分で休息の介入が出る"
+            );
+            assert_eq!(shown_kind(&core), Some(InterventionKind::Rest));
+            assert!(
+                !tick_for(&core, &clock, 5 * MINUTE),
+                "待機の期限が来ても表示中は待つ"
+            );
+            assert_eq!(shown_kind(&core), Some(InterventionKind::Rest));
+
+            core.answer_intervention(InterventionChoice::Grace)
+                .expect("応答できる");
+            assert!(tick_once(&core, &clock), "応答の後に出る");
+            assert_eq!(shown_kind(&core), Some(InterventionKind::Wait));
+        }
+
+        /// 受け入れ条件 — 待機中も**連続作業時間**は増え続け、休息の介入は通常どおり出る。
+        #[test]
+        fn the_work_clock_keeps_running_while_waiting() {
+            let (core, _, clock, _, rice) = a_core_on_the_main_work();
+            let activated_at = core.current_position().activated_at();
+            assert!(core.begin_wait(minutes(120), None));
+            core.select_step(rice).expect("移せる");
+
+            assert!(!tick_for(&core, &clock, 50 * MINUTE - TICK_INTERVAL_MILLIS));
+            assert_eq!(core.current_position().activated_at(), activated_at);
+            assert!(tick_once(&core, &clock), "50 分で休息の介入が出る");
+            assert_eq!(shown_kind(&core), Some(InterventionKind::Rest));
+        }
+
+        /// I/O マトリクス「待機中に休息」— ⌘R で主作業へ戻して休息に入り、待機を終える。
+        #[test]
+        fn declaring_a_rest_while_waiting_returns_to_the_main_work_first() {
+            let (core, storage, _, third, rice) = a_core_on_the_main_work();
+            assert!(core.begin_wait(minutes(5), None));
+            core.select_step(rice).expect("移せる");
+            let before = storage.commits().len();
+
+            assert!(core.begin_rest().expect("入れる"));
+
+            let position = core.current_position();
+            assert_eq!(position.step_id(), Some(third), "主作業へ戻っている");
+            assert!(!position.is_active(), "休息中である");
+            assert!(core.snapshot().wait().is_none(), "待機は終わる");
+
+            let commits = storage.commits();
+            assert_eq!(commits.len(), before + 1, "1 トランザクション");
+            let record = commits
+                .last()
+                .and_then(|commit| commit.switch_record.clone())
+                .expect("戻りは切り替え履歴に残る");
+            assert_eq!(record.departed_step_id(), rice);
+            assert!(!record.note_written());
+        }
+
+        /// 主作業にいるまま休息に入っても、履歴は積まず、待機を終える。
+        #[test]
+        fn declaring_a_rest_on_the_main_work_ends_the_wait_without_a_record() {
+            let (core, storage, _, third, _) = a_core_on_the_main_work();
+            assert!(core.begin_wait(minutes(5), None));
+
+            assert!(core.begin_rest().expect("入れる"));
+
+            assert_eq!(core.current_position().step_id(), Some(third));
+            assert!(core.snapshot().wait().is_none());
+            assert!(storage
+                .commits()
+                .last()
+                .expect("ある")
+                .switch_record
+                .is_none());
+        }
+
+        /// 休息の介入の「休息に入る」も同じく主作業へ戻してから休息に入る。
+        #[test]
+        fn resting_from_the_intervention_while_waiting_returns_first() {
+            let (core, _, clock, third, rice) = a_core_on_the_main_work();
+            assert!(core.begin_wait(minutes(120), None));
+            core.select_step(rice).expect("移せる");
+            assert!(tick_for(&core, &clock, 50 * MINUTE));
+            assert_eq!(shown_kind(&core), Some(InterventionKind::Rest));
+
+            core.answer_intervention(InterventionChoice::Rest)
+                .expect("応答できる");
+
+            assert_eq!(core.current_position().step_id(), Some(third));
+            assert!(!core.current_position().is_active());
+            assert!(core.snapshot().wait().is_none());
+        }
+
+        /// 休息へ入る書き込みに失敗したら、移らず、待機も続く。
+        #[test]
+        fn a_failed_rest_while_waiting_keeps_the_wait() {
+            let (core, storage, _, _, rice) = a_core_on_the_main_work();
+            assert!(core.begin_wait(minutes(5), None));
+            core.select_step(rice).expect("移せる");
+            let before = core.snapshot();
+
+            storage.set_failing(true);
+            assert!(core.begin_rest().is_err());
+            assert_eq!(core.snapshot(), before);
+        }
+
+        /// I/O マトリクス「時間が来る」の提示失敗 — 取り下げて待機の長さの後に出直す。
+        #[test]
+        fn a_withdrawn_wait_intervention_comes_back_after_the_wait_length() {
+            let (core, _, clock, _, _) = a_core_on_the_main_work();
+            assert!(core.begin_wait(minutes(5), None));
+            assert!(tick_for(&core, &clock, 5 * MINUTE));
+
+            assert!(core.withdraw_intervention());
+            assert!(core.snapshot().wait().is_some(), "待機は続く");
+            assert!(!tick_for(&core, &clock, 5 * MINUTE - TICK_INTERVAL_MILLIS));
+            assert!(tick_once(&core, &clock));
+            assert_eq!(shown_kind(&core), Some(InterventionKind::Wait));
+        }
+
+        /// I/O マトリクス「設定」— 面の分数の初期値は設定から決まる。
+        #[test]
+        fn the_initial_minutes_follow_the_setting() {
+            let (core, _, _, _, _) = a_core_on_the_main_work();
+            assert_eq!(core.snapshot().rest_settings().wait_length_minutes(), 5);
+            core.store_setting(Setting::new(rest::WAIT_LENGTH_KEY, "60"))
+                .expect("書ける");
+            assert_eq!(core.snapshot().rest_settings().wait_length_minutes(), 1);
+        }
+
+        /// **待機は永続化しない** — 起動し直したコアは待機していない (利用者の裁定)。
+        #[test]
+        fn a_restored_core_is_not_waiting() {
+            let (core, _, _) = a_core();
+            assert!(core.snapshot().wait().is_none());
         }
     }
 }

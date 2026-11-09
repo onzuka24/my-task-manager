@@ -343,7 +343,14 @@ test('復帰の介入でもパネルは自ら隠れず、オーバーレイも�
   expect(invoked.filter((cmd) => cmd === 'answer_intervention')).toHaveLength(1)
 })
 
-const MEANINGFUL_LABELS = ['休息に入る', '猶予の後に出直す', '休息を終える', 'もう少し休む']
+const MEANINGFUL_LABELS = [
+  '休息に入る',
+  '猶予の後に出直す',
+  '休息を終える',
+  'もう少し休む',
+  '主作業に戻る',
+  'あと少し',
+]
 
 function labels(): string[] {
   return choices().map((button) => button.querySelector('.label')?.textContent?.trim() ?? '')
@@ -388,4 +395,62 @@ test('介入の報せを受けたら、取り直しが済むまで前の種類�
   release({ ...SNAPSHOT, kind: 'rest' })
   await settle()
   expect(labels()).toEqual(['休息に入る', '猶予の後に出直す'])
+})
+
+// --- 待機の介入 -------------------------------------------------------------
+
+async function raiseWait(): Promise<void> {
+  snapshot = { ...SNAPSHOT, kind: 'wait' }
+  await emit('intervention_raised', null)
+  await settle()
+}
+
+test('待機の介入は「主作業に戻る」「あと少し」の二択を示す', async () => {
+  await raiseWait()
+
+  expect(choices()).toHaveLength(2)
+  expect(labels()).toEqual(['主作業に戻る', 'あと少し'])
+  expect(document.querySelector('.prompt')?.textContent).toContain('主作業に戻る時間です。')
+})
+
+test('待機の介入も同じ二つの打鍵を案内する (AD-7) — 新しいホットキーを足さない', async () => {
+  await raiseWait()
+
+  const text = document.body.textContent ?? ''
+  expect(text).toContain('Control + Option + R')
+  expect(text).toContain('Control + Option + G')
+})
+
+test('「主作業に戻る」は rest、「あと少し」は grace を送る', async () => {
+  await raiseWait()
+
+  choiceLabeled('主作業に戻る').click()
+  await settle()
+  expect(argsOf('answer_intervention')).toEqual({ request: { choice: 'rest' } })
+
+  calls = []
+  choiceLabeled('あと少し').click()
+  await settle()
+  expect(argsOf('answer_intervention')).toEqual({ request: { choice: 'grace' } })
+})
+
+test('受け入れ条件 — 待機の介入は残り時間・経過・回数を描かない (AD-15)', async () => {
+  await raiseWait()
+
+  const text = (document.body.textContent ?? '').replaceAll(/Control \+ Option \+ [RG]/g, '')
+  expect(text).not.toMatch(/[0-9０-９]/)
+  expect(text).not.toMatch(/[0-9０-９〇一二三四五六七八九十百]+\s*(分|秒|回)/)
+  for (const forbidden of ['残り', '経過', '%', '回目']) {
+    expect(text).not.toContain(forbidden)
+  }
+})
+
+test('待機の介入でもパネルは自ら隠れず、オーバーレイも自ら開かない — どちらもコアが行う', async () => {
+  await raiseWait()
+
+  choiceLabeled('主作業に戻る').click()
+  await settle()
+
+  expect(invoked.filter((cmd) => cmd.includes('overlay'))).toEqual([])
+  expect(invoked.filter((cmd) => cmd === 'answer_intervention')).toHaveLength(1)
 })
