@@ -172,7 +172,9 @@ pub fn run() {
             commands::get_intervention_snapshot,
             commands::answer_intervention,
             commands::begin_rest,
-            commands::end_rest
+            commands::end_rest,
+            commands::begin_wait,
+            commands::return_from_wait
         ])
         // 第 2 層 — 閉じる要求は破棄ではなく非表示に変換する。
         //

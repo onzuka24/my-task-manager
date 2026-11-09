@@ -103,7 +103,9 @@ flowchart LR
 | `create_task` | Overlay | タスクを作る (`⌘N`)。`ideaId` があれば思いつきからの昇格で、同じトランザクションでその思いつきを消す |
 | `capture_idea` | Overlay | 思いつきを置く (`⌘I`)。現在地・中断メモ・休息に触れない。イベントは発行しない |
 | `get_task_draft` / `edit_task` | Overlay | タスクを直す (`⌘E`) |
-| `begin_rest` / `end_rest` | Overlay | 休息に入る (`⌘R`) / 終える |
+| `begin_rest` / `end_rest` | Overlay | 休息に入る (`⌘R`) / 終える。待機中の `begin_rest` は、現在地が戻り先と別のタスクにあれば**現在地を戻り先へ移して** (切り替え履歴 1 行) から休息に入り、待機を終える。表示中の待機の介入は取り下げてパネルを隠す。休息に入れば `current_position_changed` を発行する |
+| `begin_wait` | Overlay | 待機に入る (`⌘D`)。分数 (文字列) と何を待っているかを受け取り、現在地を戻り先として覚える。何も永続化せず、イベントも発行しない |
+| `return_from_wait` | Overlay | 待機中の `⌘D` で主作業に戻る。現在地が戻り先と別のタスクにあれば書きかけのメモの確定・移動・切り替え履歴を 1 トランザクションで書き、そのときだけ `current_position_changed` を発行する。同じタスクの中なら何も書かない。どちらでも待機を終え、表示中の待機の介入を取り下げてパネルを隠す |
 | `hide_overlay` / `mark_overlay_hidden` | Overlay | 閉じる |
 | `get_intervention_snapshot` | Intervention | 介入パネルの中身 |
 | `answer_intervention` | Intervention | 介入への応答 |
@@ -138,7 +140,7 @@ sequenceDiagram
     S->>T: 刻みを開始
     loop 10 秒ごと
         T->>C: tick()
-        Note over C: 寿命を過ぎた思いつきを消す
+        Note over C: 休息 → 復帰 → 待機の順に介入を判定 (表示中は待つ)<br/>出さなければ寿命を過ぎた思いつきを消す
         C-->>T: 介入を出すか
     end
 ```

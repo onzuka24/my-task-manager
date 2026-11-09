@@ -100,3 +100,7 @@
 - source_spec: `_bmad-output/implementation-artifacts/spec-idea-capture.md`
   summary: Tauri コマンドの本体 (`capture_idea` の本文の正規化、`create_task` が昇格元の思いつきをコアへ渡すこと) を通すテストが無く、本体の 1 行を戻す退行が全テストを通過しうる (medium・未検証の退行の余地)。
   evidence: 純粋関数 (`as_idea_content` / `idea_to_promote`)・コア (`Core::capture_idea` / `create_task_promoting`)・フロント (IPC の模擬) はそれぞれ検査されるが、その間をつなぐコマンド本体はどれも呼ばれない。リポジトリには `tauri::test` / `mock_builder` の仕掛けが無く、既存のどのコマンドも同じ状態である。コマンド本体を通す検査の基盤を入れるときに併せて扱う。
+
+- source_spec: `_bmad-output/implementation-artifacts/spec-wait.md`
+  summary: スナップショットの取り直しが尽きたときに `forgetPosition()` が `waiting` / `resting` を倒すことを確かめる検査が無い (low)。
+  evidence: `forgetPosition` は確認できていない待機・休息に対して ⌘D・Enter が `return_from_wait` / `end_rest` を撃たないための守りだが、待機中・休息中を描いた後にスナップショットを失敗させる検査がどこにも無く、行を消しても全テストが通る。二つの旗をまとめて、古いスナップショットの検査として足す。

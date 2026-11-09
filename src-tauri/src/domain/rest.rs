@@ -25,6 +25,12 @@
 //! 戻るきっかけを差し出す判定は [`decide_return`] が持つ。こちらは実時間で数え、
 //! **スリープ中の時間も休息に含める** — スリープは離席である。**休息**を時間で
 //! 終わらせはしない。促すだけである (FR-15)。
+//!
+//! # 待機の介入も別の判定である
+//!
+//! **待機**に入ってから**待機の長さ**が経ったら主作業へ戻るきっかけを差し出す判定は
+//! [`decide_wait`] が持つ。契機は時間だけであり、AI の完了などの外部の出来事を見ない。
+//! **待機**を時間で終わらせはしない。促すだけである。
 
 use super::position::CurrentPosition;
 use super::setting::{self, Setting};
@@ -51,6 +57,18 @@ pub const DEFAULT_REST_LENGTH_SECONDS: i64 = 10 * 60;
 /// **休息の長さ**を保存する鍵。
 pub const REST_LENGTH_KEY: &str = "rest_length_seconds";
 
+/// **待機の長さ**の既定値 — 5 分。DB に値が無ければこれを使う (AD-11)。
+///
+/// 待機の面の分数の初期値であり、利用者が確定した分数が実際の長さになる。
+pub const DEFAULT_WAIT_LENGTH_SECONDS: i64 = 5 * 60;
+
+/// **待機の長さ**を保存する鍵。
+pub const WAIT_LENGTH_KEY: &str = "wait_length_seconds";
+
+/// 待機の分数の上限 — 1 日。設定値から作る面の初期値も、確定した分数もここで頭打ちに
+/// する。待機は短い別作業のためのものであり、桁外れの値で期限の算術を壊さない。
+pub const MAX_WAIT_MINUTES: i64 = 24 * 60;
+
 /// 計時の刻みの間隔 (ミリ秒)。
 ///
 /// **細かくしても得るものが無い。** 閾値は分の単位であり、待機時の CPU 予算 (AD-14) に
@@ -64,7 +82,7 @@ pub const TICK_INTERVAL_MILLIS: i64 = 10_000;
 /// 実体がこの係数である。**
 pub const SLEEP_GAP_FACTOR: i64 = 3;
 
-/// **休息閾値**・**猶予**・**休息の長さ** (AD-11)。
+/// **休息閾値**・**猶予**・**休息の長さ**・**待機の長さ** (AD-11)。
 ///
 /// 値は設定テーブルから読み、無ければコード内の定数を使う。**別建ての設定ファイルを
 /// 持たない。**
@@ -73,6 +91,7 @@ pub struct RestSettings {
     rest_threshold_seconds: i64,
     grace_period_seconds: i64,
     rest_length_seconds: i64,
+    wait_length_seconds: i64,
 }
 
 impl Default for RestSettings {
@@ -81,6 +100,7 @@ impl Default for RestSettings {
             rest_threshold_seconds: DEFAULT_REST_THRESHOLD_SECONDS,
             grace_period_seconds: DEFAULT_GRACE_PERIOD_SECONDS,
             rest_length_seconds: DEFAULT_REST_LENGTH_SECONDS,
+            wait_length_seconds: DEFAULT_WAIT_LENGTH_SECONDS,
         }
     }
 }
@@ -101,6 +121,8 @@ impl RestSettings {
                 .unwrap_or(fallback.grace_period_seconds),
             rest_length_seconds: setting::positive_seconds(settings, REST_LENGTH_KEY)
                 .unwrap_or(fallback.rest_length_seconds),
+            wait_length_seconds: setting::positive_seconds(settings, WAIT_LENGTH_KEY)
+                .unwrap_or(fallback.wait_length_seconds),
         }
     }
 
@@ -120,6 +142,28 @@ impl RestSettings {
     #[must_use]
     pub const fn rest_length_seconds(&self) -> i64 {
         self.rest_length_seconds
+    }
+
+    /// **待機の長さ** (秒)。待機の面の分数の初期値の元である。
+    #[must_use]
+    pub const fn wait_length_seconds(&self) -> i64 {
+        self.wait_length_seconds
+    }
+
+    /// **待機の長さ**を分に直した値。**待機の面の分数の初期値である。**
+    ///
+    /// 端数は切り上げ、1 分を下回らず [`MAX_WAIT_MINUTES`] を超えない — 0 分を初期値に
+    /// すれば、そのまま確定できない値を差し出すことになる。桁外れの設定値でも溢れない。
+    #[must_use]
+    pub const fn wait_length_minutes(&self) -> i64 {
+        let minutes = self.wait_length_seconds.saturating_add(59) / 60;
+        if minutes < 1 {
+            1
+        } else if minutes > MAX_WAIT_MINUTES {
+            MAX_WAIT_MINUTES
+        } else {
+            minutes
+        }
     }
 
     /// **休息の長さ** (ミリ秒)。
@@ -152,6 +196,8 @@ pub enum InterventionKind {
     Rest,
     /// **休息**から戻るよう促す。**休息**に入ってから**休息の長さ**が経ったとき。
     Return,
+    /// **待機**から主作業へ戻るよう促す。**待機**に入ってから**待機の長さ**が経ったとき。
+    Wait,
 }
 
 /// 表示中の**介入** (AD-2「介入の表示状態」)。**永続化しない。起動時は常に非表示。**
@@ -198,19 +244,21 @@ impl Intervention {
 /// そのため変種はパネルの「一つ目」「二つ目」に当たり、コアで何を起こすかは表示中の
 /// [`InterventionKind`] が決める。
 ///
-/// | 変種 | [`InterventionKind::Rest`] | [`InterventionKind::Return`] |
-/// | --- | --- | --- |
-/// | `Rest` (`Control + Option + R`) | **休息**に入る | **休息**を終える |
-/// | `Grace` (`Control + Option + G`) | **猶予**の後に出直す | もう少し休む |
+/// | 変種 | [`InterventionKind::Rest`] | [`InterventionKind::Return`] | [`InterventionKind::Wait`] |
+/// | --- | --- | --- | --- |
+/// | `Rest` (`Control + Option + R`) | **休息**に入る | **休息**を終える | 主作業に戻る |
+/// | `Grace` (`Control + Option + G`) | **猶予**の後に出直す | もう少し休む | あと少し |
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum InterventionChoice {
     /// 休息の**介入**では**休息**に入る (**現在地**は値を保ったまま**非活性**になり、
     /// 計数が止まる)。復帰の**介入**では**休息**を終える (**活性**へ戻り、計数を
-    /// 数え直す)。
+    /// 数え直す)。待機の**介入**では主作業に戻る (**現在地**を戻り先へ戻し、**待機**を
+    /// 終える)。
     Rest,
     /// 休息の**介入**では**猶予**の後に再提示する (**現在地**は**活性**のまま)。
     /// 復帰の**介入**では**休息の長さ**の後に出直す (**休息**は続く)。
+    /// 待機の**介入**では**待機の長さ**の後に出直す (**待機**は続く)。
     Grace,
 }
 
@@ -375,6 +423,40 @@ pub fn decide_return(tick: &ReturnTick) -> bool {
         (None, None) => return false,
     };
     tick.now >= deadline
+}
+
+/// 待機の刻みが見るすべて。**OS を知らない。**
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WaitTick {
+    /// **待機**中か。**待機**中でなければ待機の**介入**は出ない。
+    pub waiting: bool,
+    /// 待機の**介入**を出す時刻 — 入ってから、または「あと少し」から**待機の長さ**の後。
+    /// **永続化しない** (AD-2)。
+    pub until: Option<Timestamp>,
+    /// いまの時刻。
+    pub now: Timestamp,
+    /// **介入**が既に表示されているか。**表示中は後発が待つ** (AD-7)。
+    pub showing: bool,
+}
+
+/// **待機の介入を発するか。**
+///
+/// # 規則
+///
+/// 1. **待機**中でなければ、また**介入**が表示中なら、発しない。
+/// 2. 期限に達したとき発する。
+///
+/// **契機は時間だけである。** AI の完了などの外部の出来事を見ない。実時間で比べるだけで
+/// あり、スリープ中の時間も含める — 眠っている間に出力は出ており、起きた最初の刻みで
+/// 戻るきっかけを出すほうが、さらに待たせるより目的に適う。
+///
+/// **待機を終わらせない。** この関数が決めるのは促すかどうかだけである。
+#[must_use]
+pub fn decide_wait(tick: &WaitTick) -> bool {
+    if !tick.waiting || tick.showing {
+        return false;
+    }
+    tick.until.is_some_and(|until| tick.now >= until)
 }
 
 #[cfg(test)]
@@ -760,6 +842,112 @@ mod tests {
         assert_eq!(
             serde_json::to_value(InterventionChoice::Grace).expect("直列化できる"),
             serde_json::json!("grace")
+        );
+    }
+
+    // --- 待機の介入 -------------------------------------------------------------
+
+    fn a_wait_tick(until: Timestamp, now: Timestamp) -> WaitTick {
+        WaitTick {
+            waiting: true,
+            until: Some(until),
+            now,
+            showing: false,
+        }
+    }
+
+    /// **待機の長さ**の既定は 5 分であり、面の初期値は 5 分である。
+    #[test]
+    fn the_default_wait_length_is_five_minutes() {
+        let settings = RestSettings::default();
+        assert_eq!(settings.wait_length_seconds(), 5 * 60);
+        assert_eq!(settings.wait_length_minutes(), 5);
+    }
+
+    /// I/O マトリクス「設定」— `wait_length_seconds` = 60 なら初期値 1 分。不正なら 5 分。
+    #[test]
+    fn the_wait_length_is_read_from_the_settings() {
+        let settings = RestSettings::from_settings(&[Setting::new(WAIT_LENGTH_KEY, "60")]);
+        assert_eq!(settings.wait_length_seconds(), 60);
+        assert_eq!(settings.wait_length_minutes(), 1);
+        for broken in ["0", "-60", "そのうち", ""] {
+            let settings = RestSettings::from_settings(&[Setting::new(WAIT_LENGTH_KEY, broken)]);
+            assert_eq!(
+                settings.wait_length_seconds(),
+                300,
+                "{broken:?} は既定へ落ちる"
+            );
+            assert_eq!(settings.wait_length_minutes(), 5);
+        }
+    }
+
+    /// 分に直すと端数は切り上がり、0 分にはならない。
+    #[test]
+    fn the_wait_length_in_minutes_never_reaches_zero() {
+        for (seconds, minutes) in [("1", 1), ("59", 1), ("61", 2), ("90", 2), ("600", 10)] {
+            assert_eq!(
+                RestSettings::from_settings(&[Setting::new(WAIT_LENGTH_KEY, seconds)])
+                    .wait_length_minutes(),
+                minutes,
+                "{seconds} 秒"
+            );
+        }
+    }
+
+    /// 桁外れの設定値でも溢れず、上限で頭打ちになる。
+    #[test]
+    fn a_huge_wait_length_does_not_overflow() {
+        let huge = i64::MAX.to_string();
+        let settings = RestSettings::from_settings(&[Setting::new(WAIT_LENGTH_KEY, huge)]);
+        assert_eq!(settings.wait_length_minutes(), MAX_WAIT_MINUTES);
+        let day_and_more = (MAX_WAIT_MINUTES * 60 + 1).to_string();
+        assert_eq!(
+            RestSettings::from_settings(&[Setting::new(WAIT_LENGTH_KEY, day_and_more)])
+                .wait_length_minutes(),
+            MAX_WAIT_MINUTES
+        );
+    }
+
+    /// I/O マトリクス「時間が来る」— 期限で出る。それより前は出ない。
+    #[test]
+    fn the_wait_intervention_comes_at_its_deadline() {
+        let until = Timestamp::from_unix_millis(T0.unix_millis() + 5 * MINUTE);
+        assert!(!decide_wait(&a_wait_tick(
+            until,
+            Timestamp::from_unix_millis(until.unix_millis() - 1)
+        )));
+        assert!(decide_wait(&a_wait_tick(until, until)));
+        assert!(decide_wait(&a_wait_tick(
+            until,
+            Timestamp::from_unix_millis(until.unix_millis() + 30 * MINUTE)
+        )));
+    }
+
+    /// **待機**中でなければ、また表示中なら出ない (AD-7)。
+    #[test]
+    fn the_wait_intervention_needs_a_wait_and_an_empty_panel() {
+        let until = T0;
+        let now = Timestamp::from_unix_millis(T0.unix_millis() + MINUTE);
+
+        let mut tick = a_wait_tick(until, now);
+        tick.waiting = false;
+        assert!(!decide_wait(&tick), "待機中でなければ出ない");
+
+        let mut tick = a_wait_tick(until, now);
+        tick.showing = true;
+        assert!(!decide_wait(&tick), "表示中は後発が待つ");
+
+        let mut tick = a_wait_tick(until, now);
+        tick.until = None;
+        assert!(!decide_wait(&tick), "期限が分からなければ出さない");
+    }
+
+    /// 種類の綴りを固定する。介入パネルが文言を出し分ける鍵である。
+    #[test]
+    fn the_wait_kind_keeps_its_spelling() {
+        assert_eq!(
+            serde_json::to_value(InterventionKind::Wait).expect("直列化できる"),
+            serde_json::json!("wait")
         );
     }
 }

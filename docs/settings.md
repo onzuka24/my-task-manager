@@ -12,6 +12,7 @@
 | `rest_threshold_seconds` | `3000` (50 分) | 休息閾値。連続作業時間がこれを超えると休息の介入パネルが出る |
 | `grace_period_seconds` | `900` (15 分) | 猶予。介入に「猶予」(`Ctrl+Opt+G`) で応じたとき、次に出直すまでの時間 |
 | `rest_length_seconds` | `600` (10 分) | 休息の長さ。休息に入ってからこれだけ経つと戻るきっかけのパネルが出る。「もう少し休む」でも同じ長さの後に出直す |
+| `wait_length_seconds` | `300` (5 分) | 待機の長さ。待機の面 (`⌘D`) の分数の初期値 (分に直して切り上げ、1 分未満にならない)。実際に介入が出るまでの時間と「あと少し」の間合いは、待機に入るときに確定した分数である |
 | `idea_lifetime_seconds` | `1209600` (14 日) | 思いつきの寿命。置いてからこれを過ぎた思いつき (昇格しなかったもの) は、計時の刻みで DB から消える。消えたことは知らせない |
 
 ### 値の読み方
@@ -99,6 +100,7 @@ INSERT INTO setting (key, value) VALUES
   ('rest_threshold_seconds', '60'),
   ('grace_period_seconds',   '30'),
   ('rest_length_seconds',    '60'),
+  ('wait_length_seconds',    '60'),
   ('idea_lifetime_seconds',  '60')
 ON CONFLICT(key) DO UPDATE SET value = excluded.value;
 SQL

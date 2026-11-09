@@ -30,6 +30,7 @@
 //!
 //! スパイン「一貫性の規約」。**切り替え**の成否は記録してよいが、本文は決して残さない。
 
+use std::num::NonZeroU32;
 use std::sync::Mutex;
 
 use tauri::{AppHandle, Manager, Runtime, State};
@@ -37,8 +38,8 @@ use tauri::{AppHandle, Manager, Runtime, State};
 use crate::adapters::hotkey::{HotkeyStatus, ResponseHotkeyStatus};
 use crate::adapters::{intervention, presentation};
 use crate::domain::idea::IdeaId;
-use crate::domain::rest::{InterventionChoice, InterventionKind};
-use crate::domain::state::{Core, CoreState};
+use crate::domain::rest::{InterventionChoice, InterventionKind, RestSettings};
+use crate::domain::state::{Core, CoreState, WaitReturn};
 use crate::domain::task::{InterruptionNote, Step, StepId, Task, TaskId};
 
 /// コアが `manage` されていないときに示す理由。
@@ -154,6 +155,22 @@ pub struct OverlaySnapshot {
     /// **休息**には戻る先があり、終了を宣言できる。**残り時間は運ばない** — 常時の
     /// カウントダウンを作らないためであり、運ぶ欄が無ければ描ける値も無い (AD-15)。
     pub resting: bool,
+    /// **待機**中か。
+    ///
+    /// **期限・残り時間・経過・回数は運ばない** (AD-15)。欄が無ければ描ける値も無い。
+    pub waiting: bool,
+    /// 何を待っているか。**待機**中でない・空なら `None`。
+    pub wait_label: Option<String>,
+    /// 待機の面の分数の初期値 — **待機の長さ** (設定値) を分に直した値。
+    ///
+    /// **設定値であって残り時間ではない。** 待機中でも変わらない。
+    pub wait_length_minutes: u32,
+}
+
+/// 待機の面の分数の初期値。[`RestSettings::wait_length_minutes`] が唯一の出所である
+/// (1 以上・上限以下に収まっている)。
+fn wait_length_minutes_of(settings: &RestSettings) -> u32 {
+    u32::try_from(settings.wait_length_minutes()).unwrap_or(1)
 }
 
 /// **コア状態を描画用のスナップショットへ落とす純粋関数。**
@@ -176,6 +193,10 @@ fn snapshot_of(hotkey: HotkeyStatus, state: Option<&CoreState>) -> OverlaySnapsh
         step_count: None,
         interruption_note: None,
         resting: false,
+        waiting: false,
+        wait_label: None,
+        // コアが読めないときは既定の設定値から作る。
+        wait_length_minutes: wait_length_minutes_of(&RestSettings::default()),
     };
 
     let Some(state) = state else {
@@ -185,8 +206,12 @@ fn snapshot_of(hotkey: HotkeyStatus, state: Option<&CoreState>) -> OverlaySnapsh
         };
     };
 
+    let wait = state.wait();
     let empty = OverlaySnapshot {
         resting: state.is_resting(),
+        waiting: wait.is_some(),
+        wait_label: wait.and_then(|wait| wait.label()).map(str::to_string),
+        wait_length_minutes: wait_length_minutes_of(&state.rest_settings()),
         ..empty
     };
 
@@ -541,6 +566,99 @@ pub struct CreateTaskRequest {
 pub struct CaptureIdeaRequest {
     /// 一行の本文。前後の空白を除いて空なら置かない。
     pub content: String,
+}
+
+/// `begin_wait` が受け取る要求。**これがコマンドの引数型そのものである。**
+///
+/// フロントは `invoke('begin_wait', { request: { minutes, label } })` と呼ぶ。
+///
+/// # なぜ分数を文字列で受け取るのか
+///
+/// 「正の整数でなければ確定しない」という規則は**一箇所にしか無いべきである**
+/// ([`as_wait_minutes`])。数で受け取れば、入力欄の文字列を読む判断がフロントへ移る
+/// (`CreateTaskRequest` が**ステップ**を文字列で受け取るのと同じ理由)。
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct BeginWaitRequest {
+    /// 待つ分数。入力欄の文字列そのもの。
+    pub minutes: String,
+    /// 何を待っているか。任意。`null`・空白だけなら無いものとして扱う。
+    #[serde(default)]
+    pub label: Option<String>,
+}
+
+/// **待機**の開始の結末。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BeginWaitOutcome {
+    /// **待機**に入ったか。**現在地**が**活性**でない・既に**待機**中のときは偽であり、
+    /// 何も変わっていない。
+    pub waiting: bool,
+}
+
+/// `return_from_wait` が受け取る要求。**これがコマンドの引数型そのものである。**
+///
+/// フロントは `invoke('return_from_wait', { request: { note } })` と呼ぶ。
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ReturnFromWaitRequest {
+    /// 離れる側に確定する**中断メモ**。`null` および空欄は**省略**であり、既存のメモを
+    /// 変えない。**提示された既存メモをそのまま送り返してはならない** ([`SwitchRequest`]
+    /// と同じ規則)。**現在地**が戻り先と同じ**タスク**の中にあれば確定しない — 主作業を離れていない。
+    pub note: Option<String>,
+}
+
+/// **待機**から戻った結末。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReturnFromWaitOutcome {
+    /// **待機**中であり、**待機**を終えたか。偽なら何も起きていない。
+    pub returned: bool,
+    /// **現在地**を戻り先へ移したか。偽なら戻り先と同じ**タスク**の中にいた (または
+    /// 戻り先が見つからなかった) のであり、何も書かれていない (送ったメモも確定して
+    /// いない)。
+    pub moved: bool,
+}
+
+/// 分数が正の整数でないことを示す理由。**面を残して 1 行で提示される。**
+const WAIT_MINUTES_INVALID: &str = "待つ分数は正の整数で書くこと。待機には入っていない。";
+
+/// **待つ分数を読む純粋関数。** 前後の空白を除いて正の整数でなければ拒む。
+///
+/// 日本語入力で打った全角数字 (「１０」) は半角へ直してから読む。数字以外の文字
+/// (「５分」の「分」) は直さないため、そのまま拒まれる。
+fn as_wait_minutes(minutes: &str) -> Result<NonZeroU32, String> {
+    let ascii: String = minutes
+        .trim()
+        .chars()
+        .map(|c| match c {
+            '０'..='９' => {
+                char::from_u32(u32::from(c) - u32::from('０') + u32::from('0')).unwrap_or(c)
+            }
+            _ => c,
+        })
+        .collect();
+    ascii
+        .parse::<NonZeroU32>()
+        .map_err(|_| WAIT_MINUTES_INVALID.to_string())
+}
+
+/// **待機**の結末を境界の形へ落とす純粋関数。
+const fn wait_return_outcome(outcome: WaitReturn) -> ReturnFromWaitOutcome {
+    match outcome {
+        WaitReturn::NotWaiting => ReturnFromWaitOutcome {
+            returned: false,
+            moved: false,
+        },
+        WaitReturn::Stayed => ReturnFromWaitOutcome {
+            returned: true,
+            moved: false,
+        },
+        WaitReturn::Moved => ReturnFromWaitOutcome {
+            returned: true,
+            moved: true,
+        },
+    }
 }
 
 /// 本文が空であることを示す理由。**入力欄を残して提示される** (I/O マトリクス「空」)。
@@ -1485,6 +1603,8 @@ pub fn begin_rest<R: Runtime>(app: AppHandle<R>) -> Result<BeginRestOutcome, Str
     let core = require_core(app.try_state::<Core>())?;
 
     let rested = core.begin_rest().map_err(|error| error.to_string())?;
+    // 待機中だったなら待機は終わっている。取り残された待機のパネルを隠す。
+    intervention::hide_withdrawn(&app, &core);
     // **非活性になったのは状態の変化である。** 既定表示は「休息中」を描くため、
     // 取り直しの契機を送る (AD-3) — `answer_intervention` の `Rest` と同じ扱い。
     if rested {
@@ -1515,6 +1635,67 @@ pub fn end_rest<R: Runtime>(app: AppHandle<R>) -> Result<EndRestOutcome, String>
 
     log::info!("the end of a rest was declared (resumed={resumed})");
     Ok(EndRestOutcome { resumed })
+}
+
+/// **待機に入る。** その時点の**現在地**を戻り先として覚える。
+///
+/// **何も永続化しない** (利用者の裁定)。**連続作業時間**は数え続ける。
+///
+/// # なぜイベントを発行しないのか
+///
+/// 待機中であることを描く面は既定表示だけであり、呼び出し側はこの後スナップショットを
+/// 取り直す (AD-3)。メニューバー項目にも介入パネルにも描くものが無い — 発行すれば、
+/// **現在地**が動いていないのに `current_position_changed` を主張することになる。
+///
+/// # Errors
+///
+/// 分数が正の整数でないとき、またはコアが `manage` されていないとき。いずれの場合も
+/// **待機**には入っていない。呼び出し側は面を残して理由を 1 行示す。
+#[tauri::command]
+pub fn begin_wait<R: Runtime>(
+    app: AppHandle<R>,
+    request: BeginWaitRequest,
+) -> Result<BeginWaitOutcome, String> {
+    // **コアを要求する前に入力を検める** (`create_task` と同じ順序)。
+    let minutes = as_wait_minutes(&request.minutes)?;
+    let core = require_core(app.try_state::<Core>())?;
+    let waiting = core.begin_wait(minutes, request.label);
+    // 何を待っているかは書かない。書いてよいのは「起きた」という事実だけである。
+    log::info!("a wait was declared (waiting={waiting})");
+    Ok(BeginWaitOutcome { waiting })
+}
+
+/// **主作業に戻る** — 待機中の ⌘D (早めに戻る)。
+///
+/// **現在地**が戻り先と違えば、離れる側の**中断メモ**の確定・移動・**切り替え履歴**の
+/// 追記をコア側の単一のトランザクションで確定させる (AD-5)。
+///
+/// # Errors
+///
+/// コアが `manage` されていないとき、または永続化に失敗したとき。そのとき**現在地**は
+/// 動かず、**待機**は続く。
+#[tauri::command]
+pub fn return_from_wait<R: Runtime>(
+    app: AppHandle<R>,
+    request: ReturnFromWaitRequest,
+) -> Result<ReturnFromWaitOutcome, String> {
+    let core = require_core(app.try_state::<Core>())?;
+    let outcome = wait_return_outcome(
+        core.return_from_wait(as_interruption_note(request.note))
+            .map_err(|error| error.to_string())?,
+    );
+    // 表示中の待機のパネルはコアが取り下げた。ここで隠す。
+    intervention::hide_withdrawn(&app, &core);
+    if outcome.moved {
+        crate::announce_current_position_changed(&app);
+    }
+    // 本文は書かない。
+    log::info!(
+        "a return from the wait was declared (returned={}, moved={})",
+        outcome.returned,
+        outcome.moved
+    );
+    Ok(outcome)
 }
 
 /// 起動時に確定したホットキーの登録結果を公開する。
@@ -1876,6 +2057,9 @@ mod tests {
             step_count: Some(6),
             interruption_note: Some("3 段落目の途中".to_string()),
             resting: false,
+            waiting: false,
+            wait_label: None,
+            wait_length_minutes: 5,
         };
         let json: serde_json::Value =
             serde_json::to_value(&snapshot).expect("スナップショットは直列化できる");
@@ -1901,6 +2085,9 @@ mod tests {
             step_count: None,
             interruption_note: None,
             resting: false,
+            waiting: false,
+            wait_label: None,
+            wait_length_minutes: 5,
         })
         .expect("成功時も直列化できる");
         assert!(
@@ -1929,6 +2116,9 @@ mod tests {
             step_count: Some(2),
             interruption_note: None,
             resting: false,
+            waiting: true,
+            wait_label: Some("AI の出力".to_string()),
+            wait_length_minutes: 5,
         })
         .expect("直列化できる");
 
@@ -1948,9 +2138,14 @@ mod tests {
                 "stateError",
                 "stepContent",
                 "stepCount",
-                "stepOrdinal"
+                "stepOrdinal",
+                // **待機中であることと、何を待っているかは運ぶ。期限・残り時間・経過・
+                // 回数は運ばない** (AD-15)。分数は設定値 (面の初期値) である。
+                "waitLabel",
+                "waitLengthMinutes",
+                "waiting"
             ],
-            "履歴・件数・記入率に由来する欄を足さない (AD-15)"
+            "履歴・件数・記入率・残り時間に由来する欄を足さない (AD-15)"
         );
     }
 
@@ -3412,5 +3607,217 @@ mod tests {
     fn only_a_move_announces_the_current_position() {
         assert!(announces_a_move(SelectStepOutcome { moved: true }));
         assert!(!announces_a_move(SelectStepOutcome { moved: false }));
+    }
+
+    // --- 待機 ---------------------------------------------------------------------
+
+    /// 主作業の第 1 **ステップ**で待機しているコア。
+    fn a_waiting_core(label: Option<&str>) -> Core {
+        let core = Core::restore(
+            Box::new(FixedClock::at(1_789_000_000_000)),
+            Box::new(AcceptingStorage),
+        )
+        .expect("空の状態は復元できる");
+        let task_id = core
+            .create_task("原稿", contents(&["下書き", "推敲"]))
+            .expect("作れる");
+        let first = core.snapshot().task(task_id).expect("ある").steps()[0].id();
+        core.move_current_position(first).expect("移せる");
+        assert!(core.begin_wait(NonZeroU32::new(5).expect("正"), label.map(str::to_string)));
+        core
+    }
+
+    /// I/O マトリクス「入る」— 待機中であることと何を待っているかがスナップショットに載る。
+    #[test]
+    fn the_snapshot_reports_the_wait() {
+        let snapshot = snapshot_of(
+            HotkeyStatus::registered(),
+            Some(&a_waiting_core(Some("AI の出力")).snapshot()),
+        );
+        assert!(snapshot.waiting);
+        assert_eq!(snapshot.wait_label.as_deref(), Some("AI の出力"));
+        assert_eq!(
+            snapshot.step_content.as_deref(),
+            Some("下書き"),
+            "次の一手は主作業のまま"
+        );
+
+        let unlabeled = snapshot_of(
+            HotkeyStatus::registered(),
+            Some(&a_waiting_core(None).snapshot()),
+        );
+        assert!(unlabeled.waiting);
+        assert_eq!(unlabeled.wait_label, None);
+    }
+
+    /// 待機していなければ偽、コアが読めなければ偽。面の初期値は既定の 5 分。
+    #[test]
+    fn no_wait_is_reported_without_one() {
+        let snapshot = snapshot_of(
+            HotkeyStatus::registered(),
+            Some(&a_state_at_the_third_of_six()),
+        );
+        assert!(!snapshot.waiting);
+        assert_eq!(snapshot.wait_label, None);
+        assert_eq!(snapshot.wait_length_minutes, 5);
+
+        let missing = snapshot_of(HotkeyStatus::registered(), None);
+        assert!(!missing.waiting);
+        assert_eq!(missing.wait_length_minutes, 5);
+    }
+
+    /// I/O マトリクス「設定」— `wait_length_seconds` = 60 なら面の初期値は 1。
+    #[test]
+    fn the_initial_minutes_follow_the_setting() {
+        let core = a_waiting_core(None);
+        core.store_setting(crate::domain::setting::Setting::new(
+            crate::domain::rest::WAIT_LENGTH_KEY,
+            "60",
+        ))
+        .expect("書ける");
+        let snapshot = snapshot_of(HotkeyStatus::registered(), Some(&core.snapshot()));
+        assert_eq!(snapshot.wait_length_minutes, 1);
+    }
+
+    /// 受け入れ条件 — 待機中のスナップショットに残り時間・経過・回数の欄が無い。
+    #[test]
+    fn the_waiting_snapshot_carries_no_clock() {
+        let json = serde_json::to_value(snapshot_of(
+            HotkeyStatus::registered(),
+            Some(&a_waiting_core(Some("AI の出力")).snapshot()),
+        ))
+        .expect("直列化できる");
+        let fields: Vec<&String> = json
+            .as_object()
+            .expect("オブジェクトである")
+            .keys()
+            .collect();
+        for forbidden in ["until", "remaining", "elapsed", "since", "deadline"] {
+            assert!(
+                fields
+                    .iter()
+                    .all(|field| !field.to_lowercase().contains(forbidden)),
+                "{forbidden} に当たる欄を運ばない"
+            );
+        }
+        let wait_fields: Vec<&str> = fields
+            .iter()
+            .map(|field| field.as_str())
+            .filter(|field| field.to_lowercase().contains("wait"))
+            .collect();
+        assert_eq!(
+            wait_fields,
+            vec!["waitLabel", "waitLengthMinutes", "waiting"],
+            "待機の欄はこの三つだけである — 回数・残り時間を足さない"
+        );
+        assert_eq!(json["waiting"], serde_json::json!(true));
+        assert_eq!(json["waitLabel"], serde_json::json!("AI の出力"));
+        assert!(json["waitLengthMinutes"].is_u64());
+    }
+
+    /// 受け入れ条件 — 待機の介入のパネルの境界にも数値の欄が無い。種類は `wait`。
+    #[test]
+    fn the_wait_intervention_snapshot_names_its_kind_and_carries_no_clock() {
+        let clock = FixedClock::at(1_789_000_000_000);
+        let core = Core::restore(Box::new(clock.clone()), Box::new(AcceptingStorage))
+            .expect("空の状態は復元できる");
+        let task_id = core
+            .create_task("原稿", contents(&["下書き"]))
+            .expect("作れる");
+        let first = core.snapshot().task(task_id).expect("ある").steps()[0].id();
+        core.move_current_position(first).expect("移せる");
+        assert!(core.begin_wait(NonZeroU32::new(1).expect("正"), None));
+        let mut raised = false;
+        for _ in 0..6 {
+            clock.advance(crate::domain::rest::TICK_INTERVAL_MILLIS);
+            raised |= core.tick().expect("刻める").raised;
+        }
+        assert!(raised, "1 分で待機の介入が出る");
+
+        let json = serde_json::to_value(intervention_snapshot_of(
+            Some(ResponseHotkeyStatus::registered()),
+            Some(&core.snapshot()),
+        ))
+        .expect("直列化できる");
+        assert_eq!(json.get("kind"), Some(&serde_json::json!("wait")));
+        let fields: Vec<&String> = json
+            .as_object()
+            .expect("オブジェクトである")
+            .keys()
+            .collect();
+        assert_eq!(fields, vec!["hotkey", "kind", "shown", "stateError"]);
+    }
+
+    /// TS → Rust の契約。待機の要求の形を固定する。
+    #[test]
+    fn the_wait_requests_keep_their_wire_contract() {
+        let begin: BeginWaitRequest =
+            serde_json::from_value(serde_json::json!({ "minutes": "5", "label": "AI の出力" }))
+                .expect("読める");
+        assert_eq!(begin.minutes, "5");
+        assert_eq!(begin.label.as_deref(), Some("AI の出力"));
+
+        let unlabeled: BeginWaitRequest =
+            serde_json::from_value(serde_json::json!({ "minutes": "5", "label": null }))
+                .expect("読める");
+        assert_eq!(unlabeled.label, None);
+
+        let refused: Result<BeginWaitRequest, _> = serde_json::from_value(
+            serde_json::json!({ "minutes": "5", "label": null, "until": 0 }),
+        );
+        assert!(refused.is_err(), "知らない欄を拒む");
+
+        let back: ReturnFromWaitRequest =
+            serde_json::from_value(serde_json::json!({ "note": "米は 5kg" })).expect("読める");
+        assert_eq!(back.note.as_deref(), Some("米は 5kg"));
+        let silent: ReturnFromWaitRequest =
+            serde_json::from_value(serde_json::json!({ "note": null })).expect("読める");
+        assert_eq!(silent.note, None);
+    }
+
+    /// Rust → TS の契約。待機の結末の形を固定する。
+    #[test]
+    fn the_wait_outcomes_keep_their_wire_contract() {
+        assert_eq!(
+            serde_json::to_value(BeginWaitOutcome { waiting: true }).expect("直列化できる"),
+            serde_json::json!({ "waiting": true })
+        );
+        assert_eq!(
+            serde_json::to_value(wait_return_outcome(WaitReturn::Moved)).expect("直列化できる"),
+            serde_json::json!({ "returned": true, "moved": true })
+        );
+        assert_eq!(
+            wait_return_outcome(WaitReturn::Stayed),
+            ReturnFromWaitOutcome {
+                returned: true,
+                moved: false
+            }
+        );
+        assert_eq!(
+            wait_return_outcome(WaitReturn::NotWaiting),
+            ReturnFromWaitOutcome {
+                returned: false,
+                moved: false
+            }
+        );
+    }
+
+    /// I/O マトリクス「分数が不正」— 正の整数でなければ確定しない。理由は 1 行。
+    #[test]
+    fn the_wait_minutes_must_be_a_positive_integer() {
+        for broken in ["0", "abc", "", "  ", "-5", "1.5", "５分"] {
+            assert_eq!(
+                as_wait_minutes(broken),
+                Err(WAIT_MINUTES_INVALID.to_string()),
+                "{broken:?} は拒む"
+            );
+        }
+        assert!(!WAIT_MINUTES_INVALID.contains('\n'), "理由は 1 行");
+        assert_eq!(as_wait_minutes(" 5 ").map(NonZeroU32::get), Ok(5));
+        // 日本語入力の全角数字は読む。
+        assert_eq!(as_wait_minutes("１０").map(NonZeroU32::get), Ok(10));
+        assert_eq!(as_wait_minutes(" ５ ").map(NonZeroU32::get), Ok(5));
+        assert!(as_wait_minutes("０").is_err());
+        assert_eq!(as_wait_minutes("1").map(NonZeroU32::get), Ok(1));
     }
 }
