@@ -2,5 +2,9 @@
 # rustup の優先順位では rust-toolchain.toml より強い。このプロジェクト配下だけ現行 stable を
 # 選ばせるため、mise 側でも同じバージョンを固定する (グローバル設定は変更しない)。
 # mise を使わない環境では rust-toolchain.toml が同じ結果をもたらす。
+#
+# pnpm は Node 25 以降 corepack が同梱されなくなり、Node だけでは手に入らない。
+# 版は package.json の packageManager と揃える。
 [tools]
 rust = "1.98.1"
+pnpm = "11.24.0"
