@@ -102,7 +102,34 @@ function disclosureFor(openTaskId: string | null): Record<string, unknown> {
       })
     }
   }
-  return { stateError: null, rows }
+  return { stateError: null, rows, ideas: ideaList }
+}
+
+/**
+ * 開示面の末尾に並ぶ思いつき (新しい順)。`DisclosureIdea` と 1:1 — **ID と本文だけ**。
+ */
+let ideaList: { ideaId: string; content: string }[] = []
+
+/**
+ * `capture_idea` の応答。Rust 側の `as_idea_content` と同じく、空白だけの本文は拒む。
+ * `captureFails` が立っていれば永続化の失敗を模す。
+ */
+let captureFails = false
+/** 置く応答を握り、任意の時点で返すための仕掛け。遅れて着く応答を作る。 */
+let holdCapture = false
+let releaseCapture: (() => void) | null = null
+function captureIdea(args: unknown): null | Promise<null> {
+  if (holdCapture) {
+    return new Promise((resolve) => {
+      releaseCapture = () => resolve(null)
+    })
+  }
+  const request = ((args ?? {}) as { request?: { content?: string } }).request ?? {}
+  if (captureFails) throw new Error('状態の書き込みに失敗した')
+  if ((request.content ?? '').trim() === '') {
+    throw new Error('思いつきが空である。一行書いてから置くこと。')
+  }
+  return null
 }
 
 /** `@tauri-apps/api` の mock が用意しないイベント内部実装の穴。 */
@@ -187,6 +214,7 @@ function installIPC(): void {
         return draftFor(args)
       }
       if (cmd === 'edit_task') return null
+      if (cmd === 'capture_idea') return captureIdea(args)
       return null
     },
     { shouldMockEvents: true },
@@ -284,6 +312,7 @@ function installHangingIPC(hanging: string): void {
       if (cmd === 'complete_current_step') return completionOutcome
       if (cmd === 'get_task_draft') return draftFor(args)
       if (cmd === 'edit_task') return null
+      if (cmd === 'capture_idea') return captureIdea(args)
       return null
     },
     { shouldMockEvents: true },
@@ -414,6 +443,10 @@ beforeEach(async () => {
   beginRestOutcome = { rested: true }
   completionOutcome = { taskFinished: false }
   draftFails = false
+  ideaList = []
+  captureFails = false
+  holdCapture = false
+  releaseCapture = null
   mockWindows('main')
   installIPC()
   stubEventInternals()
@@ -1068,6 +1101,7 @@ test('⌘Enter は作成のみ — 現在地は変わらず、オーバーレイ
       title: '原稿',
       steps: '構成を決める\n下書きを書く\n推敲する',
       moveCurrentPosition: false,
+      ideaId: null,
     },
   })
   expect(invoked).not.toContain('hide_overlay')
@@ -1095,6 +1129,7 @@ test('⌘⇧Enter は作成して着手 — 現在地をその第 1 ステップ
       title: '原稿',
       steps: '構成を決める\n下書きを書く\n推敲する',
       moveCurrentPosition: true,
+      ideaId: null,
     },
   })
   expect(document.querySelector('input.title')).toBeNull()
@@ -1251,6 +1286,7 @@ test('空行を含む入力は切り分けずそのまま送る — 落とす規
       title: '原稿',
       steps: '構成を決める\n\n   \n下書きを書く\n\n',
       moveCurrentPosition: false,
+      ideaId: null,
     },
   })
 })
@@ -1913,7 +1949,7 @@ test('Esc で戻ってから開き直しても、開くのは現在地のタス�
 })
 
 test('タスクが 1 個も無ければ空欄にせず、その旨の 1 行を出す', async () => {
-  disclosureOverride = { stateError: null, rows: [] }
+  disclosureOverride = { stateError: null, rows: [], ideas: [] }
   await openDisclosure()
 
   expect(stepRows()).toHaveLength(0)
@@ -1928,7 +1964,7 @@ test('タスクが 1 個も無ければ空欄にせず、その旨の 1 行を�
 
 test('コアが読めなくても面は開き、理由が出る。移動はできない', async () => {
   const CORE_MISSING = '保存された状態を読み込めていない。'
-  disclosureOverride = { stateError: CORE_MISSING, rows: [] }
+  disclosureOverride = { stateError: CORE_MISSING, rows: [], ideas: [] }
   await openDisclosure()
 
   expect(document.querySelector('.disclosure')).not.toBeNull()
@@ -2630,7 +2666,7 @@ test('作成の面のボタンは二つの確定と戻るだけである', async
   await settle()
 
   expect(argsOf('create_task')).toEqual({
-    request: { title: '原稿', steps: '下書き', moveCurrentPosition: true },
+    request: { title: '原稿', steps: '下書き', moveCurrentPosition: true, ideaId: null },
   })
 })
 
@@ -2750,4 +2786,294 @@ test('作成の面と一覧では ⌘R が休息を宣言しない', async () =>
   press('r', { metaKey: true })
   await settle()
   expect(invoked).not.toContain('begin_rest')
+})
+
+// ---------------------------------------------------------------------------
+// 思いつき — 作業中の思いつきを一行で手放す
+// ---------------------------------------------------------------------------
+
+const IDEA_A = { ideaId: '0198f0e0-0000-7000-8000-0000000000c1', content: '請求書の様式を直す' }
+const IDEA_B = { ideaId: '0198f0e0-0000-7000-8000-0000000000c2', content: '棚を片付ける' }
+
+function ideaField(): HTMLInputElement | null {
+  return document.querySelector<HTMLInputElement>('input.idea')
+}
+
+async function openCapture(): Promise<void> {
+  press('i', { metaKey: true })
+  await settle()
+}
+
+function ideaRows(): HTMLButtonElement[] {
+  return [...document.querySelectorAll<HTMLButtonElement>('.idea-row')]
+}
+
+test('思いつきの面は初期表示に無く、⌘I で一行の入力欄が開く', async () => {
+  expect(ideaField()).toBeNull()
+
+  await openCapture()
+
+  expect(ideaField()).not.toBeNull()
+  expect(document.activeElement).toBe(ideaField())
+  expect(document.querySelector('.hint')?.textContent ?? '').toContain('Enter で置く')
+})
+
+test('既定表示の案内に ⌘I が載っている', async () => {
+  expect(document.querySelector('.hint')?.textContent ?? '').toContain('⌘I で思いつき')
+})
+
+test('I/O「置く」— Enter で置き、閉じずに既定表示へ戻る。現在地もメモの下書きも変わらない', async () => {
+  typeNote('接続詞を整える途中 / 次は結論')
+  await settle()
+
+  await openCapture()
+  typeInto(ideaField() as HTMLInputElement, '請求書の様式を直す')
+  press('Enter')
+  await settle()
+
+  expect(argsOf('capture_idea')).toEqual({ request: { content: '請求書の様式を直す' } })
+  expect(invoked).not.toContain('hide_overlay')
+  expect(invoked).not.toContain('switch_current_position')
+  expect(invoked).not.toContain('select_step')
+  expect(ideaField()).toBeNull()
+  expect(document.querySelector('.next-action')?.textContent).toBe('3 段落目を書き直す')
+  expect(noteField().value).toBe('接続詞を整える途中 / 次は結論')
+  expect(noticeText()).toBe('思いつきを置いた。')
+})
+
+test('I/O「休息中に置く」— 置けて、休息は続いている', async () => {
+  await enterTheRestingSurface()
+
+  await openCapture()
+  expect(ideaField()).not.toBeNull()
+  typeInto(ideaField() as HTMLInputElement, '棚を片付ける')
+  press('Enter')
+  await settle()
+
+  expect(invoked).toContain('capture_idea')
+  expect(invoked).not.toContain('end_rest')
+  expect(document.body.textContent ?? '').toContain('休息中')
+  expect(noticeText()).toBe('思いつきを置いた。')
+})
+
+test('I/O「空」— 空白だけでは置かれず、入力欄が残り理由が 1 行出る', async () => {
+  await openCapture()
+  typeInto(ideaField() as HTMLInputElement, '   ')
+  press('Enter')
+  await settle()
+
+  expect(ideaField()).not.toBeNull()
+  expect(ideaField()?.value).toBe('   ')
+  expect(noticeText()).toContain('思いつきを置けなかった')
+  expect(noticeText()).toContain('思いつきが空である')
+})
+
+test('置くのに失敗したら入力欄を残して理由を示す', async () => {
+  captureFails = true
+  await openCapture()
+  typeInto(ideaField() as HTMLInputElement, '請求書の様式を直す')
+  press('Enter')
+  await settle()
+
+  expect(ideaField()?.value).toBe('請求書の様式を直す')
+  expect(noticeText()).toContain('状態の書き込みに失敗した')
+})
+
+test('思いつきの面の Esc は既定表示へ戻るだけで、閉じも置きもしない', async () => {
+  typeNote('書きかけ')
+  await settle()
+  await openCapture()
+  typeInto(ideaField() as HTMLInputElement, '捨てる')
+  press('Escape')
+  await settle()
+
+  expect(ideaField()).toBeNull()
+  expect(invoked).not.toContain('capture_idea')
+  expect(invoked).not.toContain('hide_overlay')
+  expect(noteField().value).toBe('書きかけ')
+})
+
+test('I/O「IME」— 変換中の Enter では置かない', async () => {
+  await openCapture()
+  typeInto(ideaField() as HTMLInputElement, 'せいきゅうしょ')
+  press('Enter', { isComposing: true } as KeyboardEventInit)
+  await settle()
+
+  expect(invoked).not.toContain('capture_idea')
+  expect(ideaField()).not.toBeNull()
+})
+
+test('フォーカスを失えば思いつきの下書きは捨てられ、次の呼び出しは初期表示である', async () => {
+  await openCapture()
+  typeInto(ideaField() as HTMLInputElement, '途中')
+  await emit('tauri://blur', null)
+  await settle()
+  await emit('tauri://focus', null)
+  await settle()
+
+  expect(ideaField()).toBeNull()
+  expect(invoked).not.toContain('capture_idea')
+})
+
+test('受け入れ条件 — 思いつきがあっても、既定表示には本文も数も現れない', async () => {
+  ideaList = [IDEA_B, IDEA_A]
+  // 一覧では確かに見えている。
+  await openDisclosure()
+  expect(ideaRows()).toHaveLength(2)
+
+  press('Escape')
+  await settle()
+
+  expect(document.querySelector('.disclosure')).toBeNull()
+  expect(document.querySelector('.next-action')).not.toBeNull()
+  const text = document.body.textContent ?? ''
+  expect(text).not.toContain(IDEA_A.content)
+  expect(text).not.toContain(IDEA_B.content)
+  expect(text).not.toMatch(/思いつき[^·]*\d/)
+})
+
+test('I/O「一覧」— 開示面の末尾に見出し「思いつき」と新しい順の行が並ぶ', async () => {
+  ideaList = [IDEA_B, IDEA_A]
+  await openDisclosure()
+
+  expect(document.querySelector('.ideas-heading')?.textContent?.trim()).toBe('思いつき')
+  expect(ideaRows().map((row) => row.textContent?.trim())).toEqual([
+    IDEA_B.content,
+    IDEA_A.content,
+  ])
+  // タスクの行の後に並ぶ。
+  const all = [...document.querySelectorAll<HTMLElement>('[data-row-key]')].map(
+    (row) => row.dataset.rowKey,
+  )
+  expect(all.slice(-2)).toEqual([`idea:${IDEA_B.ideaId}`, `idea:${IDEA_A.ideaId}`])
+})
+
+test('I/O「0 件」— 思いつきが無ければ欄ごと出ない', async () => {
+  await openDisclosure()
+
+  expect(document.querySelector('.ideas')).toBeNull()
+  expect(document.querySelector('.ideas-heading')).toBeNull()
+  expect(ideaRows()).toHaveLength(0)
+})
+
+/** 入力位置を、指定の鍵を持つ行まで ↓ で運ぶ。 */
+async function moveDownTo(rowKey: string): Promise<void> {
+  for (let i = 0; i < 16; i += 1) {
+    if ((document.activeElement as HTMLElement)?.dataset.rowKey === rowKey) return
+    press('ArrowDown')
+    await settle()
+  }
+  throw new Error(`${rowKey} へ入力位置が届かない`)
+}
+
+test('I/O「昇格」— 思いつきの行で Enter → 題名とステップ 1 に文が入り、⌘Enter で昇格する', async () => {
+  ideaList = [IDEA_A]
+  await openDisclosure()
+  await moveDownTo(`idea:${IDEA_A.ideaId}`)
+
+  expect(document.querySelector('.hint')?.textContent ?? '').toContain('Enter でタスクにする')
+  press('Enter')
+  await settle()
+
+  // 開示面は畳まれ、作成の面が下書きを持って開く。ここでは何も書かれない。
+  expect(document.querySelector('.disclosure')).toBeNull()
+  expect(titleField().value).toBe(IDEA_A.content)
+  expect(stepsField().value).toBe(IDEA_A.content)
+  expect(invoked).not.toContain('create_task')
+
+  press('Enter', { metaKey: true })
+  await settle()
+
+  expect(argsOf('create_task')).toEqual({
+    request: {
+      title: IDEA_A.content,
+      steps: IDEA_A.content,
+      moveCurrentPosition: false,
+      ideaId: IDEA_A.ideaId,
+    },
+  })
+  expect(noticeText()).toContain('タスクを作成した')
+})
+
+test('I/O「昇格をやめる」— 作成の面を Esc で出れば何も送られず、次の作成は昇格ではない', async () => {
+  ideaList = [IDEA_A]
+  await openDisclosure()
+  await moveDownTo(`idea:${IDEA_A.ideaId}`)
+  press('Enter')
+  await settle()
+
+  press('Escape')
+  await settle()
+  expect(invoked).not.toContain('create_task')
+
+  // 普通に作成し直すと、昇格元は持ち越されていない。
+  await openCreation()
+  expect(titleField().value).toBe('')
+  typeInto(titleField(), '別件')
+  typeInto(stepsField(), '一')
+  press('Enter', { metaKey: true })
+  await settle()
+  expect((argsOf('create_task')?.request as { ideaId: unknown }).ideaId).toBeNull()
+})
+
+test('思いつきの行でもボタンから昇格でき、⌘E は効かない', async () => {
+  ideaList = [IDEA_A]
+  await openDisclosure()
+  await moveDownTo(`idea:${IDEA_A.ideaId}`)
+
+  expect(actionLabels()).toContain('タスクにする')
+  expect(actionLabels()).not.toContain('このタスクを直す')
+  press('e', { metaKey: true })
+  await settle()
+  expect(invoked).not.toContain('get_task_draft')
+
+  actionButton('タスクにする').click()
+  await settle()
+  expect(titleField().value).toBe(IDEA_A.content)
+})
+
+test('タスク 0 件・思いつきありでは「まだタスクが無い。」が思いつきの欄より前に出て、思いつきへ届く', async () => {
+  disclosureOverride = { stateError: null, rows: [], ideas: [IDEA_A, IDEA_B] }
+  await openDisclosure()
+
+  const empty = document.querySelector('.empty')
+  const section = document.querySelector('.ideas')
+  expect(empty?.textContent).toBe('まだタスクが無い。')
+  expect(section).not.toBeNull()
+  expect(
+    (empty as Element).compareDocumentPosition(section as Element) &
+      Node.DOCUMENT_POSITION_FOLLOWING,
+  ).toBeTruthy()
+
+  // 入力位置は先頭の思いつきにあり、↓ で次へ届く。
+  expect((document.activeElement as HTMLElement)?.dataset.rowKey).toBe(`idea:${IDEA_A.ideaId}`)
+  press('ArrowDown')
+  await settle()
+  expect((document.activeElement as HTMLElement)?.dataset.rowKey).toBe(`idea:${IDEA_B.ideaId}`)
+
+  press('Enter')
+  await settle()
+  expect(titleField().value).toBe(IDEA_B.content)
+  expect(stepsField().value).toBe(IDEA_B.content)
+})
+
+test('置く応答が面を畳んだ後に着いても、既定表示に報せを出さない', async () => {
+  holdCapture = true
+
+  await openCapture()
+  typeInto(ideaField() as HTMLInputElement, '遅れて着く')
+  press('Enter')
+  await settle()
+
+  // 飛んでいる間は ⌘I で開き直せない (面を畳んでから押す)。
+  await emit('tauri://blur', null)
+  await settle()
+  press('i', { metaKey: true })
+  await settle()
+  expect(ideaField()).toBeNull()
+
+  ;(releaseCapture as unknown as () => void)()
+  await settle()
+
+  expect(document.body.textContent ?? '').not.toContain('思いつきを置いた。')
 })

@@ -25,6 +25,7 @@ use std::sync::{Mutex, MutexGuard};
 
 use rusqlite::{Connection, OptionalExtension, Transaction};
 
+use crate::domain::idea::{Idea, IdeaId};
 use crate::domain::position::CurrentPosition;
 use crate::domain::setting::Setting;
 use crate::domain::switch::SwitchRecord;
@@ -102,10 +103,12 @@ impl Storage for SqliteStorage {
         let tasks = read_tasks(&connection)?;
         let current_position = read_current_position(&connection)?;
         let settings = read_settings(&connection)?;
+        let ideas = read_ideas(&connection)?;
         Ok(RestoredState {
             tasks,
             current_position,
             settings,
+            ideas,
         })
     }
 
@@ -135,6 +138,14 @@ impl Storage for SqliteStorage {
         }
         for setting in &commit.settings {
             write_setting(&transaction, setting)?;
+        }
+        // **思いつき**は外部キーを持たないため順序は任意である。**タスク**の作成と同じ
+        // トランザクションに入ることだけが意味を持つ (昇格)。
+        if let Some(idea) = &commit.idea {
+            write_idea(&transaction, idea)?;
+        }
+        for id in &commit.deleted_ideas {
+            delete_idea(&transaction, *id)?;
         }
 
         transaction
@@ -271,6 +282,61 @@ fn write_setting(transaction: &Transaction<'_>, setting: &Setting) -> Result<(),
         )
         .map_err(|error| StorageError::Write(format!("設定値を書けない: {error}")))?;
     Ok(())
+}
+
+/// **思いつき**を 1 行追加する。
+///
+/// **本文はエラーにも載せない** (ログに本文を書かない)。
+fn write_idea(transaction: &Transaction<'_>, idea: &Idea) -> Result<(), StorageError> {
+    transaction
+        .execute(
+            "INSERT INTO idea (id, content, created_at) VALUES (?1, ?2, ?3)",
+            rusqlite::params![
+                idea.id().to_string(),
+                idea.content(),
+                idea.created_at().to_iso8601(),
+            ],
+        )
+        .map_err(|error| StorageError::Write(format!("思いつきを書けない: {error}")))?;
+    Ok(())
+}
+
+/// **思いつき**を 1 行消す。**この層で行を消す唯一の関数である。**
+///
+/// 既に無い ID は何もしない — 寿命で消えた後に昇格が確定しても失敗にしない。
+fn delete_idea(transaction: &Transaction<'_>, id: IdeaId) -> Result<(), StorageError> {
+    transaction
+        .execute("DELETE FROM idea WHERE id = ?1", [id.to_string()])
+        .map_err(|error| StorageError::Write(format!("思いつきを消せない: {error}")))?;
+    Ok(())
+}
+
+/// 全**思いつき**を読む。並びは作成の古い順 (表示の並びは読み手が決める)。
+fn read_ideas(connection: &Connection) -> Result<Vec<Idea>, StorageError> {
+    let mut statement = connection
+        .prepare("SELECT id, content, created_at FROM idea ORDER BY created_at, id")
+        .map_err(|error| StorageError::Read(format!("思いつきを読めない: {error}")))?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })
+        .map_err(|error| StorageError::Read(format!("思いつきを読めない: {error}")))?;
+
+    let mut ideas = Vec::new();
+    for row in rows {
+        let (id, content, created_at) =
+            row.map_err(|error| StorageError::Read(format!("思いつきを読めない: {error}")))?;
+        let id = IdeaId::parse(&id)
+            .map_err(|error| StorageError::Corrupted(format!("思いつきの ID `{id}`: {error}")))?;
+        let created_at = Timestamp::parse_iso8601(&created_at)
+            .map_err(|error| StorageError::Corrupted(error.to_string()))?;
+        ideas.push(Idea::rehydrate(id, content, created_at));
+    }
+    Ok(ideas)
 }
 
 /// 全**設定値**を読む (AD-11)。
@@ -685,6 +751,8 @@ mod tests {
                 current_position: Some(position),
                 switch_record: None,
                 settings: Vec::new(),
+                idea: None,
+                deleted_ideas: Vec::new(),
             })
             .expect("タスクが同じトランザクションで先に書かれるため成立する");
 
@@ -830,6 +898,8 @@ mod tests {
             current_position: Some(CurrentPosition::rehydrate(task.id(), stranger, true, NOW)),
             switch_record: None,
             settings: Vec::new(),
+            idea: None,
+            deleted_ideas: Vec::new(),
         });
         assert!(outcome.is_err(), "存在しないステップを指す現在地は書けない");
 
@@ -874,6 +944,8 @@ mod tests {
                 current_position: Some(position),
                 switch_record: Some(SwitchRecord::new(NOW, departed, true)),
                 settings: Vec::new(),
+                idea: None,
+                deleted_ideas: Vec::new(),
             })
             .expect("三つが同じトランザクションで書ける");
 
@@ -915,6 +987,8 @@ mod tests {
             current_position: Some(CurrentPosition::rehydrate(task.id(), stranger, true, NOW)),
             switch_record: Some(SwitchRecord::new(NOW, task.steps()[0].id(), true)),
             settings: Vec::new(),
+            idea: None,
+            deleted_ideas: Vec::new(),
         });
         assert!(outcome.is_err());
         assert_eq!(count_switch_records(&storage), 0);
@@ -942,6 +1016,8 @@ mod tests {
                     current_position: None,
                     switch_record: Some(SwitchRecord::new(at, departed, note_written)),
                     settings: Vec::new(),
+                    idea: None,
+                    deleted_ideas: Vec::new(),
                 })
                 .expect("書ける");
         }
@@ -1170,6 +1246,74 @@ mod tests {
         assert_eq!(restored.tasks.len(), 1);
         assert_eq!(restored.current_position.step_id(), Some(step_id));
         assert!(restored.current_position.is_active());
+    }
+
+    /// **思いつき**が往復し、消せる。
+    #[test]
+    fn an_idea_round_trips_and_can_be_deleted() {
+        let storage = SqliteStorage::in_memory().expect("開ける");
+        let idea = Idea::new(NOW, "請求書の様式を直す");
+        storage
+            .apply(&Commit::of_idea(idea.clone()))
+            .expect("書ける");
+        assert_eq!(storage.restore().expect("読める").ideas, vec![idea.clone()]);
+
+        storage
+            .apply(&Commit::of_deleted_ideas(vec![idea.id()]))
+            .expect("消せる");
+        assert!(storage.restore().expect("読める").ideas.is_empty());
+
+        // 既に無い ID を消しても失敗しない (寿命で消えた後の昇格)。
+        storage
+            .apply(&Commit::of_deleted_ideas(vec![idea.id()]))
+            .expect("無い ID は無視される");
+    }
+
+    /// **昇格はタスクの作成と同じトランザクションである。** タスクが書けなければ
+    /// 思いつきも消えない。
+    #[test]
+    fn a_failed_promotion_keeps_the_idea() {
+        let storage = SqliteStorage::in_memory().expect("開ける");
+        let idea = Idea::new(NOW, "請求書の様式を直す");
+        storage
+            .apply(&Commit::of_idea(idea.clone()))
+            .expect("書ける");
+
+        // **タスクの書き込みそのものを落とす。** ステップの挿入を拒む制約を試験用に
+        // 張り、昇格のコミットがタスクの部分で失敗するようにする。
+        storage
+            .lock()
+            .execute_batch(
+                "CREATE TRIGGER refuse_step BEFORE INSERT ON step \
+                 BEGIN SELECT RAISE(ABORT, '試験用の失敗'); END;",
+            )
+            .expect("制約を張れる");
+        let task = a_task();
+        let outcome = storage.apply(&Commit {
+            task: Some(task.clone()),
+            deleted_ideas: vec![idea.id()],
+            ..Commit::default()
+        });
+        assert!(outcome.is_err(), "タスクの書き込みで失敗する");
+        let restored = storage.restore().expect("読める");
+        assert!(restored.tasks.is_empty(), "タスクは生まれていない");
+        assert_eq!(restored.ideas, vec![idea.clone()], "思いつきは残る");
+        storage
+            .lock()
+            .execute_batch("DROP TRIGGER refuse_step;")
+            .expect("制約を外せる");
+
+        // 成功する昇格では、タスクが生まれ思いつきが消える。
+        storage
+            .apply(&Commit {
+                task: Some(task.clone()),
+                deleted_ideas: vec![idea.id()],
+                ..Commit::default()
+            })
+            .expect("確定できる");
+        let restored = storage.restore().expect("読める");
+        assert_eq!(restored.tasks, vec![task]);
+        assert!(restored.ideas.is_empty());
     }
 
     /// DB ファイルのパスはアプリデータディレクトリ配下に組み立てられる。

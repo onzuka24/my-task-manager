@@ -96,3 +96,7 @@
 - source_spec: `_bmad-output/implementation-artifacts/spec-rest-advice.md`
   summary: 休息のすすめを開くと、休息中の案内と「休息を終える」ボタンが固定寸法の窓 (640×280) の下へ押し出され、スクロールしないと見えない可能性がある (medium・未検証)。
   evidence: 見積りでは開いた面の中身が約 270px で、余白を除いた内側の高さ 224px を超えうる。仕様はスクロールで辿れることだけを求めている。jsdom は配置を計算しないため自動検査では決まらない。`make dev` で ⌘R → ⌘T と押し、開いた状態で案内とボタンが窓に収まるかを見れば決まる。収まらなければ、開いている間は `.position` の行を畳む・格子の行間を詰める・窓を休息中だけ高くする、のいずれかを検討する。
+
+- source_spec: `_bmad-output/implementation-artifacts/spec-idea-capture.md`
+  summary: Tauri コマンドの本体 (`capture_idea` の本文の正規化、`create_task` が昇格元の思いつきをコアへ渡すこと) を通すテストが無く、本体の 1 行を戻す退行が全テストを通過しうる (medium・未検証の退行の余地)。
+  evidence: 純粋関数 (`as_idea_content` / `idea_to_promote`)・コア (`Core::capture_idea` / `create_task_promoting`)・フロント (IPC の模擬) はそれぞれ検査されるが、その間をつなぐコマンド本体はどれも呼ばれない。リポジトリには `tauri::test` / `mock_builder` の仕掛けが無く、既存のどのコマンドも同じ状態である。コマンド本体を通す検査の基盤を入れるときに併せて扱う。

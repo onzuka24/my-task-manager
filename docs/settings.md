@@ -4,13 +4,15 @@
 
 ## 一覧
 
-すべて秒単位の正の整数である。定義は `src-tauri/src/domain/rest.rs`。
+すべて秒単位の正の整数である。定義は `src-tauri/src/domain/rest.rs` (休息まわり) と
+`src-tauri/src/domain/idea.rs` (思いつき)。
 
 | 鍵 (`key`) | 既定値 | 意味 |
 | --- | --- | --- |
 | `rest_threshold_seconds` | `3000` (50 分) | 休息閾値。連続作業時間がこれを超えると休息の介入パネルが出る |
 | `grace_period_seconds` | `900` (15 分) | 猶予。介入に「猶予」(`Ctrl+Opt+G`) で応じたとき、次に出直すまでの時間 |
 | `rest_length_seconds` | `600` (10 分) | 休息の長さ。休息に入ってからこれだけ経つと戻るきっかけのパネルが出る。「もう少し休む」でも同じ長さの後に出直す |
+| `idea_lifetime_seconds` | `1209600` (14 日) | 思いつきの寿命。置いてからこれを過ぎた思いつき (昇格しなかったもの) は、計時の刻みで DB から消える。消えたことは知らせない |
 
 ### 値の読み方
 
@@ -96,12 +98,14 @@ sqlite3 "$DB" <<'SQL'
 INSERT INTO setting (key, value) VALUES
   ('rest_threshold_seconds', '60'),
   ('grace_period_seconds',   '30'),
-  ('rest_length_seconds',    '60')
+  ('rest_length_seconds',    '60'),
+  ('idea_lifetime_seconds',  '60')
 ON CONFLICT(key) DO UPDATE SET value = excluded.value;
 SQL
 ```
 
-刻みが 10 秒なので、介入が出るのは閾値から最大 10 秒ほど遅れる。
+刻みが 10 秒なので、介入が出るのは閾値から最大 10 秒ほど遅れる。思いつきが消えるのも
+同じく寿命から最大 10 秒ほど遅れる。
 
 ## パラメータを増やすとき
 

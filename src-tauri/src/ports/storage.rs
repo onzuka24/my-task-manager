@@ -13,6 +13,7 @@
 //! 確定させてはならない。分ければその隙間で異常終了したとき、**現在地**だけが動いて
 //! **完了**が落ちた状態が残りうる — AD-5 が禁じているのはまさにそれである。
 
+use crate::domain::idea::{Idea, IdeaId};
 use crate::domain::position::CurrentPosition;
 use crate::domain::setting::Setting;
 use crate::domain::switch::SwitchRecord;
@@ -32,6 +33,8 @@ pub struct RestoredState {
     /// **空であることが正常な状態である。** 初回起動の DB には 1 行も無く、読み手は
     /// コード内の定数へ落ちる (スパイン「一貫性の規約」)。
     pub settings: Vec<Setting>,
+    /// 全**思いつき**。並び順は問わない — 表示の並び (新しい順) は読み手が決める。
+    pub ideas: Vec<Idea>,
 }
 
 impl Default for RestoredState {
@@ -41,6 +44,7 @@ impl Default for RestoredState {
             tasks: Vec::new(),
             current_position: CurrentPosition::NotStarted,
             settings: Vec::new(),
+            ideas: Vec::new(),
         }
     }
 }
@@ -52,9 +56,9 @@ impl Default for RestoredState {
 /// 際限なく増えるからである。**タスク**が持つ**ステップ**は高々数個であり、丸ごと
 /// 書き直す代償は無視できる。
 ///
-/// **行を消す変更が存在しない。** v1 は**タスク**も**ステップ**も削除しない (消滅の
-/// 経路は CAP-20 にのみ属する)。削除を表現する値を置かないことで、それを構造として
-/// 保証する。
+/// **消せるのは思いつきだけである。** 行を消す変更は [`Self::deleted_ideas`] の一つしか
+/// 無い。**タスク**も**ステップ**も削除しない (消滅の経路は CAP-20 にのみ属する) —
+/// それらの削除を表現する値を置かないことで、構造として保証する。
 ///
 /// **欄が並んでいるのは AD-5 のためである。** 一度の**切り替え**は、離脱側の
 /// **中断メモ**の確定 (と任意の**完了**宣言) ・**現在地**の移動・**切り替え履歴**の
@@ -80,6 +84,13 @@ pub struct Commit {
     /// 鍵ごとの upsert であり、**行を消さない**。設定を「消す」ことは既定値へ戻すことで
     /// あり、v1 にその経路は無い。
     pub settings: Vec<Setting>,
+    /// 追加する**思いつき**。置く操作以外では `None`。
+    pub idea: Option<Idea>,
+    /// 削除する**思いつき**。**行を消す唯一の欄である。**
+    ///
+    /// 昇格 (**タスク**の作成と同じコミット) と寿命 (刻み) の二つの経路だけが埋める。
+    /// 既に無い ID は黙って無視される — 寿命で消えた後の昇格を失敗にしない。
+    pub deleted_ideas: Vec<IdeaId>,
 }
 
 impl Commit {
@@ -91,6 +102,8 @@ impl Commit {
             current_position: None,
             switch_record: None,
             settings: Vec::new(),
+            idea: None,
+            deleted_ideas: Vec::new(),
         }
     }
 
@@ -102,6 +115,8 @@ impl Commit {
             current_position: Some(current_position),
             switch_record: None,
             settings: Vec::new(),
+            idea: None,
+            deleted_ideas: Vec::new(),
         }
     }
 
@@ -113,6 +128,26 @@ impl Commit {
             current_position: None,
             switch_record: None,
             settings,
+            idea: None,
+            deleted_ideas: Vec::new(),
+        }
+    }
+
+    /// **思いつき**を 1 件置くコミット。
+    #[must_use]
+    pub fn of_idea(idea: Idea) -> Self {
+        Self {
+            idea: Some(idea),
+            ..Self::default()
+        }
+    }
+
+    /// **思いつき**を消すだけのコミット (寿命)。
+    #[must_use]
+    pub fn of_deleted_ideas(deleted_ideas: Vec<IdeaId>) -> Self {
+        Self {
+            deleted_ideas,
+            ..Self::default()
         }
     }
 
@@ -123,6 +158,8 @@ impl Commit {
             && self.current_position.is_none()
             && self.switch_record.is_none()
             && self.settings.is_empty()
+            && self.idea.is_none()
+            && self.deleted_ideas.is_empty()
     }
 }
 

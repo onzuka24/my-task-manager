@@ -15,6 +15,7 @@
 
 use std::sync::{Mutex, MutexGuard};
 
+use super::idea::{self, Idea, IdeaId};
 use super::position::CurrentPosition;
 use super::rest::{
     self, Decision, Intervention, InterventionChoice, InterventionKind, RestSettings, ReturnTick,
@@ -40,6 +41,11 @@ pub struct CoreState {
     /// [`RestSettings`] を畳んだ形で持たないのは、同じ真実が二つの場所に生まれるためで
     /// ある — 書き換えのたびに畳み直す規律が要り、片方だけ古い状態を作れてしまう。
     settings: Vec<Setting>,
+    /// 全**思いつき**。**既定表示には出ない** — 読み手は**開示面**だけである。
+    ///
+    /// 置く操作 ([`Core::capture_idea`]) で増え、昇格 ([`Core::create_task_promoting`]) と
+    /// 寿命 ([`Core::tick`]) で減る。並び順は問わない。
+    ideas: Vec<Idea>,
     /// 表示中の**介入**。**永続化しない。起動時は常に非表示** (AD-2)。
     ///
     /// **1 個のフィールドである。** 集合として持たないため「二つの介入」を表現する値が
@@ -71,6 +77,7 @@ impl Default for CoreState {
             tasks: Vec::new(),
             current_position: CurrentPosition::NotStarted,
             settings: Vec::new(),
+            ideas: Vec::new(),
             intervention: None,
             grace_until: None,
             last_tick: Timestamp::MIN,
@@ -128,6 +135,12 @@ impl CoreState {
     #[must_use]
     pub fn settings(&self) -> &[Setting] {
         &self.settings
+    }
+
+    /// 全**思いつき**。並び順は問わない。
+    #[must_use]
+    pub fn ideas(&self) -> &[Idea] {
+        &self.ideas
     }
 
     /// 表示中の**介入** (AD-2)。
@@ -231,6 +244,7 @@ impl Core {
             tasks,
             current_position,
             settings,
+            ideas,
         } = storage.restore()?;
 
         // **現在地**が実在しない**ステップ**を指していないことを、ここで一度だけ確かめる。
@@ -268,6 +282,7 @@ impl Core {
                 tasks,
                 current_position,
                 settings,
+                ideas,
                 // **起動時は常に非表示である** (AD-2)。
                 intervention: None,
                 grace_until: None,
@@ -305,11 +320,59 @@ impl Core {
         title: impl Into<String>,
         step_contents: Vec<String>,
     ) -> Result<TaskId, CoreError> {
+        self.create_task_promoting(title, step_contents, None)
+    }
+
+    /// **タスク**を作る。`promoted_from` が `Some` なら、その**思いつき**からの昇格である。
+    ///
+    /// **昇格元の削除は作成と同じトランザクションで確定する。** 分ければ、その隙間の
+    /// 異常終了が「タスクは生まれたが思いつきも残っている」を作る。作成が失敗すれば
+    /// **思いつき**も残る。
+    ///
+    /// **昇格元が既に無ければ (寿命で消えた後なら) 無視する。** 作成は通常どおり
+    /// 確定する (I/O マトリクス「昇格の途中で消える」)。`None` なら従来どおりの作成である。
+    ///
+    /// # Errors
+    ///
+    /// **ステップ**が 1 個も無いとき、または永続化に失敗したとき。いずれの場合も
+    /// **タスク**は生まれず、**思いつき**も残る。
+    pub fn create_task_promoting(
+        &self,
+        title: impl Into<String>,
+        step_contents: Vec<String>,
+        promoted_from: Option<IdeaId>,
+    ) -> Result<TaskId, CoreError> {
         let mut state = self.lock();
         let task = Task::create(self.clock.now(), title, step_contents)?;
         let id = task.id();
-        self.storage.apply(&Commit::of_task(task.clone()))?;
+        let promoted =
+            promoted_from.filter(|idea| state.ideas.iter().any(|kept| kept.id() == *idea));
+        self.storage.apply(&Commit {
+            task: Some(task.clone()),
+            deleted_ideas: promoted.into_iter().collect(),
+            ..Commit::default()
+        })?;
         state.tasks.push(task);
+        if let Some(promoted) = promoted {
+            state.ideas.retain(|idea| idea.id() != promoted);
+        }
+        Ok(id)
+    }
+
+    /// **思いつき**を置く。
+    ///
+    /// **現在地**・**中断メモ**・**休息**・計時のいずれにも触れない。本文の検め (前後の
+    /// 空白を除いて空なら置かない) はコマンド境界の純粋関数が持つ。
+    ///
+    /// # Errors
+    ///
+    /// 永続化に失敗したとき。**メモリ上の状態も変えない。**
+    pub fn capture_idea(&self, content: impl Into<String>) -> Result<IdeaId, CoreError> {
+        let mut state = self.lock();
+        let idea = Idea::new(self.clock.now(), content);
+        let id = idea.id();
+        self.storage.apply(&Commit::of_idea(idea.clone()))?;
+        state.ideas.push(idea);
         Ok(id)
     }
 
@@ -510,6 +573,8 @@ impl Core {
             current_position: moved,
             switch_record: Some(SwitchRecord::new(now, departed, note_written)),
             settings: Vec::new(),
+            idea: None,
+            deleted_ideas: Vec::new(),
         })?;
 
         if task_changed {
@@ -595,7 +660,7 @@ impl Core {
     /// 三つの変更は**単一のトランザクション**で確定する (AD-5)。別々に呼べば、題名だけが
     /// 直って**ステップ**が元のまま残る状態が異常終了で残りうる。
     ///
-    /// **消す経路は無い。** [`Commit`] は行を消す変更を持たず (`ports/storage.rs`)、v1 は
+    /// **消す経路は無い。** [`Commit`] が消せるのは**思いつき**だけであり (`ports/storage.rs`)、v1 は
     /// **タスク**も**ステップ**も削除しない。直せるのは本文だけである。
     ///
     /// **現在地**・**完了**・**中断メモ**のいずれにも触れない。指しているのが ID である
@@ -714,6 +779,8 @@ impl Core {
             // **機会を与えていないため `note_written` は常に偽である。**
             switch_record: departed.map(|departed| SwitchRecord::new(now, departed, false)),
             settings: Vec::new(),
+            idea: None,
+            deleted_ideas: Vec::new(),
         })?;
         state.current_position = moved;
         Ok(true)
@@ -750,8 +817,16 @@ impl Core {
     ///
     /// 提示層が行うべきこと。**この関数はパネルを出さない** — OS を知らないためである。
     ///
+    /// # 思いつきの寿命
+    ///
+    /// **介入**を発しなかった刻みの最後に、**思いつきの寿命**を過ぎた**思いつき**を
+    /// 1 コミットで削除する ([`idea::expired`])。何も知らせない (AD-15)。**介入**を
+    /// 発した刻みでは次の刻みへ回す。削除に失敗したら**思いつき**を残したまま `Err` を
+    /// 返し (計時と**介入**の判断は既に済んでいる)、次の刻みが同じ判定をやり直す。
+    ///
     /// # Errors
     ///
+    /// 寿命を過ぎた**思いつき**の削除を永続化できなかったとき。
     /// スリープ分の差し引きや計時のリセットを永続化できなかったとき。そのとき
     /// **直前の刻みの時刻は進めない** — 進めると、差し引けなかったスリープが
     /// **連続作業時間**に混ざったまま二度と補正されない。次の刻みが同じ飛びを見て
@@ -798,8 +873,21 @@ impl Core {
         if returning {
             state.return_until = None;
             state.intervention = Some(Intervention::raised(InterventionKind::Return, now));
+            // 寿命の削除は次の刻みへ回す。ここで失敗して `Err` を返せば、発した
+            // **介入**が提示層へ届かない。
+            return Ok(TickEffect { raised: true });
         }
-        Ok(TickEffect { raised: returning })
+
+        // **寿命を過ぎた思いつきを消す。** 何も知らせない (AD-15)。**介入**の判断と
+        // 直前の刻みの時刻の更新を済ませた後に置く — 削除の失敗が**介入**も計時も
+        // 止めないためである。失敗すれば思いつきは残り、次の刻みが同じ判定をやり直す。
+        let expired = idea::expired(&state.ideas, now, idea::lifetime_seconds(&state.settings));
+        if !expired.is_empty() {
+            self.storage
+                .apply(&Commit::of_deleted_ideas(expired.clone()))?;
+            state.ideas.retain(|kept| !expired.contains(&kept.id()));
+        }
+        Ok(TickEffect { raised: false })
     }
 
     /// **介入への応答** (CAP-10 / FR-15)。**介入を閉じる唯一の経路である** (AD-7)。
@@ -1685,6 +1773,7 @@ mod tests {
                     Timestamp::from_unix_millis(0),
                 ),
                 settings: Vec::new(),
+                ideas: Vec::new(),
             },
             ..RecordingStorage::default()
         });
@@ -1709,6 +1798,7 @@ mod tests {
                     Timestamp::from_unix_millis(0),
                 ),
                 settings: Vec::new(),
+                ideas: Vec::new(),
             },
             ..RecordingStorage::default()
         });
@@ -3089,6 +3179,7 @@ mod tests {
                 tasks: saved.tasks().to_vec(),
                 current_position: saved.current_position(),
                 settings: Vec::new(),
+                ideas: Vec::new(),
             },
             ..RecordingStorage::default()
         });
@@ -3341,5 +3432,272 @@ mod tests {
             Some(first),
             "メモリ上の現在地も動いていない"
         );
+    }
+
+    // --- 思いつき ---------------------------------------------------------------
+
+    mod ideas {
+        use super::*;
+        use crate::domain::idea::{Idea, DEFAULT_IDEA_LIFETIME_SECONDS, IDEA_LIFETIME_KEY};
+
+        fn contents_of(core: &Core) -> Vec<String> {
+            core.snapshot()
+                .ideas()
+                .iter()
+                .map(|idea| idea.content().to_string())
+                .collect()
+        }
+
+        /// I/O マトリクス「置く」— 1 件増え、**現在地**も**中断メモ**も変わらない。
+        #[test]
+        fn capturing_an_idea_touches_nothing_else() {
+            let (core, storage, _) = a_core_at_work();
+            let before = core.snapshot();
+            let commits_before = storage.commits().len();
+
+            core.capture_idea("請求書の様式を直す").expect("置ける");
+
+            let after = core.snapshot();
+            assert_eq!(contents_of(&core), vec!["請求書の様式を直す"]);
+            assert_eq!(after.current_position(), before.current_position());
+            assert_eq!(after.tasks(), before.tasks(), "中断メモも完了も変わらない");
+            let commits = storage.commits();
+            assert_eq!(commits.len(), commits_before + 1);
+            let commit = commits.last().expect("ある");
+            assert!(commit.idea.is_some());
+            assert!(commit.task.is_none() && commit.current_position.is_none());
+            assert!(commit.switch_record.is_none() && commit.deleted_ideas.is_empty());
+        }
+
+        /// I/O マトリクス「休息中に置く」— 置けて、休息は続いている。
+        #[test]
+        fn an_idea_can_be_captured_while_resting() {
+            let (core, _, _) = a_core_at_work();
+            assert!(core.begin_rest().expect("入れる"));
+
+            core.capture_idea("棚を片付ける").expect("置ける");
+
+            assert!(core.snapshot().is_resting());
+            assert_eq!(contents_of(&core), vec!["棚を片付ける"]);
+        }
+
+        /// 永続化に失敗したら、メモリにも置かない。
+        #[test]
+        fn a_failed_capture_leaves_nothing() {
+            let (core, storage, _) = a_core();
+            storage.set_failing(true);
+            assert!(core.capture_idea("x").is_err());
+            assert!(core.snapshot().ideas().is_empty());
+        }
+
+        /// I/O マトリクス「昇格」— タスクができ、その思いつきは**同じコミット**で消える。
+        #[test]
+        fn promoting_deletes_the_idea_in_the_same_commit() {
+            let (core, storage, _) = a_core();
+            let idea = core.capture_idea("請求書の様式を直す").expect("置ける");
+            let other = core.capture_idea("棚を片付ける").expect("置ける");
+
+            let task_id = core
+                .create_task_promoting(
+                    "請求書の様式を直す",
+                    contents(&["請求書の様式を直す"]),
+                    Some(idea),
+                )
+                .expect("作れる");
+
+            let commit = storage.commits().last().cloned().expect("ある");
+            assert_eq!(commit.task.as_ref().map(Task::id), Some(task_id));
+            assert_eq!(commit.deleted_ideas, vec![idea]);
+            let left: Vec<_> = core.snapshot().ideas().iter().map(Idea::id).collect();
+            assert_eq!(left, vec![other], "昇格したものだけが消える");
+            assert!(core.snapshot().task(task_id).is_some());
+        }
+
+        /// I/O マトリクス「昇格」の失敗 — 作成に失敗すれば思いつきも残る。
+        #[test]
+        fn a_failed_promotion_keeps_the_idea() {
+            let (core, storage, _) = a_core();
+            let idea = core.capture_idea("請求書の様式を直す").expect("置ける");
+            storage.set_failing(true);
+
+            let outcome = core.create_task_promoting("題", contents(&["一"]), Some(idea));
+
+            assert!(outcome.is_err());
+            assert_eq!(core.snapshot().ideas().len(), 1);
+            assert!(core.snapshot().tasks().is_empty());
+
+            // ステップが無い作成もタスクを生まず、思いつきを残す。
+            storage.set_failing(false);
+            assert!(core
+                .create_task_promoting("題", Vec::new(), Some(idea))
+                .is_err());
+            assert_eq!(core.snapshot().ideas().len(), 1);
+        }
+
+        /// I/O マトリクス「昇格の途中で消える」— 削除済みの思いつきは無視して作成する。
+        #[test]
+        fn promoting_an_already_expired_idea_still_creates_the_task() {
+            let (core, storage, _) = a_core();
+            let gone = IdeaId::new(Timestamp::from_unix_millis(0));
+
+            let task_id = core
+                .create_task_promoting("題", contents(&["一"]), Some(gone))
+                .expect("作れる");
+
+            assert!(core.snapshot().task(task_id).is_some());
+            let commit = storage.commits().last().cloned().expect("ある");
+            assert!(commit.deleted_ideas.is_empty(), "無いものを消しに行かない");
+        }
+
+        /// 昇格元が無ければ従来どおりの作成である。
+        #[test]
+        fn a_plain_creation_leaves_ideas_alone() {
+            let (core, storage, _) = a_core();
+            core.capture_idea("残る").expect("置ける");
+            core.create_task("題", contents(&["一"])).expect("作れる");
+            assert_eq!(contents_of(&core), vec!["残る"]);
+            assert!(storage
+                .commits()
+                .last()
+                .expect("ある")
+                .deleted_ideas
+                .is_empty());
+        }
+
+        /// I/O マトリクス「寿命の設定」— 60 秒なら 60 秒を過ぎた刻みで消える。
+        #[test]
+        fn an_idea_disappears_after_a_configured_lifetime() {
+            let (core, storage, clock) = a_core_at_work();
+            core.store_setting(Setting::new(IDEA_LIFETIME_KEY, "60"))
+                .expect("書ける");
+            core.capture_idea("短命").expect("置ける");
+
+            // 60 秒ちょうどまでは残る。
+            tick_for(&core, &clock, 60_000);
+            assert_eq!(contents_of(&core), vec!["短命"]);
+
+            let commits_before = storage.commits().len();
+            tick_once(&core, &clock);
+            assert!(core.snapshot().ideas().is_empty(), "60 秒を過ぎたら消える");
+            let commit = storage.commits()[commits_before].clone();
+            assert_eq!(commit.deleted_ideas.len(), 1);
+            assert!(commit.task.is_none() && commit.idea.is_none());
+        }
+
+        /// 壊れた寿命は 14 日へ落ちる — 0 で刻みのたびに消えたりしない。
+        #[test]
+        fn a_broken_lifetime_falls_back_to_fourteen_days() {
+            let (core, _, clock) = a_core_at_work();
+            core.store_setting(Setting::new(IDEA_LIFETIME_KEY, "0"))
+                .expect("書ける");
+            core.capture_idea("残る").expect("置ける");
+            tick_for(&core, &clock, 5 * MINUTE);
+            assert_eq!(contents_of(&core), vec!["残る"]);
+        }
+
+        /// I/O マトリクス「寿命」— 起動直後の最初の刻みでも、14 日 + 1 秒を過ぎた
+        /// ものだけが消える。
+        #[test]
+        fn the_first_tick_after_launch_removes_expired_ideas() {
+            let clock = FixedClock::at(1_789_000_000_000);
+            let lifetime_millis = DEFAULT_IDEA_LIFETIME_SECONDS * 1_000;
+            // 最初の刻みは 10 秒後。その時点で 14 日 + 1 秒を過ぎている / まだ過ぎていない。
+            let first_tick = clock.now().unix_millis() + TICK_INTERVAL_MILLIS;
+            let old = Idea::new(
+                Timestamp::from_unix_millis(first_tick - lifetime_millis - 1_000),
+                "古い",
+            );
+            let young = Idea::new(
+                Timestamp::from_unix_millis(first_tick - lifetime_millis),
+                "ちょうど",
+            );
+            let storage = Arc::new(RecordingStorage {
+                restored: RestoredState {
+                    ideas: vec![old.clone(), young.clone()],
+                    ..RestoredState::default()
+                },
+                ..RecordingStorage::default()
+            });
+            let core = core_with(Arc::clone(&storage), clock.clone());
+            assert_eq!(core.snapshot().ideas().len(), 2, "復元で読み戻る");
+
+            tick_once(&core, &clock);
+
+            let left: Vec<_> = core.snapshot().ideas().iter().map(Idea::id).collect();
+            assert_eq!(left, vec![young.id()]);
+            assert_eq!(
+                storage.commits().last().expect("ある").deleted_ideas,
+                vec![old.id()]
+            );
+        }
+
+        /// I/O マトリクス「寿命」の失敗 — 状態を変えずに `Err`。次の刻みでやり直す。
+        #[test]
+        fn a_failed_expiry_is_retried_on_the_next_tick() {
+            let (core, storage, clock) = a_core_at_work();
+            core.store_setting(Setting::new(IDEA_LIFETIME_KEY, "60"))
+                .expect("書ける");
+            core.capture_idea("短命").expect("置ける");
+            tick_for(&core, &clock, 60_000);
+
+            storage.set_failing(true);
+            clock.advance(TICK_INTERVAL_MILLIS);
+            assert!(core.tick().is_err());
+            assert_eq!(
+                contents_of(&core),
+                vec!["短命"],
+                "失敗した削除はメモリにも反映しない"
+            );
+
+            storage.set_failing(false);
+            clock.advance(TICK_INTERVAL_MILLIS);
+            core.tick().expect("刻める");
+            assert!(core.snapshot().ideas().is_empty());
+        }
+
+        /// **削除の失敗は介入も計時も止めない。** 削除が失敗し続けても、閾値を超えた
+        /// 刻みは休息の**介入**を発し、直前の刻みの時刻も進む (スリープに見えない)。
+        #[test]
+        fn a_failing_expiry_does_not_block_the_rest_intervention() {
+            let (core, storage, clock) = a_core_at_work();
+            core.store_setting(Setting::new(REST_THRESHOLD_KEY, "60"))
+                .expect("書ける");
+            core.store_setting(Setting::new(IDEA_LIFETIME_KEY, "20"))
+                .expect("書ける");
+            core.capture_idea("消えない").expect("置ける");
+            storage.set_failing(true);
+
+            let mut raised = false;
+            let mut failed = false;
+            for _ in 0..12 {
+                clock.advance(TICK_INTERVAL_MILLIS);
+                match core.tick() {
+                    Ok(effect) => raised |= effect.raised,
+                    Err(_) => failed = true,
+                }
+                assert_eq!(core.snapshot().last_tick, clock.now(), "刻みの時刻は進む");
+                if raised {
+                    break;
+                }
+            }
+
+            assert!(failed, "削除は実際に失敗している");
+            assert!(raised, "閾値を超えた刻みは介入を発する");
+            assert_eq!(
+                core.snapshot().intervention().map(|shown| shown.kind()),
+                Some(InterventionKind::Rest)
+            );
+            assert_eq!(contents_of(&core), vec!["消えない"]);
+        }
+
+        /// 消えるものが無い刻みは何も書かない (待機中の常駐が DB を叩かない)。
+        #[test]
+        fn a_tick_without_expired_ideas_writes_nothing_for_them() {
+            let (core, storage, clock) = a_core_at_work();
+            core.capture_idea("新しい").expect("置ける");
+            let before = storage.commits().len();
+            tick_once(&core, &clock);
+            assert_eq!(storage.commits().len(), before);
+        }
     }
 }
