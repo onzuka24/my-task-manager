@@ -2185,6 +2185,191 @@ test('休息中でも残り時間やカウントダウンを出さない (spec N
   }
 })
 
+// --- 休息のすすめ ----------------------------------------------------------
+
+function restAdviceToggle(): HTMLButtonElement | null {
+  return document.querySelector<HTMLButtonElement>('button.rest-advice-toggle')
+}
+
+function restAdviceItems(): string[] {
+  return Array.from(document.querySelectorAll('.rest-advice-list li')).map(
+    (li) => li.textContent ?? '',
+  )
+}
+
+test('休息に入った直後のすすめは見出しだけである (閉じた状態)', async () => {
+  await enterTheRestingSurface()
+
+  const toggle = restAdviceToggle()
+  expect(toggle?.textContent).toContain('休息のすすめ')
+  expect(toggle?.getAttribute('aria-expanded')).toBe('false')
+  expect(restAdviceItems()).toHaveLength(0)
+})
+
+test('⌘T ですすめが開き、もう一度で畳まれる — コアは呼ばれない', async () => {
+  await enterTheRestingSurface()
+
+  const opened = pressCancelable('t', { metaKey: true })
+  await settle()
+  expect(opened.defaultPrevented).toBe(true)
+  expect(restAdviceToggle()?.getAttribute('aria-expanded')).toBe('true')
+  expect(restAdviceItems()).toEqual([
+    '窓の外など遠く (6m 以上) を 20 秒ほど眺める',
+    '水をコップ 1 杯飲む',
+    'スマホを見ない — うつむく姿勢が首に、近くの画面が目に負担をかける',
+    '肩をすくめて 5 秒止め、ストンと落とす (3 回)',
+    '首をゆっくり左右に倒し、伸ばす',
+    '歯の食いしばりをほどき、ゆっくり息を吐く',
+    '立ち上がって少し歩く',
+  ])
+
+  // CapsLock が入っていても効く。
+  press('T', { metaKey: true })
+  await settle()
+  expect(restAdviceToggle()?.getAttribute('aria-expanded')).toBe('false')
+  expect(restAdviceItems()).toHaveLength(0)
+
+  expect(invoked).toEqual([])
+})
+
+test('ボタンでもすすめを開閉でき、コアは呼ばれない', async () => {
+  await enterTheRestingSurface()
+
+  restAdviceToggle()?.click()
+  await settle()
+  expect(restAdviceToggle()?.getAttribute('aria-expanded')).toBe('true')
+  expect(restAdviceItems()).toHaveLength(7)
+
+  restAdviceToggle()?.click()
+  await settle()
+  expect(restAdviceToggle()?.getAttribute('aria-expanded')).toBe('false')
+  expect(restAdviceItems()).toHaveLength(0)
+
+  expect(invoked).toEqual([])
+})
+
+test('修飾を伴う ⌘T は開閉しない', async () => {
+  await enterTheRestingSurface()
+
+  press('t', { metaKey: true, shiftKey: true })
+  press('t', { metaKey: true, altKey: true })
+  press('t', { metaKey: true, ctrlKey: true })
+  press('t')
+  await settle()
+
+  expect(restAdviceToggle()?.getAttribute('aria-expanded')).toBe('false')
+})
+
+test('IME 変換中の ⌘T は何もしない', async () => {
+  await enterTheRestingSurface()
+
+  press('t', { metaKey: true, isComposing: true })
+  await settle()
+
+  expect(restAdviceToggle()?.getAttribute('aria-expanded')).toBe('false')
+  expect(invoked).toEqual([])
+})
+
+test('作業中の既定表示にすすめは描かれず、⌘T は何も起こさない', async () => {
+  expect(restAdviceToggle()).toBeNull()
+  invoked = []
+
+  const event = pressCancelable('t', { metaKey: true })
+  await settle()
+
+  expect(event.defaultPrevented).toBe(true)
+  expect(restAdviceToggle()).toBeNull()
+  expect(document.body.textContent ?? '').not.toContain('休息のすすめ')
+  expect(invoked).toEqual([])
+  expect(document.querySelector('.hint')?.textContent ?? '').not.toContain('⌘T')
+
+  // 作業中の ⌘T は引き継がれる開閉の状態にも触れない。
+  await enterTheRestingSurface()
+  expect(restAdviceToggle()?.getAttribute('aria-expanded')).toBe('false')
+  expect(restAdviceItems()).toHaveLength(0)
+})
+
+test('押しっぱなしの ⌘T (自動反復) は開閉しない', async () => {
+  await enterTheRestingSurface()
+
+  const event = pressCancelable('t', { metaKey: true, repeat: true })
+  await settle()
+
+  expect(event.defaultPrevented).toBe(true)
+  expect(restAdviceToggle()?.getAttribute('aria-expanded')).toBe('false')
+  expect(restAdviceItems()).toHaveLength(0)
+})
+
+test('休息中の案内に ⌘T が載る', async () => {
+  await enterTheRestingSurface()
+
+  expect(document.querySelector('.hint')?.textContent ?? '').toContain('⌘T で休息のすすめ')
+})
+
+test('すすめが開いたまま Enter を押すと休息が終わり、すすめは消える', async () => {
+  await enterTheRestingSurface()
+  press('t', { metaKey: true })
+  await settle()
+  snapshot = { ...SNAPSHOT, resting: false }
+
+  press('Enter')
+  await settle()
+
+  expect(invoked).toContain('end_rest')
+  expect(invoked).not.toContain('switch_current_position')
+  expect(restAdviceToggle()).toBeNull()
+  expect(restAdviceItems()).toHaveLength(0)
+})
+
+test('開閉の状態は閉じても次の休息へ引き継がれる', async () => {
+  await enterTheRestingSurface()
+  press('t', { metaKey: true })
+  await settle()
+
+  // 休息を終え、オーバーレイを閉じる。
+  snapshot = { ...SNAPSHOT, resting: false }
+  press('Enter')
+  await settle()
+  press('Escape')
+  await settle()
+  expect(invoked).toContain('hide_overlay')
+
+  // 後で再び休息に入る。
+  await enterTheRestingSurface()
+
+  expect(restAdviceToggle()?.getAttribute('aria-expanded')).toBe('true')
+  expect(restAdviceItems()).toHaveLength(7)
+})
+
+test('すすめを開いても残り時間・経過・達成を出さない (AD-15)', async () => {
+  await enterTheRestingSurface()
+  press('t', { metaKey: true })
+  await settle()
+
+  const text = document.body.textContent ?? ''
+  for (const forbidden of ['残り', '分後', '経過', '%']) {
+    expect(text).not.toContain(forbidden)
+  }
+  expect(document.querySelector('.rest-advice input[type="checkbox"]')).toBeNull()
+})
+
+test('受け入れ条件: 開いたすすめは切り取られず、main のスクロールで辿れる', async () => {
+  await enterTheRestingSurface()
+  press('t', { metaKey: true })
+  await settle()
+
+  const main = document.querySelector('main') as HTMLElement
+  const list = document.querySelector('.rest-advice-list') as HTMLElement
+  expect(main.contains(list)).toBe(true)
+  const style = getComputedStyle(list)
+  expect(['auto', 'scroll', 'hidden']).not.toContain(style.overflow)
+  expect(['auto', 'scroll', 'hidden']).not.toContain(style.overflowY)
+  expect(['auto', 'scroll', 'hidden']).not.toContain(style.overflowX)
+  expect(['none', '']).toContain(style.maxHeight)
+  expect(['', 'auto']).toContain(style.height)
+  expect(restAdviceItems()[6]).toContain('立ち上がって少し歩く')
+})
+
 // ---------------------------------------------------------------------------
 // 修正の面 (CAP-5 / FR-4 / FR-5)
 // ---------------------------------------------------------------------------

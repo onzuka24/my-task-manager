@@ -169,6 +169,32 @@
    */
   let resting = $state(false)
 
+  /**
+   * 休息のすすめが開いているか — 揮発ビュー状態 (AD-2)。コアは知らない。
+   *
+   * **常駐が動いている間だけ覚える** (利用者の裁定)。`forgetPosition()` /
+   * `dismissNotices()` / `close()` で畳まない — 窓は隠すだけで webview は生き続ける
+   * ため、この `$state` がそのまま常駐中の記憶になり、次の休息へ引き継がれる。
+   * 永続化はしない。起動直後は閉じている。
+   */
+  let restAdviceOpen = $state(false)
+
+  /**
+   * 休息のすすめ (緊張型頭痛の対策)。**中身はコードに固定する** (利用者の裁定)。
+   *
+   * 体の使い方の短い提案に留める — 診断や断定を書かない。時間・回数・達成を問う
+   * 項目にしない (AD-15)。「20 秒」「3 回」は過ごし方の目安であり、計時も数えもしない。
+   */
+  const REST_ADVICE: readonly string[] = [
+    '窓の外など遠く (6m 以上) を 20 秒ほど眺める',
+    '水をコップ 1 杯飲む',
+    'スマホを見ない — うつむく姿勢が首に、近くの画面が目に負担をかける',
+    '肩をすくめて 5 秒止め、ストンと落とす (3 回)',
+    '首をゆっくり左右に倒し、伸ばす',
+    '歯の食いしばりをほどき、ゆっくり息を吐く',
+    '立ち上がって少し歩く',
+  ]
+
   /** 休息の宣言が飛んでいる間。二重確定を防ぐ。 */
   let beginningRest = $state(false)
   /** 休息の終了の宣言が飛んでいる間。二重確定を防ぐ。 */
@@ -1199,7 +1225,7 @@
    * **`key` を畳んで比べる。** CapsLock が入っていると `key` は `'L'` で届き、小文字と
    * の比較では一致しない — 案内どおりに押しても何も起きない面ができる。
    */
-  function isSurfaceKey(event: KeyboardEvent, letter: 'n' | 'l' | 'e' | 'r'): boolean {
+  function isSurfaceKey(event: KeyboardEvent, letter: 'n' | 'l' | 'e' | 'r' | 't'): boolean {
     return (
       event.key.toLowerCase() === letter &&
       event.metaKey &&
@@ -1288,6 +1314,17 @@
       event.preventDefault()
       if (switching) return
       void declareRest()
+      return
+    }
+
+    // 休息のすすめの開閉。**コアを呼ばない** — 休息の状態も計時も変えない。休息中で
+    // なければすすめは描かれておらず、何も起きない。打鍵は飲む (webview の既定動作へ
+    // 抜けさせない)。
+    if (isSurfaceKey(event, 't')) {
+      event.preventDefault()
+      // 押しっぱなしの自動反復で開閉を繰り返さない — 最後の状態が反復回数で決まる。
+      if (event.repeat || !resting) return
+      restAdviceOpen = !restAdviceOpen
       return
     }
 
@@ -1742,6 +1779,35 @@
     -->
     <p class="next-action">休息中。</p>
     <p class="position">現在地は保たれている。連続作業時間は数えていない。</p>
+
+    <!--
+      休息のすすめ。**開閉するだけで、こなしたかは問わない** — チェックボックスも
+      数も置かない (AD-15)。閉じているときは見出し 1 行だけを出す。
+
+      `onmousedown` で既定動作を止めるのは、他のボタンと同じく入力位置を奪わないため
+      である。フォーカスがこのボタンに残ると、Enter が既定表示の打鍵 (休息の終了) と
+      ボタンの click の両方に読まれうる。
+    -->
+    <section class="rest-advice">
+      <button
+        type="button"
+        class="rest-advice-toggle"
+        aria-expanded={restAdviceOpen}
+        aria-controls={restAdviceOpen ? 'rest-advice-list' : undefined}
+        onmousedown={preventStealingFocus}
+        onclick={() => (restAdviceOpen = !restAdviceOpen)}
+      >
+        <span class="mark" aria-hidden="true">{restAdviceOpen ? '▾' : '▸'}</span>
+        休息のすすめ
+      </button>
+      {#if restAdviceOpen}
+        <ul class="rest-advice-list" id="rest-advice-list">
+          {#each REST_ADVICE as advice (advice)}
+            <li>{advice}</li>
+          {/each}
+        </ul>
+      {/if}
+    </section>
   {:else if stepContent === null}
     {#if !snapshotError}
       <p class="next-action">まだ現在地が無い — 未着手である。</p>
@@ -1908,7 +1974,7 @@
       休息の終了の宣言だけを意味する (CAP-10)。案内と実際に効く打鍵を食い違わせない。
     -->
     <p class="hint">
-      {#if resting}Enter で休息を終える · {:else if stepContent !== null}Enter で切り替え · ⌘Enter で完了して次を選ぶ · ⌘R で休息に入る · ⌘E でこのタスクを直す · {/if}⌘N で新しいタスク · ⌘L で一覧 · Esc で閉じる{#if hotkey && hotkey.registered} · {hotkey.accelerator} で開閉{/if} · 開く・終了はメニューバー項目からも
+      {#if resting}Enter で休息を終える · ⌘T で休息のすすめ · {:else if stepContent !== null}Enter で切り替え · ⌘Enter で完了して次を選ぶ · ⌘R で休息に入る · ⌘E でこのタスクを直す · {/if}⌘N で新しいタスク · ⌘L で一覧 · Esc で閉じる{#if hotkey && hotkey.registered} · {hotkey.accelerator} で開閉{/if} · 開く・終了はメニューバー項目からも
     </p>
   {/if}
 </main>
@@ -1949,6 +2015,51 @@
   .position {
     margin: 0;
     font-size: 0.82rem;
+    color: var(--overlay-muted);
+  }
+
+  /*
+    休息のすすめ。`.position` 並みの小さな文字で窓 (640×280) に収まりやすくする。
+    収まらない分は main のスクロールで辿る — 切り取らない (max-height / overflow を
+    持たせない)。強調色・バー・進捗の表現を足さない (AD-15)。
+  */
+  .rest-advice {
+    display: flex;
+    flex-direction: column;
+    gap: 0.35rem;
+  }
+
+  .rest-advice-toggle {
+    align-self: flex-start;
+    margin: 0;
+    padding: 0;
+    border: none;
+    background: none;
+    color: var(--overlay-muted);
+    font: inherit;
+    font-size: 0.82rem;
+    cursor: pointer;
+  }
+
+  .rest-advice-toggle:focus-visible {
+    outline: 1px solid var(--overlay-focus);
+    outline-offset: 2px;
+  }
+
+  .rest-advice-toggle .mark {
+    display: inline-block;
+    width: 1em;
+  }
+
+  .rest-advice-list {
+    margin: 0;
+    padding: 0 0 0 1.2rem;
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    column-gap: 1.25rem;
+    row-gap: 0.15rem;
+    font-size: 0.8rem;
+    line-height: 1.45;
     color: var(--overlay-muted);
   }
 
