@@ -161,6 +161,7 @@ pub fn run() {
             commands::get_overlay_snapshot,
             commands::get_disclosure_surface,
             commands::create_task,
+            commands::capture_idea,
             commands::switch_current_position,
             commands::select_step,
             commands::complete_current_step,

@@ -36,6 +36,7 @@ use tauri::{AppHandle, Manager, Runtime, State};
 
 use crate::adapters::hotkey::{HotkeyStatus, ResponseHotkeyStatus};
 use crate::adapters::{intervention, presentation};
+use crate::domain::idea::IdeaId;
 use crate::domain::rest::{InterventionChoice, InterventionKind};
 use crate::domain::state::{Core, CoreState};
 use crate::domain::task::{InterruptionNote, Step, StepId, Task, TaskId};
@@ -332,6 +333,44 @@ pub struct DisclosureSurface {
     ///
     /// **タスク**が 1 個も無ければ空である。フロントはこれを見て「その旨の 1 行」を出す。
     pub rows: Vec<DisclosureRow>,
+    /// **思いつき**。新しい順。**行 ([`Self::rows`]) とは別の欄である** — 一覧の末尾に
+    /// 見出し「思いつき」と並び、0 件なら欄ごと出ない。
+    ///
+    /// **件数の欄も時刻の欄も持たない** (AD-15)。並びはここで決めて運ぶ。
+    pub ideas: Vec<DisclosureIdea>,
+}
+
+/// **開示面**に並ぶ**思いつき**の 1 行。
+///
+/// **欄は ID と本文だけである。** 作成時刻・残り日数・経過を運ばない — 欄が無ければ
+/// フロントがどう書こうと描ける値が存在しない (AD-15 / spec Never)。契約は
+/// [`tests::the_disclosure_ideas_keep_their_wire_contract`] が固定する。
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DisclosureIdea {
+    /// 昇格するときに作成の要求へ載せて送り返す ID ([`CreateTaskRequest::idea_id`])。
+    pub idea_id: String,
+    /// 本文。昇格の下書き (題名とステップ 1) にもなる。
+    pub content: String,
+}
+
+/// **思いつき**を新しい順に並べる純粋関数。
+///
+/// 作成時刻の降順、同時刻なら ID の降順 (UUID v7 は生成順) である。
+fn disclosure_ideas_of(state: &CoreState) -> Vec<DisclosureIdea> {
+    let mut ideas: Vec<_> = state.ideas().iter().collect();
+    ideas.sort_by(|a, b| {
+        b.created_at()
+            .cmp(&a.created_at())
+            .then_with(|| b.id().cmp(&a.id()))
+    });
+    ideas
+        .into_iter()
+        .map(|idea| DisclosureIdea {
+            idea_id: idea.id().to_string(),
+            content: idea.content().to_string(),
+        })
+        .collect()
 }
 
 /// **コア状態を開示面の一覧へ落とす純粋関数** (CAP-9 / FR-19)。
@@ -350,6 +389,7 @@ fn disclosure_of(state: Option<&CoreState>, open_task_id: Option<&str>) -> Discl
         return DisclosureSurface {
             state_error: Some(CORE_MISSING.to_string()),
             rows: Vec::new(),
+            ideas: Vec::new(),
         };
     };
 
@@ -362,7 +402,7 @@ fn disclosure_of(state: Option<&CoreState>, open_task_id: Option<&str>) -> Discl
     // 一覧は済んだ仕事の山へ育ち、罪悪感を与えない約束が壊れる。
     //
     // **消すのは表示からだけである。** 行は残る (`ports/storage.rs` の [`Commit`] は
-    // 行を消す変更を持たない)。FR-19 の「**腐敗**した**タスク**を含まない」と同じ
+    // **タスク**の行を消す変更を持たない)。FR-19 の「**腐敗**した**タスク**を含まない」と同じ
     // 場所に同じ形で立っており、CAP-20 の除外もここへ加わる。
     //
     // **現在地**を抱えている**タスク**だけは例外として残す。落とすと、最後の
@@ -408,6 +448,7 @@ fn disclosure_of(state: Option<&CoreState>, open_task_id: Option<&str>) -> Discl
     DisclosureSurface {
         state_error: None,
         rows,
+        ideas: disclosure_ideas_of(state),
     }
 }
 
@@ -484,6 +525,52 @@ pub struct CreateTaskRequest {
     /// **書き留めることと着手することは別の行為である** (FR-18 と同じ原則)。既に
     /// **現在地**があるときも、置き換えはこれが真のときにだけ起きる。
     pub move_current_position: bool,
+    /// 昇格元の**思いつき**。[`DisclosureIdea::idea_id`] が運んだ文字列そのもの。
+    ///
+    /// `null` (または欄の欠落) なら従来どおりの作成である。値があれば、作成と同じ
+    /// トランザクションでその**思いつき**を削除する。既に寿命で消えていれば無視する。
+    #[serde(default)]
+    pub idea_id: Option<String>,
+}
+
+/// `capture_idea` が受け取る要求。**これがコマンドの引数型そのものである。**
+///
+/// フロントは `invoke('capture_idea', { request: { content } })` と呼ぶ。
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CaptureIdeaRequest {
+    /// 一行の本文。前後の空白を除いて空なら置かない。
+    pub content: String,
+}
+
+/// 本文が空であることを示す理由。**入力欄を残して提示される** (I/O マトリクス「空」)。
+const IDEA_MISSING: &str = "思いつきが空である。一行書いてから置くこと。";
+
+/// 昇格元の ID が読めないことを示す理由。**何も保存されていない。**
+const IDEA_ID_UNREADABLE: &str = "思いつきの ID を読めない。何も保存していない。";
+
+/// **思いつきの本文を整える純粋関数。** 前後の空白を除いて空なら置かない。
+///
+/// **一行である。** 貼り付けで紛れ込んだ改行は空白へ畳む — 行を区切りとして扱う
+/// 面ではないため、改行を残すと開示面の 1 行が複数行に割れる。
+fn as_idea_content(content: &str) -> Result<String, String> {
+    let line = content
+        .split(STEP_SEPARATORS)
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
+    if line.is_empty() {
+        return Err(IDEA_MISSING.to_string());
+    }
+    Ok(line)
+}
+
+/// **昇格元の ID を読む純粋関数。** `None` は昇格ではない。読めない ID は `Err`。
+fn idea_to_promote(idea_id: Option<&str>) -> Result<Option<IdeaId>, String> {
+    idea_id
+        .map(|text| IdeaId::parse(text).map_err(|_| IDEA_ID_UNREADABLE.to_string()))
+        .transpose()
 }
 
 /// **タスク**の作成の結末。
@@ -988,10 +1075,12 @@ pub fn create_task<R: Runtime>(
     // **コアを要求する前に入力を検める。** 順を逆にすると、題名を書き忘れただけの利用者に
     // 「状態を読み込めていない」という無関係な理由が返りうる。
     let definition = as_task_definition(&request.title, &request.steps)?;
+    let promoted_from = idea_to_promote(request.idea_id.as_deref())?;
     let core = require_core(app.try_state::<Core>())?;
 
+    // 昇格元の**思いつき**は作成と同じトランザクションで消える (コア側)。
     let task_id = core
-        .create_task(definition.title, definition.step_contents)
+        .create_task_promoting(definition.title, definition.step_contents, promoted_from)
         .map_err(|error| error.to_string())?;
     // 状態を変えた後は必ず event を発行する (AD-3)。ペイロードは持たない — 受け手は
     // スナップショットを取り直す。
@@ -1019,6 +1108,33 @@ pub fn create_task<R: Runtime>(
 
     log::info!("a task was created (moved=true)");
     Ok(CreateTaskOutcome { moved: true })
+}
+
+/// **思いつき**を置く。
+///
+/// **現在地**・**中断メモ**・**休息**・計時のいずれにも触れない。**本文はログに書かない。**
+///
+/// # なぜイベントを発行しないのか
+///
+/// **思いつき**は既定表示にもメニューバー項目にも出ない (AD-15)。再描画すべき面が
+/// どこにも無く、発行すれば「何かが増えた」という能動的な合図だけが生まれる。開示面は
+/// 開くたびに取り直す (AD-3 鮮度規則)。
+///
+/// # Errors
+///
+/// 本文が空のとき、コアが `manage` されていないとき、または永続化に失敗したとき。
+/// **いずれの場合も何も保存されていない。** 呼び出し側は入力欄を残して理由を示す。
+#[tauri::command]
+pub fn capture_idea<R: Runtime>(
+    app: AppHandle<R>,
+    request: CaptureIdeaRequest,
+) -> Result<(), String> {
+    let content = as_idea_content(&request.content)?;
+    let core = require_core(app.try_state::<Core>())?;
+    core.capture_idea(content)
+        .map_err(|error| error.to_string())?;
+    log::info!("an idea was captured");
+    Ok(())
 }
 
 /// **開示面**が表示されるたびに呼ばれ、一覧の完全なスナップショットを返す
@@ -2097,6 +2213,7 @@ mod tests {
                 title: "原稿".to_string(),
                 steps: "構成を決める\n下書きを書く".to_string(),
                 move_current_position: true,
+                idea_id: None,
             }
         );
 
@@ -2944,6 +3061,7 @@ mod tests {
         let json: serde_json::Value = serde_json::to_value(DisclosureSurface {
             state_error: None,
             rows: Vec::new(),
+            ideas: Vec::new(),
         })
         .expect("直列化できる");
 
@@ -2954,11 +3072,149 @@ mod tests {
             .collect();
         assert_eq!(
             fields,
-            vec!["rows", "stateError"],
+            vec!["ideas", "rows", "stateError"],
             "件数・進捗率に由来する欄を足さない (AD-15)"
         );
         assert!(json["stateError"].is_null());
         assert!(json["rows"].is_array());
+        assert!(json["ideas"].is_array());
+    }
+
+    /// **思いつき**の 1 行は ID と本文だけを運ぶ。件数・時刻・残り日数の欄を持たない
+    /// (AD-15 / spec Never)。
+    #[test]
+    fn the_disclosure_ideas_keep_their_wire_contract() {
+        let json = serde_json::to_value(DisclosureIdea {
+            idea_id: "0198f0e0-0000-7000-8000-000000000000".to_string(),
+            content: "請求書の様式を直す".to_string(),
+        })
+        .expect("直列化できる");
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "ideaId": "0198f0e0-0000-7000-8000-000000000000",
+                "content": "請求書の様式を直す",
+            })
+        );
+    }
+
+    /// **TS → Rust の契約。** 置く要求は本文だけである。
+    #[test]
+    fn the_capture_request_keeps_its_wire_contract() {
+        let request: CaptureIdeaRequest =
+            serde_json::from_str(r#"{"content":"請求書の様式を直す"}"#).expect("復元できる");
+        assert_eq!(
+            request,
+            CaptureIdeaRequest {
+                content: "請求書の様式を直す".to_string()
+            }
+        );
+        assert!(serde_json::from_str::<CaptureIdeaRequest>(r#"{"text":"x"}"#).is_err());
+    }
+
+    /// 昇格元の ID が作成の要求に載る。欠けていれば従来どおりの作成である。
+    #[test]
+    fn the_creation_request_carries_the_idea_to_promote() {
+        let request: CreateTaskRequest = serde_json::from_str(
+            r#"{"title":"題","steps":"一","moveCurrentPosition":false,"ideaId":"0198f0e0-0000-7000-8000-000000000000"}"#,
+        )
+        .expect("復元できる");
+        assert_eq!(
+            request.idea_id.as_deref(),
+            Some("0198f0e0-0000-7000-8000-000000000000")
+        );
+        let plain: CreateTaskRequest = serde_json::from_str(
+            r#"{"title":"題","steps":"一","moveCurrentPosition":false,"ideaId":null}"#,
+        )
+        .expect("復元できる");
+        assert_eq!(plain.idea_id, None);
+        // 欄が欠けていても従来どおりの作成として復元できる (`#[serde(default)]`)。
+        let omitted: CreateTaskRequest =
+            serde_json::from_str(r#"{"title":"題","steps":"一","moveCurrentPosition":false}"#)
+                .expect("ideaId が無くても復元できる");
+        assert_eq!(omitted.idea_id, None);
+
+        assert_eq!(idea_to_promote(None), Ok(None));
+        assert!(
+            idea_to_promote(Some("0198f0e0-0000-7000-8000-000000000000"))
+                .expect("読める")
+                .is_some()
+        );
+        assert_eq!(
+            idea_to_promote(Some("壊れた")),
+            Err(IDEA_ID_UNREADABLE.to_string())
+        );
+    }
+
+    /// I/O マトリクス「空」— 空白だけの本文は置かない。前後の空白は落とし、改行は畳む。
+    #[test]
+    fn an_idea_must_have_content() {
+        for blank in ["", "   ", "\n\t ", "\u{2028}"] {
+            assert_eq!(as_idea_content(blank), Err(IDEA_MISSING.to_string()));
+        }
+        assert_eq!(
+            as_idea_content("  請求書の様式を直す  "),
+            Ok("請求書の様式を直す".to_string())
+        );
+        assert_eq!(as_idea_content("一\n二"), Ok("一 二".to_string()));
+    }
+
+    /// I/O マトリクス「一覧」「0 件」— 思いつきは新しい順に、行とは別の欄に並ぶ。
+    #[test]
+    fn the_disclosure_lists_ideas_newest_first_apart_from_the_rows() {
+        let clock = FixedClock::at(1_789_000_000_000);
+        let core = Core::restore(Box::new(clock.clone()), Box::new(AcceptingStorage))
+            .expect("空の状態は復元できる");
+        let empty = disclosure_of(Some(&core.snapshot()), None);
+        assert!(empty.ideas.is_empty(), "0 件なら欄は空");
+
+        core.capture_idea("古い").expect("置ける");
+        clock.advance(1_000);
+        core.capture_idea("新しい").expect("置ける");
+
+        let surface = disclosure_of(Some(&core.snapshot()), None);
+        let contents: Vec<&str> = surface
+            .ideas
+            .iter()
+            .map(|idea| idea.content.as_str())
+            .collect();
+        assert_eq!(contents, vec!["新しい", "古い"]);
+        assert!(surface.rows.is_empty(), "思いつきはタスクの行に混ざらない");
+
+        let missing = disclosure_of(None, None);
+        assert!(missing.ideas.is_empty());
+    }
+
+    /// 受け入れ条件 — 思いつきが何件あっても、既定表示のスナップショットに思いつきの
+    /// 文字も数も現れない。
+    #[test]
+    fn the_overlay_snapshot_carries_nothing_about_ideas() {
+        let core = Core::restore(
+            Box::new(FixedClock::at(1_789_000_000_000)),
+            Box::new(AcceptingStorage),
+        )
+        .expect("空の状態は復元できる");
+        let task_id = core.create_task("原稿", contents(&["一"])).expect("作れる");
+        let first = core.snapshot().task(task_id).expect("ある").steps()[0].id();
+        core.move_current_position(first).expect("移せる");
+        let before = serde_json::to_value(snapshot_of(
+            HotkeyStatus::registered(),
+            Some(&core.snapshot()),
+        ))
+        .expect("直列化できる");
+
+        for index in 0..3 {
+            core.capture_idea(format!("思いつき{index}"))
+                .expect("置ける");
+        }
+        let after = serde_json::to_value(snapshot_of(
+            HotkeyStatus::registered(),
+            Some(&core.snapshot()),
+        ))
+        .expect("直列化できる");
+
+        assert_eq!(before, after, "思いつきは既定表示に何も足さない");
+        assert!(!after.to_string().contains("思いつき"));
     }
 
     /// **鍵の集合を固定する検査** (`the_snapshot_carries_nothing_from_the_switch_record`

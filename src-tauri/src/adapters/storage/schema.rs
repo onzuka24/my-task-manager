@@ -85,8 +85,27 @@ CREATE TABLE switch_record (
 ) STRICT;
 ";
 
+/// 版 3 — **思いつき**。
+///
+/// V1・V2 を書き換えず追記する (V2 の注釈と同じ理由)。
+///
+/// **外部キーを持たない。** **思いつき**はどの**タスク**にも**ステップ**にも属さず、
+/// 昇格して生まれた**タスク**とも結ばない — 昇格した時点で行そのものが消える。
+///
+/// **この表だけは行を消す。** 昇格 (作成と同じトランザクション) と寿命 (`Core::tick`)
+/// の二つの経路だけが `DELETE` する。**タスク**・**ステップ**を消す経路は今も無い。
+///
+/// **索引を張らない。** 寿命の判定はメモリ上で行い、DB は主キーで消すだけである。
+const V3: &str = "\
+CREATE TABLE idea (
+    id         TEXT PRIMARY KEY NOT NULL,
+    content    TEXT NOT NULL,
+    created_at TEXT NOT NULL
+) STRICT;
+";
+
 /// 版の順序。**追記のみ。** 添字 + 1 が `PRAGMA user_version` の値になる。
-const MIGRATIONS: &[&str] = &[V1, V2];
+const MIGRATIONS: &[&str] = &[V1, V2, V3];
 
 /// コードが期待するスキーマの版。
 pub const LATEST_VERSION: i64 = MIGRATIONS.len() as i64;
@@ -247,6 +266,7 @@ mod tests {
             tables(&connection),
             vec![
                 "current_position",
+                "idea",
                 "setting",
                 "step",
                 "switch_record",
@@ -255,14 +275,68 @@ mod tests {
         );
     }
 
-    /// **V1 を書き換えず V2 を追記した。** 既存インストールは V1 適用済みのまま
-    /// V2 だけを受け取る — その一段だけが走ることを確かめる。
+    /// **V1 を書き換えず V2・V3 を追記した。** 既存インストールは適用済みの版を
+    /// 保ったまま、残りの版だけを受け取る。
     #[test]
     fn an_existing_installation_only_receives_the_new_version() {
-        assert_eq!(LATEST_VERSION, 2);
-        assert_eq!(pending(1), &[V2]);
+        assert_eq!(LATEST_VERSION, 3);
+        assert_eq!(pending(1), &[V2, V3]);
+        assert_eq!(pending(2), &[V3]);
         assert!(V1.contains("CREATE TABLE task"));
         assert!(!V1.contains("switch_record"), "V1 は書き換えない");
+        assert!(
+            !V1.contains("idea") && !V2.contains("idea"),
+            "V1・V2 は書き換えない"
+        );
+    }
+
+    /// 受け入れ条件「版 2 の既存 DB を起動すると版 3 になり、既存のタスクと現在地は
+    /// そのまま」。
+    #[test]
+    fn migrating_from_version_two_adds_the_idea_table_and_keeps_the_rest() {
+        let mut connection = Connection::open_in_memory().expect("メモリ DB は開ける");
+        configure(&connection).expect("PRAGMA を設定できる");
+        connection.execute_batch(V1).expect("版 1 は適用できる");
+        connection.execute_batch(V2).expect("版 2 は適用できる");
+        connection
+            .pragma_update(None, "user_version", 2)
+            .expect("版番号は書ける");
+        connection
+            .execute("INSERT INTO task (id, title) VALUES ('t', '原稿')", [])
+            .expect("タスクは書ける");
+        connection
+            .execute(
+                "INSERT INTO step (id, task_id, ordinal, content) VALUES ('s', 't', 1, '下書き')",
+                [],
+            )
+            .expect("ステップは書ける");
+        connection
+            .execute(
+                "INSERT INTO current_position (id, task_id, step_id, is_active, activated_at) \
+                 VALUES (1, 't', 's', 1, '1970-01-01T00:00:00.000Z')",
+                [],
+            )
+            .expect("現在地は書ける");
+        assert!(!tables(&connection).contains(&"idea".to_string()));
+
+        migrate(&mut connection).expect("残りが適用できる");
+
+        assert_eq!(version_of(&connection), 3);
+        assert!(tables(&connection).contains(&"idea".to_string()));
+        let title: String = connection
+            .query_row("SELECT title FROM task WHERE id = 't'", [], |row| {
+                row.get(0)
+            })
+            .expect("タスクは残っている");
+        assert_eq!(title, "原稿");
+        let step: String = connection
+            .query_row(
+                "SELECT step_id FROM current_position WHERE id = 1",
+                [],
+                |row| row.get(0),
+            )
+            .expect("現在地は残っている");
+        assert_eq!(step, "s");
     }
 
     /// 版 1 の DB を開くと**切り替え履歴**の表だけが増える。

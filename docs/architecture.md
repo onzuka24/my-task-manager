@@ -98,9 +98,10 @@ flowchart LR
 | `get_overlay_snapshot` | Overlay | 既定表示 (次の一手) の取得 |
 | `switch_current_position` | Overlay | 切り替え (`Enter`) |
 | `complete_current_step` | Overlay | 完了して次を選ぶ (`⌘Enter`) |
-| `get_disclosure_surface` | Overlay | 一覧 (`⌘L`) |
+| `get_disclosure_surface` | Overlay | 一覧 (`⌘L`)。末尾に思いつきの欄を含む |
 | `select_step` | Overlay | 一覧から現在地を移す |
-| `create_task` | Overlay | タスクを作る (`⌘N`) |
+| `create_task` | Overlay | タスクを作る (`⌘N`)。`ideaId` があれば思いつきからの昇格で、同じトランザクションでその思いつきを消す |
+| `capture_idea` | Overlay | 思いつきを置く (`⌘I`)。現在地・中断メモ・休息に触れない。イベントは発行しない |
 | `get_task_draft` / `edit_task` | Overlay | タスクを直す (`⌘E`) |
 | `begin_rest` / `end_rest` | Overlay | 休息に入る (`⌘R`) / 終える |
 | `hide_overlay` / `mark_overlay_hidden` | Overlay | 閉じる |
@@ -131,12 +132,13 @@ sequenceDiagram
     L->>S: 起動 (二重起動は single-instance が弾く)
     S->>S: ホットキー登録・メニューバー項目
     S->>DB: open → PRAGMA 設定 → マイグレーション
-    DB-->>C: restore (タスク・現在地・設定値)
+    DB-->>C: restore (タスク・現在地・設定値・思いつき)
     S->>S: autostart 登録 (初回のみ)
     S->>S: 介入パネルを生成して隠す
     S->>T: 刻みを開始
     loop 10 秒ごと
         T->>C: tick()
+        Note over C: 寿命を過ぎた思いつきを消す
         C-->>T: 介入を出すか
     end
 ```

@@ -47,10 +47,19 @@
   // **ステップは配列ではなく入力欄の文字列そのものを送る。** 行を切り分けて空行を落とす
   // 規則は一箇所 (Rust 側の `as_task_definition`) にしか無い。ここで切り分ければ、
   // その純粋関数が守っているものが実際の経路から外れる。
+  //
+  // `ideaId` は昇格元の思いつき。`null` なら従来どおりの作成である。値があれば、コアは
+  // 作成と同じトランザクションでその思いつきを消す。
   type CreateTaskRequest = {
     title: string
     steps: string
     moveCurrentPosition: boolean
+    ideaId: string | null
+  }
+
+  // src-tauri/src/commands/mod.rs の `CaptureIdeaRequest` と 1:1。
+  type CaptureIdeaRequest = {
+    content: string
   }
 
   type CreateTaskOutcome = {
@@ -73,11 +82,22 @@
       }
     | { kind: 'step'; stepId: string; content: string; completed: boolean; current: boolean }
 
+  // src-tauri/src/commands/mod.rs の `DisclosureIdea` と 1:1。
+  //
+  // **ID と本文だけである。** 件数・作成時刻・残り日数を運ばない (AD-15)。
+  type DisclosureIdea = {
+    ideaId: string
+    content: string
+  }
+
   // src-tauri/src/commands/mod.rs の `DisclosureSurface` と 1:1。
   // Rust 側の `tests::the_disclosure_surface_keeps_its_wire_contract` が形を固定している。
+  //
+  // `ideas` は行と別の欄であり、新しい順に並んで届く。0 件なら欄ごと描かない。
   type DisclosureSurface = {
     stateError: string | null
     rows: DisclosureRow[]
+    ideas: DisclosureIdea[]
   }
 
   // src-tauri/src/commands/mod.rs の `DisclosureRequest` と 1:1。
@@ -261,6 +281,33 @@
 
   let createError = $state<string | null>(null)
   let creatingTask = $state(false)
+  /**
+   * 作成の面を開いた元の思いつき。**昇格の途中である間だけ値を持つ。**
+   *
+   * 作成が確定したときだけコアへ送られ、コアが同じトランザクションでその思いつきを
+   * 消す。Esc で面を出れば捨てられ、思いつきは残る。
+   */
+  let promotingIdeaId = $state<string | null>(null)
+
+  /**
+   * 思いつきを置く面の開閉と、入力途中の一行 — 揮発ビュー状態 (AD-2 の状態表)。
+   *
+   * **`capturing` が初期値で偽であることが FR-2 の実体である。** この面は初期表示に
+   * 現れず、明示的な打鍵 (⌘I) を経てのみ到達する。Esc・フォーカス喪失で破棄される。
+   *
+   * **現在地・中断メモ・休息・計時のいずれにも触れない。** 中断メモの下書き
+   * (`noteDraft`) はこの面の間も生きており、戻れば同じ欄に残っている。
+   */
+  let capturing = $state(false)
+  let ideaDraft = $state('')
+  let ideaInput = $state<HTMLInputElement | null>(null)
+  let captureError = $state<string | null>(null)
+  let capturingIdea = $state(false)
+  /**
+   * 直近に思いつきを置いたこと。**置いた後もオーバーレイは閉じない** (利用者の裁定)。
+   * 既定表示に 1 行だけ述べる。**件数は述べない** (AD-15)。
+   */
+  let ideaCaptured = $state(false)
 
   /**
    * 修正の面の開閉状態と下書き — 揮発ビュー状態 (AD-2 の状態表)。
@@ -302,6 +349,8 @@
    */
   let disclosing = $state(false)
   let rows = $state<DisclosureRow[]>([])
+  /** 開示面の末尾に並ぶ思いつき。スナップショットの写しである (`rows` と同じ)。 */
+  let ideas = $state<DisclosureIdea[]>([])
   /**
    * ステップを並べているタスク — 揮発ビュー状態 (AD-2 の表「開示面の開閉状態」)。
    *
@@ -354,16 +403,28 @@
   /** 直近の修正が確定したことを述べる 1 行。面は成功と同時に畳まれる。 */
   let edited = $state(false)
 
-  /** 行を一意に指す鍵。見出しとステップで綴りを分ける。 */
-  function rowKey(row: DisclosureRow): string {
+  /**
+   * 行を一意に指す鍵。見出し・ステップ・思いつきで綴りを分ける。
+   *
+   * 思いつきは `DisclosureRow` ではない (行と別の欄で届く) ため、`ideaId` だけを持つ値と
+   * して受ける。
+   */
+  function rowKey(row: DisclosureRow | DisclosureIdea): string {
+    if ('ideaId' in row) return `idea:${row.ideaId}`
     return row.kind === 'task' ? `task:${row.taskId}` : `step:${row.stepId}`
   }
 
-  /** 一覧の全行 — **見出しも含む**。↑↓ はこの並びの上を動く。 */
-  const rowKeys = $derived(rows.map(rowKey))
+  /**
+   * 一覧の全行 — **見出しも思いつきも含む**。↑↓ はこの並びの上を動く。思いつきは
+   * タスクの行の後に続く (画面の並びと同じ)。
+   */
+  const rowKeys = $derived([...rows.map(rowKey), ...ideas.map(rowKey)])
 
   /** 入力位置がある行そのもの。Enter の意味はこの行の種類で決まる。 */
   const selectedRow = $derived(rows.find((row) => rowKey(row) === selectedRowKey) ?? null)
+
+  /** 入力位置がある思いつき。Enter で作成の面が開く (昇格)。 */
+  const selectedIdea = $derived(ideas.find((idea) => rowKey(idea) === selectedRowKey) ?? null)
 
   /**
    * 直近の作成の結末。**作成が確定したことを述べる唯一の手がかりである。**
@@ -447,6 +508,7 @@
    */
   function forgetRows(): void {
     rows = []
+    ideas = []
     selectedRowKey = null
   }
 
@@ -551,6 +613,7 @@
     restErrorDetail = null
     completionNotice = null
     edited = false
+    ideaCaptured = false
   }
 
   /**
@@ -564,6 +627,19 @@
     titleDraft = ''
     stepsDraft = ''
     createError = null
+    // 昇格の途中で出たなら、思いつきはそのまま残る。何も送られていない。
+    promotingIdeaId = null
+  }
+
+  /**
+   * 思いつきの下書きを捨て、置く面を畳む。**`discardTaskDraft` の双子である。**
+   *
+   * 畳む契機は Esc・フォーカス喪失・置いた成功の三つだけである。
+   */
+  function discardIdeaDraft(): void {
+    capturing = false
+    ideaDraft = ''
+    captureError = null
   }
 
   /**
@@ -605,6 +681,7 @@
       })
       if (!isCurrent()) return
       rows = surface.rows
+      ideas = surface.ideas
       // **開いたタスクは戻り値から読み直す。** `null` で頼んだときに何が開いたのかを
       // 知っているのはコアだけであり、以降の取り直しはその答えを保つ必要がある —
       // 保たなければ、現在地が動いた報せのたびに開いていたタスクが別のものへ移る。
@@ -749,7 +826,13 @@
     const row = selectedRow
     // 確定の途中では二つ目を受けない。取り直しの最中に開く先が変わると、着いた応答が
     // どちらの要求のものか読めなくなる。
-    if (!row || selecting) return
+    if (selecting) return
+    // 思いつきの行なら作成の面を開く (昇格)。**ここでは何も書かない。**
+    if (selectedIdea) {
+      await promoteIdea(selectedIdea)
+      return
+    }
+    if (!row) return
     if (row.kind === 'task') {
       await openTask(row.taskId)
       return
@@ -956,7 +1039,11 @@
    * 属する先は一つに定まる。
    */
   const taskToEdit = $derived(
-    selectedRow?.kind === 'task' ? selectedRow.taskId : (openTaskId ?? null),
+    selectedIdea !== null
+      ? null
+      : selectedRow?.kind === 'task'
+        ? selectedRow.taskId
+        : (openTaskId ?? null),
   )
 
   /**
@@ -965,12 +1052,86 @@
    * **初期表示には現れない。** ここへ到達する経路は明示的な打鍵だけである (AD-15)。
    * 既存のタスクを並べて選ばせる面は作らない — それは CAP-9 の開示面である (FR-19)。
    */
-  async function openCreation(): Promise<void> {
+  async function openCreation(from: DisclosureIdea | null = null): Promise<void> {
     if (creating) return
     dismissNotices()
     creating = true
     createError = null
+    // **昇格の下書きは題名とステップ 1 の両方に思いつきの文を入れる** (利用者の裁定)。
+    // ⌘Enter 一打で昇格でき、必要なら直してから確定する。
+    if (from) {
+      titleDraft = from.content
+      stepsDraft = from.content
+      promotingIdeaId = from.ideaId
+    }
     await focusTitleAtEnd()
+  }
+
+  /**
+   * 思いつきをタスクへ昇格させる面を開く。**開示面は畳む** (二つの面を同時に出さない)。
+   *
+   * **ここでは何も書かない。** 思いつきが消えるのは作成が確定したときだけであり、
+   * 作成の面を Esc で出れば思いつきは残る。
+   */
+  async function promoteIdea(idea: DisclosureIdea): Promise<void> {
+    discardDisclosure()
+    await openCreation(idea)
+  }
+
+  /**
+   * 思いつきを置く面へ入る。**初期表示には現れない** — 明示的な打鍵 (⌘I) だけが
+   * ここへ至る (FR-2 / AD-15)。
+   */
+  async function openCapture(): Promise<void> {
+    // 直前の置く要求が飛んでいる間は開き直さない。着いた応答が新しい面を畳みうる。
+    if (capturing || capturingIdea) return
+    dismissNotices()
+    capturing = true
+    captureError = null
+    await tick()
+    focusAtEnd(ideaInput)
+  }
+
+  /**
+   * 置く面から出る。**オーバーレイは閉じない。** 既定表示へ戻り、中断メモの下書きは
+   * そのまま残る。
+   */
+  async function leaveCapture(): Promise<void> {
+    discardIdeaDraft()
+    await focusNoteAtEnd()
+  }
+
+  /**
+   * 思いつきを置く。
+   *
+   * **置いた後もオーバーレイを閉じない** (利用者の裁定)。既定表示へ戻り「思いつきを
+   * 置いた。」を 1 行出す。**現在地・中断メモ・休息・計時に触れない** — 既定表示の
+   * スナップショットも取り直さない (何も変わっていない)。
+   *
+   * 空の本文は Rust 側の純粋関数が拒む。ここで先回りして弾くと、規則が二箇所に分かれる
+   * (`confirmCreation` と同じ流儀)。
+   */
+  async function confirmCapture(): Promise<void> {
+    if (capturingIdea) return
+    capturingIdea = true
+    captureError = null
+    const request: CaptureIdeaRequest = { content: ideaDraft }
+    try {
+      await invoke('capture_idea', { request })
+      // **面が既に畳まれていれば何も触らない** (フォーカス喪失・閉じた後に着いた応答)。
+      // 置かれたことは確定しているが、述べる面がもう無い。
+      if (!capturing) return
+      discardIdeaDraft()
+      await focusNoteAtEnd()
+      ideaCaptured = true
+    } catch (error) {
+      // **入力欄を残して理由を 1 行示す** (I/O マトリクス「空」「置く」の失敗)。
+      console.error('failed to capture the idea', error)
+      if (!capturing) return
+      captureError = String(error)
+    } finally {
+      capturingIdea = false
+    }
   }
 
   /**
@@ -1001,6 +1162,8 @@
       title: titleDraft,
       steps: stepsDraft,
       moveCurrentPosition,
+      // 昇格の途中ならその思いつき。作成と同じトランザクションで消える。
+      ideaId: promotingIdeaId,
     }
     try {
       const outcome = await invoke<CreateTaskOutcome>('create_task', { request })
@@ -1225,7 +1388,10 @@
    * **`key` を畳んで比べる。** CapsLock が入っていると `key` は `'L'` で届き、小文字と
    * の比較では一致しない — 案内どおりに押しても何も起きない面ができる。
    */
-  function isSurfaceKey(event: KeyboardEvent, letter: 'n' | 'l' | 'e' | 'r' | 't'): boolean {
+  function isSurfaceKey(
+    event: KeyboardEvent,
+    letter: 'n' | 'l' | 'e' | 'r' | 't' | 'i',
+  ): boolean {
     return (
       event.key.toLowerCase() === letter &&
       event.metaKey &&
@@ -1246,6 +1412,12 @@
     // 入力中の Enter が切り替えを撃てば、下書きごと面が消える。
     if (creating) {
       onCreationKeydown(event)
+      return
+    }
+
+    // 思いつきを置く面も自前の打鍵を持つ。入力中の Enter を切り替えへ持ち込まない。
+    if (capturing) {
+      onCaptureKeydown(event)
       return
     }
 
@@ -1305,6 +1477,15 @@
       // 打鍵が何も起こさないほうが案内と食い違わない。
       if (stepContent === null) return
       void openEdit(null)
+      return
+    }
+
+    // 思いつきを置く面。**作業中・休息中のどちらからも入れる** — 現在地にも休息にも
+    // 触れないためである。
+    if (isSurfaceKey(event, 'i')) {
+      event.preventDefault()
+      if (switching) return
+      void openCapture()
       return
     }
 
@@ -1387,6 +1568,30 @@
     // 確定の打鍵は二つ。⌘Enter は作成のみで現在地を変えず、⌘⇧Enter は作成に加えて
     // 現在地をその第 1 ステップへ置く。
     void confirmCreation(event.shiftKey)
+  }
+
+  /**
+   * 思いつきを置く面の打鍵。**IME ガードは呼び出し元が既に通している** (AD-6) —
+   * 変換中の Enter は確定にならない。
+   *
+   * **一行の面である。** 改行の意味を持たないため、確定は素の Enter である。修飾キーを
+   * 伴う Enter は受け付けない — 案内と実際に効く打鍵を食い違わせない。
+   */
+  function onCaptureKeydown(event: KeyboardEvent): void {
+    if (event.key === 'Escape') {
+      // 確定の途中では出ない。失敗したときの理由を読む機会が消える。
+      if (capturingIdea) return
+      event.preventDefault()
+      void leaveCapture()
+      return
+    }
+
+    if (event.key !== 'Enter') return
+    if (event.repeat) return
+    if (event.metaKey || event.shiftKey || event.altKey || event.ctrlKey) return
+
+    event.preventDefault()
+    void confirmCapture()
   }
 
   /**
@@ -1487,6 +1692,7 @@
         // 間持ち越さない。
         dismissNotices()
         discardTaskDraft()
+        discardIdeaDraft()
         discardDisclosure()
         discardTaskEdit()
         void refresh()
@@ -1497,6 +1703,7 @@
         // **ここで下書きを捨てる。** 取得時にだけ捨てていると、フォーカスのイベントを
         // 伴わない再表示が、作成の面を出したままの初期表示になる (FR-2 が禁じる)。
         discardTaskDraft()
+        discardIdeaDraft()
         discardDisclosure()
         discardTaskEdit()
         void close()
@@ -1585,6 +1792,28 @@
       <p class="alert" role="alert">
         タスクを作成できなかった。何も保存されていない。
         <span class="detail">{createError}</span>
+      </p>
+    {/if}
+  {:else if capturing}
+    <!--
+      思いつきを置く面。**一行だけである。** 現在地も中断メモも出さない — この面は
+      手放すための面であり、何かを見せる面ではない。既存の思いつきも並べない (件数も
+      述べない / AD-15)。
+    -->
+    <input
+      class="idea"
+      type="text"
+      bind:this={ideaInput}
+      bind:value={ideaDraft}
+      spellcheck="false"
+      placeholder="思いつき (一行)"
+      aria-label="思いつき"
+    />
+
+    {#if captureError}
+      <p class="alert" role="alert">
+        思いつきを置けなかった。何も保存されていない。
+        <span class="detail">{captureError}</span>
       </p>
     {/if}
   {:else if editing}
@@ -1753,12 +1982,41 @@
           </button>
         {/if}
       {/each}
+
+      <!--
+        空欄にしない (I/O マトリクス「タスクが無い」)。**思いつきの欄より前に置く** —
+        タスクの行が並ぶはずの位置で述べる。
+      -->
+      {#if rows.length === 0 && !stateError && !disclosureError && !snapshotError}
+        <p class="empty">まだタスクが無い。</p>
+      {/if}
+
+      <!--
+        思いつき。**タスクの行の後に、別の欄として並ぶ。** 0 件なら見出しごと出さない。
+        件数・作成からの経過・残り日数のいずれも出さない (AD-15) — 運ばれてこないため
+        描ける値がそもそも無い。並べ替え・削除・編集の手がかりも置かない。
+
+        Enter (click は選ぶだけ) で作成の面が開き、タスクへ昇格する。
+      -->
+      {#if ideas.length > 0}
+        <section class="ideas" aria-label="思いつき">
+          <p class="ideas-heading">思いつき</p>
+          {#each ideas as idea (idea.ideaId)}
+            <button
+              type="button"
+              class="idea-row"
+              class:selected={rowKey(idea) === selectedRowKey}
+              data-row-key={rowKey(idea)}
+              tabindex={rowKey(idea) === selectedRowKey ? 0 : -1}
+              onclick={() => selectRow(rowKey(idea))}
+            >
+              <span class="content">{idea.content}</span>
+            </button>
+          {/each}
+        </section>
+      {/if}
     </div>
 
-    {#if rows.length === 0 && !stateError && !disclosureError && !snapshotError}
-      <!-- 空欄にしない (I/O マトリクス「タスクが無い」)。 -->
-      <p class="empty">まだタスクが無い。</p>
-    {/if}
   {:else if stateError}
     <!--
       コアが読めていない。**未着手と取り違えない** — 取り違えれば、現在地が失われた
@@ -1851,7 +2109,7 @@
     失敗すると現在地は描かれなくなるが、切り替えそのものは確定しており、述べなければ
     それを確かめる方法が残らない。
   -->
-  {#if !creating && !disclosing && !editing && switchNotice}
+  {#if !creating && !capturing && !disclosing && !editing && switchNotice}
     <p class="alert" role="alert">{switchNotice}</p>
   {/if}
 
@@ -1859,7 +2117,7 @@
     作成が確定したことを述べる唯一の場所。面は成功と同時に畳まれるため、ここに無ければ
     「作成できたのか」を確かめる方法が残らない。件数も登録数も述べない (AD-15 / SM-C1)。
   -->
-  {#if !creating && !disclosing && !editing && creationNotice}
+  {#if !creating && !capturing && !disclosing && !editing && creationNotice}
     <p class="alert" role="alert">{creationNotice}</p>
   {/if}
 
@@ -1869,7 +2127,7 @@
     述べるのと違うのは、切り替えの移動先は利用者が目で見て選んだステップではないが、
     一覧の選択は目で見て選んだステップだからである。
   -->
-  {#if !creating && !disclosing && !editing && selectionNotice}
+  {#if !creating && !capturing && !disclosing && !editing && selectionNotice}
     <p class="alert" role="alert">{selectionNotice}</p>
   {/if}
 
@@ -1877,7 +2135,7 @@
     休息の終了について述べる唯一の場所。**休息中の面の中ではない** — 宣言に成功すれば
     面は畳まれるため、そこに置くと「休息中ではなかった」が誰にも届かない。
   -->
-  {#if !creating && !disclosing && !editing && restNotice}
+  {#if !creating && !capturing && !disclosing && !editing && restNotice}
     <p class="alert" role="alert">
       {restNotice}
       {#if restErrorDetail}<span class="detail">{restErrorDetail}</span>{/if}
@@ -1888,8 +2146,16 @@
     修正が確定したことを述べる唯一の場所。面は成功と同時に畳まれるため、ここに無ければ
     「直せたのか」を確かめる方法が残らない。
   -->
-  {#if !creating && !disclosing && !editing && edited}
+  {#if !creating && !capturing && !disclosing && !editing && edited}
     <p class="alert" role="alert">タスクを直した。現在地も完了も変えていない。</p>
+  {/if}
+
+  <!--
+    思いつきを置いたことを述べる唯一の場所。**件数は述べない** (AD-15)。面は置いた
+    時点で畳まれ、オーバーレイは閉じない (利用者の裁定)。
+  -->
+  {#if !creating && !capturing && !disclosing && !editing && ideaCaptured}
+    <p class="alert" role="alert">思いつきを置いた。</p>
   {/if}
 
   <!--
@@ -1904,6 +2170,9 @@
       <button type="button" onmousedown={preventStealingFocus} onclick={() => confirmCreation(false)}>作成</button>
       <button type="button" onmousedown={preventStealingFocus} onclick={() => confirmCreation(true)}>作成して着手</button>
       <button type="button" onmousedown={preventStealingFocus} onclick={() => leaveCreation()}>戻る</button>
+    {:else if capturing}
+      <button type="button" onmousedown={preventStealingFocus} onclick={() => confirmCapture()}>置く</button>
+      <button type="button" onmousedown={preventStealingFocus} onclick={() => leaveCapture()}>戻る</button>
     {:else if editing}
       {#if editTaskId !== null}
         <button type="button" onmousedown={preventStealingFocus} onclick={() => confirmEdit()}>保存</button>
@@ -1914,6 +2183,8 @@
         <button type="button" onmousedown={preventStealingFocus} onclick={() => confirmSelection()}>
           {selectedRow.kind === 'task' ? 'このタスクのステップを見る' : 'ここへ現在地を移す'}
         </button>
+      {:else if selectedIdea}
+        <button type="button" onmousedown={preventStealingFocus} onclick={() => confirmSelection()}>タスクにする</button>
       {/if}
       {#if taskToEdit !== null}
         <button type="button" onmousedown={preventStealingFocus} onclick={() => openEdit(taskToEdit)}>このタスクを直す</button>
@@ -1942,6 +2213,8 @@
     <p class="hint">
       ⌘Enter で作成 · ⌘⇧Enter で作成して着手 · Enter で改行 · Esc で戻る
     </p>
+  {:else if capturing}
+    <p class="hint">Enter で置く · Esc で戻る</p>
   {:else if editing}
     <!--
       案内と実際に効く打鍵が食い違ってはならない。相手が無ければ保存の打鍵も効かない。
@@ -1962,9 +2235,11 @@
       案内と実際に効く打鍵が食い違う。
     -->
     <p class="hint">
-      {#if rowKeys.length > 0}↑↓ で移動 · {selectedRow?.kind === 'task'
-          ? 'Enter でこのタスクのステップを見る'
-          : 'Enter でここへ現在地を移す'} · {/if}{#if taskToEdit !== null}⌘E でこのタスクを直す
+      {#if rowKeys.length > 0}↑↓ で移動 · {selectedIdea !== null
+          ? 'Enter でタスクにする'
+          : selectedRow?.kind === 'task'
+            ? 'Enter でこのタスクのステップを見る'
+            : 'Enter でここへ現在地を移す'} · {/if}{#if taskToEdit !== null}⌘E でこのタスクを直す
         · {/if}Esc で戻る
     </p>
   {:else}
@@ -1974,7 +2249,7 @@
       休息の終了の宣言だけを意味する (CAP-10)。案内と実際に効く打鍵を食い違わせない。
     -->
     <p class="hint">
-      {#if resting}Enter で休息を終える · ⌘T で休息のすすめ · {:else if stepContent !== null}Enter で切り替え · ⌘Enter で完了して次を選ぶ · ⌘R で休息に入る · ⌘E でこのタスクを直す · {/if}⌘N で新しいタスク · ⌘L で一覧 · Esc で閉じる{#if hotkey && hotkey.registered} · {hotkey.accelerator} で開閉{/if} · 開く・終了はメニューバー項目からも
+      {#if resting}Enter で休息を終える · ⌘T で休息のすすめ · {:else if stepContent !== null}Enter で切り替え · ⌘Enter で完了して次を選ぶ · ⌘R で休息に入る · ⌘E でこのタスクを直す · {/if}⌘N で新しいタスク · ⌘I で思いつき · ⌘L で一覧 · Esc で閉じる{#if hotkey && hotkey.registered} · {hotkey.accelerator} で開閉{/if} · 開く・終了はメニューバー項目からも
     </p>
   {/if}
 </main>
@@ -2099,6 +2374,7 @@
   */
   .note,
   .title,
+  .idea,
   .steps,
   .step-edit {
     margin: 0;
@@ -2117,6 +2393,7 @@
 
   .note::placeholder,
   .title::placeholder,
+  .idea::placeholder,
   .steps::placeholder,
   .step-edit::placeholder {
     color: var(--overlay-muted);
@@ -2124,6 +2401,7 @@
 
   .note:focus,
   .title:focus,
+  .idea:focus,
   .steps:focus,
   .step-edit:focus {
     outline: 1px solid var(--overlay-focus);
@@ -2226,6 +2504,51 @@
 
   .content {
     flex: 1 1 auto;
+  }
+
+  /*
+    思いつきの欄。タスクの見出しと同じ淡い見出しの下に、ステップの行と同じ器で並ぶ。
+    **件数・経過・色分けを足さない** (AD-15)。
+  */
+  .ideas {
+    display: flex;
+    flex-direction: column;
+    width: 100%;
+    gap: 0.1rem;
+  }
+
+  .ideas-heading {
+    margin: 0.5rem 0 0.15rem;
+    padding: 0 0.4rem;
+    font-size: 0.8rem;
+    line-height: 1.5;
+    color: var(--overlay-muted);
+  }
+
+  .idea-row {
+    display: flex;
+    align-items: baseline;
+    width: 100%;
+    margin: 0;
+    padding: 0.22rem 0.4rem;
+    border: 1px solid transparent;
+    border-radius: 4px;
+    background: none;
+    font: inherit;
+    font-size: 0.92rem;
+    line-height: 1.5;
+    color: var(--overlay-fg);
+    text-align: left;
+    cursor: pointer;
+  }
+
+  .idea-row.selected {
+    background: var(--overlay-raised);
+  }
+
+  .idea-row:focus {
+    outline: 1px solid var(--overlay-focus);
+    outline-offset: 0;
   }
 
   /* タスクが 1 個も無いときの 1 行。空欄にしない。 */
