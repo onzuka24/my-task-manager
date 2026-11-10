@@ -278,7 +278,11 @@
   let noteInput = $state<HTMLTextAreaElement | null>(null)
 
   let switchError = $state<string | null>(null)
-  let noDestination = $state<{ noteWritten: boolean; completionDeclared: boolean } | null>(null)
+  let noDestination = $state<{
+    noteWritten: boolean
+    noteCleared: boolean
+    completionDeclared: boolean
+  } | null>(null)
   let switching = $state(false)
 
   /**
@@ -505,8 +509,12 @@
     const recorded: string[] = []
     if (noDestination.completionDeclared) recorded.push('完了')
     if (noDestination.noteWritten) recorded.push('メモ')
-    const what =
-      recorded.length === 0 ? '記録するものは無かった' : `${recorded.join('と')}は記録した`
+    // **消したことも確定である。** 「記録するものは無かった」と述べれば、消えたメモが
+    // 残っているように読める。
+    const parts: string[] = []
+    if (recorded.length > 0) parts.push(`${recorded.join('と')}は記録した`)
+    if (noDestination.noteCleared) parts.push('メモは消した')
+    const what = parts.length === 0 ? '記録するものは無かった' : parts.join('。')
     return `このタスクに次のステップが無い。${what}が、現在地は動いていない。`
   })
 
@@ -1520,6 +1528,8 @@
       note: noteIsDirty ? noteDraft : null,
       declareCompletion: false,
     }
+    // 取り直しで提示が入れ替わる前に読む。消したと述べてよいのは、消すものがあったときだけ。
+    const hadNote = notePrefill.trim() !== ''
     try {
       const outcome = await invoke<SwitchOutcome>('switch_current_position', { request })
       if (outcome.moved) {
@@ -1531,7 +1541,8 @@
         // `event.repeat` の守りが弾く。
         await refresh()
         switched = {
-          // 空白だけの本文はコア側で省略として扱われる。述べる内容をそれに合わせる。
+          // 空白だけの本文はコア側で「消した」として扱われ、「書いた」には数えられない。
+          // 述べる内容をそれに合わせる。
           noteWritten: (request.note ?? '').trim() !== '',
         }
         return
@@ -1539,8 +1550,11 @@
       // 最終ステップだった。取り直してから、実際に確定したものを述べる。
       await refresh()
       noDestination = {
-        // 空白だけの本文はコア側で省略として扱われる。述べる内容をそれに合わせる。
+        // 空白だけの本文はコア側で「消した」として扱われ、「書いた」には数えられない。
+        // 述べる内容をそれに合わせる。
         noteWritten: (request.note ?? '').trim() !== '',
+        // 提示されていたメモを空にして確定した — コアが消した。
+        noteCleared: hadNote && request.note !== null && request.note.trim() === '',
         // **この経路は完了を宣言しない。** 宣言を伴う打鍵は別の経路へ分かれた。
         completionDeclared: false,
       }

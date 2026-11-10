@@ -40,7 +40,7 @@ use crate::adapters::{intervention, presentation};
 use crate::domain::idea::IdeaId;
 use crate::domain::rest::{InterventionChoice, InterventionKind, RestSettings};
 use crate::domain::state::{Core, CoreState, WaitReturn};
-use crate::domain::task::{InterruptionNote, Step, StepId, Task, TaskId};
+use crate::domain::task::{InterruptionNote, NoteEdit, Step, StepId, Task, TaskId};
 
 /// コアが `manage` されていないときに示す理由。
 ///
@@ -514,7 +514,7 @@ fn task_of_current_position(state: &CoreState) -> Option<TaskId> {
 #[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SwitchRequest {
-    /// 確定する**中断メモ**。`null` および空欄は**省略**であり、既存のメモを変えない。
+    /// 確定する**中断メモ**。`null` は**触っていない** (既存のメモを変えない)、空欄は**消した** (既存のメモを消す)。
     ///
     /// **提示された既存メモをそのまま送り返してはならない。** 送り返せば、読み返した
     /// だけの**切り替え**が「メモを書いた」として記録され、SM-C3 の記入率が膨らむ。
@@ -602,8 +602,8 @@ pub struct BeginWaitOutcome {
 #[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ReturnFromWaitRequest {
-    /// 離れる側に確定する**中断メモ**。`null` および空欄は**省略**であり、既存のメモを
-    /// 変えない。**提示された既存メモをそのまま送り返してはならない** ([`SwitchRequest`]
+    /// 離れる側に確定する**中断メモ**。`null` は**触っていない** (既存のメモを変えない)、
+    /// 空欄は**消した** (既存のメモを消す)。**提示された既存メモをそのまま送り返してはならない** ([`SwitchRequest`]
     /// と同じ規則)。**現在地**が戻り先と同じ**タスク**の中にあれば確定しない — 主作業を離れていない。
     pub note: Option<String>,
 }
@@ -746,7 +746,7 @@ pub struct SelectStepOutcome {
 #[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CompleteStepRequest {
-    /// 確定する**中断メモ**。`null` および空欄は**省略**であり、既存のメモを変えない。
+    /// 確定する**中断メモ**。`null` は**触っていない** (既存のメモを変えない)、空欄は**消した** (既存のメモを消す)。
     ///
     /// [`SwitchRequest::note`] と同じ規則である。提示された既存メモをそのまま送り返して
     /// はならない。
@@ -1003,7 +1003,7 @@ const STEP_SEPARATORS: [char; 4] = ['\n', '\r', '\u{2028}', '\u{2029}'];
 /// **入力を**タスク**の定義へ整える純粋関数** (I/O マトリクス「空行の混在」ほか)。
 ///
 /// `AppHandle` を取らない。呼び出し側に埋め込んだままでは、生きた Tauri アプリを
-/// 起動しない限り一行も検証できない ([`as_interruption_note`] と同じ流儀)。
+/// 起動しない限り一行も検証できない ([`as_note_edit`] と同じ流儀)。
 ///
 /// # 規則
 ///
@@ -1019,7 +1019,7 @@ const STEP_SEPARATORS: [char; 4] = ['\n', '\r', '\u{2028}', '\u{2029}'];
 ///
 /// # なぜ**中断メモ**と扱いが違うのか
 ///
-/// [`as_interruption_note`] は本文をそのまま渡す — 利用者が書いた形をこちらの都合で
+/// [`as_note_edit`] は本文をそのまま渡す — 利用者が書いた形をこちらの都合で
 /// 書き換えないためである。こちらは逆に整える。**行が区切りとして意味を持つ**入力では、
 /// 行頭の空白や空行は「書いた形」ではなく入力の都合であり、そのまま**ステップ**の内容に
 /// すると連番と内容の両方がずれる。
@@ -1138,10 +1138,7 @@ pub fn switch_current_position<R: Runtime>(
     let core = require_core(app.try_state::<Core>())?;
 
     let destination = core
-        .switch_current_position(
-            as_interruption_note(request.note),
-            request.declare_completion,
-        )
+        .switch_current_position(as_note_edit(request.note), request.declare_completion)
         .map_err(|error| error.to_string())?;
     let outcome = outcome_of(destination);
 
@@ -1342,7 +1339,7 @@ pub fn complete_current_step<R: Runtime>(
 ) -> Result<CompleteStepOutcome, String> {
     let core = require_core(app.try_state::<Core>())?;
 
-    core.complete_current_step(as_interruption_note(request.note))
+    core.complete_current_step(as_note_edit(request.note))
         .map_err(|error| error.to_string())?;
 
     // **確定した後の状態から読む。** 宣言の前に数えると、いま宣言した 1 個が落ちる。
@@ -1405,17 +1402,22 @@ pub fn edit_task<R: Runtime>(app: AppHandle<R>, request: EditTaskRequest) -> Res
     Ok(())
 }
 
-/// 入力欄の文字列を**中断メモ**に変える。**空欄は省略である** (FR-7)。
+/// 入力欄の文字列を、**中断メモ**の欄に起きたことへ変える (FR-7)。
 ///
-/// 空白のみの入力を「メモを書いた」として記録すると、SM-C3 の記入率が中身のない
-/// 打鍵で膨らむ。逆に本文はそのまま渡す — 前後の空白を削ると、利用者が書いた形を
-/// こちらの都合で書き換えることになる。
-fn as_interruption_note(note: Option<String>) -> Option<InterruptionNote> {
-    let text = note?;
+/// - `null` は**触っていない** — フロントは提示されたメモに触れていなければ送らない。
+/// - 前後の空白を除いて空なら**消した**。空にして確定したメモが次の呼び出しで蘇らない。
+///   空白のみの入力を「メモを書いた」として記録しない — SM-C3 の記入率が中身のない
+///   打鍵で膨らむ ([`NoteEdit::written`])。
+/// - それ以外は**書いた**。本文はそのまま渡す — 前後の空白を削ると、利用者が書いた形を
+///   こちらの都合で書き換えることになる。
+fn as_note_edit(note: Option<String>) -> NoteEdit {
+    let Some(text) = note else {
+        return NoteEdit::Keep;
+    };
     if text.trim().is_empty() {
-        return None;
+        return NoteEdit::Clear;
     }
-    Some(InterruptionNote::new(text))
+    NoteEdit::Write(InterruptionNote::new(text))
 }
 
 /// オーバーレイを閉じる (Esc・フォーカス離脱)。隠した上で直前に最前面だったアプリへ
@@ -1681,7 +1683,7 @@ pub fn return_from_wait<R: Runtime>(
 ) -> Result<ReturnFromWaitOutcome, String> {
     let core = require_core(app.try_state::<Core>())?;
     let outcome = wait_return_outcome(
-        core.return_from_wait(as_interruption_note(request.note))
+        core.return_from_wait(as_note_edit(request.note))
             .map_err(|error| error.to_string())?,
     );
     // 表示中の待機のパネルはコアが取り下げた。ここで隠す。
@@ -2206,12 +2208,15 @@ mod tests {
         );
     }
 
-    /// 空欄は**省略**である。既存のメモを消さないための唯一の判定点 (FR-7)。
+    /// `null` は**触っていない**、空欄は**消した**。二つを取り違えれば、空にして確定した
+    /// メモが残るか、読み返しただけのメモが消える (FR-7)。
     #[test]
-    fn an_empty_input_is_an_omission_not_an_empty_note() {
-        assert_eq!(as_interruption_note(None), None);
-        assert_eq!(as_interruption_note(Some(String::new())), None);
-        assert_eq!(as_interruption_note(Some("   \n\t ".to_string())), None);
+    fn an_untouched_field_keeps_and_an_emptied_field_clears() {
+        assert_eq!(as_note_edit(None), NoteEdit::Keep);
+        assert_eq!(as_note_edit(Some(String::new())), NoteEdit::Clear);
+        assert_eq!(as_note_edit(Some("   \n\t ".to_string())), NoteEdit::Clear);
+        // 消したことは書いたことに数えない (SM-C3)。
+        assert!(!as_note_edit(Some(String::new())).written());
     }
 
     // --- タスクの作成 (CAP-4 / FR-4) -----------------------------------------
@@ -2475,10 +2480,8 @@ mod tests {
     #[test]
     fn a_written_note_is_passed_through_unchanged() {
         assert_eq!(
-            as_interruption_note(Some(" 3 段落目の途中 ".to_string()))
-                .as_ref()
-                .map(InterruptionNote::text),
-            Some(" 3 段落目の途中 ")
+            as_note_edit(Some(" 3 段落目の途中 ".to_string())),
+            NoteEdit::Write(InterruptionNote::new(" 3 段落目の途中 "))
         );
     }
 

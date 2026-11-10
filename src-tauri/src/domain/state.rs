@@ -24,7 +24,7 @@ use super::rest::{
 };
 use super::setting::Setting;
 use super::switch::SwitchRecord;
-use super::task::{InterruptionNote, Step, StepId, Task, TaskId};
+use super::task::{InterruptionNote, NoteEdit, Step, StepId, Task, TaskId};
 use super::{Clock, DomainError, Timestamp};
 use crate::ports::storage::{Commit, RestoredState, Storage, StorageError};
 
@@ -582,9 +582,10 @@ impl Core {
     ///
     /// # 引数
     ///
-    /// - `note` — 離脱側に残す**中断メモ**。`None` は**省略**であり、**既存のメモを
-    ///   消さない** (FR-7「省略しても切り替えは完了する」)。`Some` は「**今回**書かれた」
-    ///   を意味し、**切り替え履歴**の `note_written` に写る。提示した既存のメモをその
+    /// - `note` — 離脱側の**中断メモ**の欄に起きたこと ([`NoteEdit`])。`Keep` は
+    ///   **触っていない**であり、**既存のメモを消さない** (FR-7「省略しても切り替えは
+    ///   完了する」)。`Clear` は欄を空にした — 既存のメモを消す。`Write` だけが「**今回**
+    ///   書かれた」を意味し、**切り替え履歴**の `note_written` に写る。提示した既存のメモをその
     ///   まま送り返すのは「今回書いた」ではない — 呼び出し側 (コマンド境界とオーバー
     ///   レイ) が区別する責務を負う。読み返しただけの**切り替え**を記入として数えれば、
     ///   SM-C3 の記入率が膨らみ、偽陽性を排除するための指標が機能しなくなる。
@@ -607,9 +608,10 @@ impl Core {
     /// [`CoreError::Storage`]。いずれの場合もメモリ上の状態は変わらない。
     pub fn switch_current_position(
         &self,
-        note: Option<InterruptionNote>,
+        note: impl Into<NoteEdit>,
         declare_completion: bool,
     ) -> Result<Option<StepId>, CoreError> {
+        let note = note.into();
         let mut state = self.lock();
         let now = self.clock.now();
 
@@ -626,10 +628,9 @@ impl Core {
         // 判断は複製の上で行う。永続化が成功したときにだけメモリへ反映する
         // (`commit_task` と同じ順序)。
         let mut draft = state.tasks[index].clone();
-        let note_written = note.is_some();
-        if note_written {
-            draft.set_interruption_note(departed, note)?;
-        }
+        // **消したことは書いたことに数えない** ([`NoteEdit::written`])。
+        let note_written = note.written();
+        note.apply_to(&mut draft, departed)?;
         if declare_completion {
             draft.declare_completion(now, departed)?;
         }
@@ -695,15 +696,16 @@ impl Core {
     ///
     /// # 引数
     ///
-    /// - `note` — 離脱側に残す**中断メモ**。`None` は**省略**であり、**既存のメモを
-    ///   消さない** ([`Self::switch_current_position`] と同じ規則)。
+    /// - `note` — **中断メモ**の欄に起きたこと ([`NoteEdit`])。`Keep` は既存のメモを
+    ///   消さず、`Clear` は消す ([`Self::switch_current_position`] と同じ規則)。
     ///
     /// # Errors
     ///
     /// **現在地**が**未着手**のとき [`DomainError::NoCurrentPosition`]、指し先が
     /// 見つからないとき [`DomainError::UnknownStep`]、永続化に失敗したとき
     /// [`CoreError::Storage`]。いずれの場合もメモリ上の状態は変わらない。
-    pub fn complete_current_step(&self, note: Option<InterruptionNote>) -> Result<(), CoreError> {
+    pub fn complete_current_step(&self, note: impl Into<NoteEdit>) -> Result<(), CoreError> {
+        let note = note.into();
         let mut state = self.lock();
         let now = self.clock.now();
 
@@ -720,9 +722,7 @@ impl Core {
         // 判断は複製の上で行い、永続化が成功したときにだけメモリへ反映する
         // (`commit_task` と同じ順序)。
         let mut draft = state.tasks[index].clone();
-        if note.is_some() {
-            draft.set_interruption_note(here, note)?;
-        }
+        note.apply_to(&mut draft, here)?;
         draft.declare_completion(now, here)?;
 
         // **何も変わらないなら書かない。** 既に**完了**しており、メモも省略された
@@ -1053,7 +1053,7 @@ impl Core {
             (InterventionKind::Wait, InterventionChoice::Rest) => {
                 // **表示中に自分で戻っていれば、二重には何も起きない。** パネルからの
                 // 戻りはメモの機会を与えていないため、`note_written` は偽である。
-                self.leave_wait(&mut state, None, now)?;
+                self.leave_wait(&mut state, NoteEdit::Keep, now)?;
             }
             (InterventionKind::Wait, InterventionChoice::Grace) => {
                 // **待機**中でなければ何も予約しない — 戻った後に「待つ」の約束が残る。
@@ -1260,7 +1260,7 @@ impl Core {
     /// **主作業に戻る** — 待機中のオーバーレイの ⌘D (早めに戻る)。
     ///
     /// **現在地**が戻り先と別の**タスク**にあれば、離れる側の**中断メモ**の確定
-    /// (`note` があれば)・戻り先への移動・**切り替え履歴**の追記を単一のトランザクションで
+    /// (`note` が `Write` なら書き、`Clear` なら消す)・戻り先への移動・**切り替え履歴**の追記を単一のトランザクションで
     /// 確定させ (AD-5)、**待機**を終える。**切り替え**と同じ扱いである。同じ**タスク**の
     /// 中にいれば (主作業を進めていた場合を含む) 何も書かずに**待機**を終える — そのとき
     /// `note` は確定しない (主作業を離れていない)。
@@ -1271,13 +1271,10 @@ impl Core {
     /// # Errors
     ///
     /// 永続化に失敗したとき。そのとき**現在地**は動かず、**待機**は続く。
-    pub fn return_from_wait(
-        &self,
-        note: Option<InterruptionNote>,
-    ) -> Result<WaitReturn, CoreError> {
+    pub fn return_from_wait(&self, note: impl Into<NoteEdit>) -> Result<WaitReturn, CoreError> {
         let mut state = self.lock();
         let now = self.clock.now();
-        self.leave_wait(&mut state, note, now)
+        self.leave_wait(&mut state, note.into(), now)
     }
 
     /// **待機**を終えて戻り先へ戻る遷移 ([`Self::return_from_wait`] と待機の**介入**の
@@ -1285,7 +1282,7 @@ impl Core {
     fn leave_wait(
         &self,
         state: &mut CoreState,
-        note: Option<InterruptionNote>,
+        note: NoteEdit,
         now: Timestamp,
     ) -> Result<WaitReturn, CoreError> {
         let Some(wait) = state.wait.as_ref() else {
@@ -1298,19 +1295,22 @@ impl Core {
 
         // 離れる側の**中断メモ**。判断は複製の上で行い、永続化が成功したときにだけ
         // メモリへ反映する (`switch_current_position` と同じ順序)。
-        let note_written = note.is_some();
+        // **消したことは書いたことに数えない** ([`NoteEdit::written`])。
+        let note_written = note.written();
         let drafted = match note {
-            Some(note) => {
+            NoteEdit::Keep => None,
+            edit => {
                 let index = state
                     .tasks
                     .iter()
                     .position(|task| task.step(departed).is_some())
                     .ok_or(DomainError::UnknownStep)?;
                 let mut draft = state.tasks[index].clone();
-                draft.set_interruption_note(departed, Some(note))?;
-                Some((index, draft))
+                edit.apply_to(&mut draft, departed)?;
+                // 変わっていない**タスク**を書き直さない (`switch_current_position` と同じ)。
+                // メモの無い欄を空にして戻ったときがそれに当たる。
+                (draft != state.tasks[index]).then_some((index, draft))
             }
-            None => None,
         };
 
         self.storage.apply(&Commit {
@@ -1620,6 +1620,26 @@ mod tests {
             Some("ここまで"),
             "メモも同じトランザクションで確定する"
         );
+    }
+
+    /// 完了の宣言でも、欄を空にして確定すれば既存のメモは消える。
+    #[test]
+    fn clearing_the_note_on_completion_deletes_the_previous_note() {
+        let (core, _, _) = a_core();
+        let task = core
+            .create_task("原稿", contents(&["下書き", "推敲"]))
+            .expect("作れる");
+        let first = core.snapshot().task(task).expect("在る").steps()[0].id();
+        core.move_current_position(first).expect("着手できる");
+        core.set_interruption_note(first, Some(InterruptionNote::new("前に書いた")))
+            .expect("メモを置ける");
+
+        core.complete_current_step(NoteEdit::Clear)
+            .expect("宣言できる");
+
+        let step = core.snapshot().task(task).expect("在る").steps()[0].clone();
+        assert!(step.is_completed());
+        assert!(step.interruption_note().is_none(), "空にしたメモは残らない");
     }
 
     /// **未着手**では宣言する相手が無く、何も書かれない。
@@ -2162,8 +2182,8 @@ mod tests {
 
     /// 受け入れ条件「メモを空のまま確定 → 現在地は次へ・`note_written` は偽」。
     ///
-    /// **省略は既存のメモを消さない。** 消すなら「省略」ではなく「削除」であり、
-    /// FR-7 の「省略しても切り替えは完了する」とは別の操作になる。
+    /// **省略 (欄に触っていない) は既存のメモを消さない。** 消すのは欄を空にして確定した
+    /// ときだけである — [`clearing_the_note_on_a_switch_deletes_the_previous_note`]。
     #[test]
     fn omitting_the_note_still_completes_the_switch_and_keeps_the_previous_note() {
         let (core, storage, _) = a_core();
@@ -2202,6 +2222,37 @@ mod tests {
             Some("前に書いた"),
             "省略は既存のメモを消さない"
         );
+    }
+
+    /// **欄を空にして確定すれば、既存のメモは消える。** 次に開いたとき蘇らない。
+    ///
+    /// **消したことは書いたことに数えない** — `note_written` は偽 (SM-C3)。
+    #[test]
+    fn clearing_the_note_on_a_switch_deletes_the_previous_note() {
+        let (core, storage, _) = a_core();
+        let task_id = core
+            .create_task("原稿", contents(&["下書き", "推敲"]))
+            .expect("作れる");
+        let first = core.snapshot().task(task_id).expect("ある").steps()[0].id();
+        core.move_current_position(first).expect("移せる");
+        core.set_interruption_note(first, Some(InterruptionNote::new("前に書いた")))
+            .expect("メモを置ける");
+
+        core.switch_current_position(NoteEdit::Clear, false)
+            .expect("切り替えられる");
+
+        let note = core
+            .snapshot()
+            .task(task_id)
+            .expect("ある")
+            .step(first)
+            .expect("ある")
+            .interruption_note()
+            .cloned();
+        assert_eq!(note, None, "空にしたメモは残らない");
+        let commit = storage.commits().last().cloned().expect("ある");
+        assert!(commit.task.is_some(), "消したことも同じコミットで確定する");
+        assert!(!commit.switch_record.expect("履歴").note_written());
     }
 
     /// I/O マトリクス「二度目の切り替え」— 確定内容が既存のメモを置き換える。
@@ -4266,6 +4317,32 @@ mod tests {
 
             let commit = storage.commits().last().cloned().expect("ある");
             assert!(commit.task.is_none());
+            assert!(!commit.switch_record.expect("履歴").note_written());
+        }
+
+        /// 早めに戻るとき欄を空にして確定すれば、離れる側の既存のメモは消える。
+        /// 消したことは書いたことに数えない。
+        #[test]
+        fn returning_early_with_an_emptied_note_deletes_the_previous_note() {
+            let (core, storage, _, _, rice) = a_core_on_the_main_work();
+            core.set_interruption_note(rice, Some(InterruptionNote::new("前のメモ")))
+                .expect("置ける");
+            assert!(core.begin_wait(minutes(5), None));
+            core.select_step(rice).expect("移せる");
+
+            assert_eq!(
+                core.return_from_wait(NoteEdit::Clear).expect("戻れる"),
+                WaitReturn::Moved
+            );
+
+            let note = core
+                .snapshot()
+                .task_of_step(rice)
+                .and_then(|task| task.step(rice))
+                .and_then(|step| step.interruption_note().cloned());
+            assert_eq!(note, None, "空にしたメモは残らない");
+            let commit = storage.commits().last().cloned().expect("ある");
+            assert!(commit.task.is_some(), "消したことも同じコミットで確定する");
             assert!(!commit.switch_record.expect("履歴").note_written());
         }
 

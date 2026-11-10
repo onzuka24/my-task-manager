@@ -96,6 +96,52 @@ impl InterruptionNote {
     }
 }
 
+/// 確定の時点で**中断メモ**の欄に起きたこと — **触っていない / 書いた / 消した**。
+///
+/// # なぜ `Option` では足りないのか
+///
+/// `None` を「省略」に当てると、欄を空にして確定したことが「触っていない」と区別できず、
+/// 消したはずのメモが残る。消したことは書いたことでもない — **切り替え履歴**の
+/// `note_written` に数えれば SM-C3 の記入率が中身のない確定で膨らむ。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NoteEdit {
+    /// 欄に触れていない。既存のメモを変えない。
+    Keep,
+    /// 書いた (書き換えた)。
+    Write(InterruptionNote),
+    /// 空にした。既存のメモを消す。
+    Clear,
+}
+
+impl NoteEdit {
+    /// 「メモを書いた」として**切り替え履歴**に数えるか。**消したことは数えない。**
+    #[must_use]
+    pub const fn written(&self) -> bool {
+        matches!(self, Self::Write(_))
+    }
+
+    /// **タスク**の複製の上で、指定の**ステップ**へ反映する。触っていなければ何もしない。
+    ///
+    /// # Errors
+    ///
+    /// **ステップ**が無いとき。
+    pub fn apply_to(self, task: &mut Task, step_id: StepId) -> Result<(), DomainError> {
+        match self {
+            Self::Keep => Ok(()),
+            Self::Write(note) => task.set_interruption_note(step_id, Some(note)),
+            Self::Clear => task.set_interruption_note(step_id, None),
+        }
+    }
+}
+
+impl From<Option<InterruptionNote>> for NoteEdit {
+    /// `None` は**触っていない**、`Some` は**書いた**。消す経路はここに無い —
+    /// [`NoteEdit::Clear`] は明示して渡す。
+    fn from(note: Option<InterruptionNote>) -> Self {
+        note.map_or(Self::Keep, Self::Write)
+    }
+}
+
 /// **ステップ** — **タスク**内の作業単位。
 ///
 /// `ordinal` はタスク内の通し番号 (1..N) であり、追記・分割のたびに再計算される。
@@ -485,6 +531,66 @@ mod tests {
     fn a_task() -> Task {
         Task::create(NOW, "原稿を仕上げる", contents(&["下書き", "推敲", "投稿"]))
             .expect("ステップがあるので作成できる")
+    }
+
+    fn note_of(task: &Task, step_id: StepId) -> Option<&str> {
+        task.step(step_id)
+            .and_then(Step::interruption_note)
+            .map(InterruptionNote::text)
+    }
+
+    /// **触っていない / 書いた / 消した** の三つが、それぞれ欄に起きることと
+    /// `note_written` に写るかを固定する。
+    #[test]
+    fn a_note_edit_keeps_writes_or_clears() {
+        let mut task = a_task();
+        let first = task.steps()[0].id();
+        task.set_interruption_note(first, Some(InterruptionNote::new("前のメモ")))
+            .expect("置ける");
+
+        NoteEdit::Keep
+            .apply_to(&mut task, first)
+            .expect("反映できる");
+        assert_eq!(note_of(&task, first), Some("前のメモ"));
+
+        NoteEdit::Write(InterruptionNote::new("新しいメモ"))
+            .apply_to(&mut task, first)
+            .expect("反映できる");
+        assert_eq!(note_of(&task, first), Some("新しいメモ"));
+
+        NoteEdit::Clear
+            .apply_to(&mut task, first)
+            .expect("反映できる");
+        assert_eq!(note_of(&task, first), None);
+
+        assert!(!NoteEdit::Keep.written());
+        assert!(NoteEdit::Write(InterruptionNote::new("x")).written());
+        assert!(
+            !NoteEdit::Clear.written(),
+            "消したことは書いたことに数えない"
+        );
+    }
+
+    /// `Option` からの変換は `None` → 触っていない、`Some` → 書いた。消す経路は無い。
+    #[test]
+    fn an_optional_note_converts_to_keep_or_write() {
+        assert_eq!(NoteEdit::from(None), NoteEdit::Keep);
+        assert_eq!(
+            NoteEdit::from(Some(InterruptionNote::new("x"))),
+            NoteEdit::Write(InterruptionNote::new("x"))
+        );
+    }
+
+    /// 存在しない**ステップ**へは反映できない。触っていなければ失敗もしない。
+    #[test]
+    fn a_note_edit_on_an_unknown_step_is_refused() {
+        let mut task = a_task();
+        let unknown = StepId::new(NOW);
+        assert_eq!(
+            NoteEdit::Clear.apply_to(&mut task, unknown),
+            Err(DomainError::UnknownStep)
+        );
+        assert_eq!(NoteEdit::Keep.apply_to(&mut task, unknown), Ok(()));
     }
 
     /// I/O マトリクス「タスク作成」— ordinal 1..N で生成される。
