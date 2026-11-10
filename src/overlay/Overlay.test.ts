@@ -2687,7 +2687,7 @@ function actionRows(): string[][] {
   )
 }
 
-test('I/O「作業中」— ボタンは三段のまとまりに分かれる', () => {
+test('I/O「作業中」— ボタンは三つのまとまりに分かれる', () => {
   expect(actionRows()).toEqual([
     ['完了', '切り替え', '思いつき', '待機'],
     ['新規タスク', 'タスク修正', 'タスク一覧'],
@@ -2695,15 +2695,28 @@ test('I/O「作業中」— ボタンは三段のまとまりに分かれる', (
   ])
 })
 
-test('受け入れ条件: 三段は縦に積まれ、どのボタンもいずれかの段に属する', () => {
+test('受け入れ条件: 前の二つのまとまりは横に並び、休息と閉じるはその下に置かれる', () => {
   const actions = document.querySelector('.actions') as HTMLElement
-  const row = document.querySelector('.action-row') as HTMLElement
-  expect(getComputedStyle(row).display).toBe('flex')
+  const line = actions.querySelector(':scope > .action-line') as HTMLElement
   expect(getComputedStyle(actions).flexDirection).toBe('column')
+  // 1 段目と 2 段目は同じ行の中にある (利用者の裁定 — 縦に三段は読みにくかった)。
+  expect(getComputedStyle(line).display).toBe('flex')
+  expect(getComputedStyle(line).flexDirection).toBe('row')
+  // 窓の幅が足りなければ 2 段目は下へ折り返す — 切り取らない。
+  expect(getComputedStyle(line).flexWrap).toBe('wrap')
+  expect(
+    [...line.querySelectorAll(':scope > .action-row')].map(
+      (row) => row.querySelector('button')?.textContent?.trim(),
+    ),
+  ).toEqual(['完了', '新規タスク'])
+  // 休息と閉じるは、その行の下に独立して置かれる。
+  const below = actions.querySelectorAll(':scope > .action-row')
+  expect(below).toHaveLength(1)
+  expect(below[0].textContent).toContain('休息')
   // 隙間の大小は jsdom が計算しない (gap を返さない)。make dev で目で見る。
-  expect(actions.querySelectorAll(':scope > .action-row')).toHaveLength(3)
-  // 段の外にボタンを置かない (まとまりに属さないボタンを作らない)。
+  // まとまりの外にボタンを置かない (まとまりに属さないボタンを作らない)。
   expect(actions.querySelectorAll(':scope > button')).toHaveLength(0)
+  expect(line.querySelectorAll(':scope > button')).toHaveLength(0)
 })
 
 test('I/O「待機中」— 1 段目の 4 つ目が「主作業に戻る」に入れ替わる', async () => {

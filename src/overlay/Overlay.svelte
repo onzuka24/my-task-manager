@@ -2536,10 +2536,13 @@
       <button type="button" onmousedown={preventStealingFocus} onclick={() => close()}>閉じる</button>
     {:else if stepContent !== null}
       <!--
-        作業中は三段に分ける — 1 段目がいまの作業の進め方、2 段目がタスクの扱い、
-        3 段目が作業から離れる操作である。どれも既存の打鍵の別の入口であり、新しい
-        操作は無い。「思いつき」は ⌘I と、「待機 / 主作業に戻る」は ⌘D と同じ経路を通る。
+        作業中は三つのまとまりに分ける — いまの作業の進め方、タスクの扱い、作業から離れる
+        操作である。**前の二つは横に並べ、間を空ける** (利用者の裁定 — 縦に三段積むと
+        読みにくかった)。窓の幅が足りなければ二つ目は下へ折り返す。切り取らない。
+        どれも既存の打鍵の別の入口であり、新しい操作は無い。「思いつき」は ⌘I と、
+        「待機 / 主作業に戻る」は ⌘D と同じ経路を通る。
       -->
+      <div class="action-line">
       <div class="action-row">
         <button type="button" onmousedown={preventStealingFocus} onclick={() => completeAndChooseNext()}>完了</button>
         <button type="button" onmousedown={preventStealingFocus} onclick={() => confirmSwitch()}>切り替え</button>
@@ -2558,6 +2561,7 @@
         <button type="button" onmousedown={preventStealingFocus} onclick={() => openCreation()}>新規タスク</button>
         <button type="button" onmousedown={preventStealingFocus} onclick={() => openEdit(null)}>タスク修正</button>
         <button type="button" onmousedown={preventStealingFocus} onclick={() => openDisclosure()}>タスク一覧</button>
+      </div>
       </div>
       <div class="action-row">
         <button type="button" onmousedown={preventStealingFocus} onclick={() => declareRest()}>休息</button>
@@ -2761,13 +2765,24 @@
   }
 
   /*
-    作業中の三段のまとまり。段の間の隙間を段の中の隙間より広くし、まとまりを目で
+    作業中の三つのまとまり。まとまりの間の隙間をまとまりの中の隙間より広くし、目で
     区切る。段がある間は .actions を縦に積む (段の無い面は従来どおり横に並ぶ)。
   */
   .actions:has(> .action-row) {
     flex-direction: column;
     flex-wrap: nowrap;
     gap: 0.55rem;
+  }
+
+  /*
+    前の二つのまとまりを横に並べる行。間を大きく空ける (利用者の裁定)。窓の幅が
+    足りなければ二つ目は下へ折り返す — 切り取れば到達できないボタンが生まれる。
+  */
+  .action-line {
+    display: flex;
+    flex-wrap: wrap;
+    column-gap: 1.5rem;
+    row-gap: 0.55rem;
   }
 
   .action-row {
