@@ -388,6 +388,29 @@ function actionLabels(): string[] {
   )
 }
 
+/** 既定表示の打鍵の案内の見出しボタン。 */
+function shortcutsToggle(): HTMLButtonElement | null {
+  return document.querySelector<HTMLButtonElement>('button.shortcuts-toggle')
+}
+
+/** 開いた案内の行。閉じていれば空。 */
+function shortcutLines(): string[] {
+  return Array.from(document.querySelectorAll('.shortcuts-list li')).map(
+    (li) => li.textContent ?? '',
+  )
+}
+
+/** 既定表示の打鍵の案内を (閉じていれば) 開き、その全文を返す。 */
+async function shortcutsText(): Promise<string> {
+  const toggle = shortcutsToggle()
+  if (!toggle) throw new Error('打鍵の案内が無い')
+  if (toggle.getAttribute('aria-expanded') !== 'true') {
+    toggle.click()
+    await settle()
+  }
+  return document.querySelector('.shortcuts')?.textContent ?? ''
+}
+
 /** 開示面へ入る。到達には明示的な打鍵が 1 回要る (FR-19 / FR-2 / AD-15)。 */
 async function openDisclosure(): Promise<void> {
   press('l', { metaKey: true })
@@ -998,7 +1021,7 @@ test('案内に無い修飾キー (Option / Control) では切り替えない', 
 
   expect(invoked).not.toContain('switch_current_position')
   // 案内と実際に効く打鍵が一致していること。
-  expect(document.body.textContent ?? '').toContain('⌘Enter で完了して次を選ぶ')
+  expect(await shortcutsText()).toContain('⌘Enter — 完了')
 })
 
 test('IME の変換取り消しの Esc でオーバーレイを閉じない', async () => {
@@ -1105,11 +1128,12 @@ test('スナップショットを取得できないままなら、古い現在�
 
 // --- タスクの作成 (CAP-4 / FR-4) ----------------------------------------------
 
-test('初期表示に作成の面は現れない (FR-2 / AD-15)', () => {
+test('初期表示に作成の面は現れない (FR-2 / AD-15)', async () => {
   expect(document.querySelector('input.title')).toBeNull()
   expect(document.querySelector('textarea.steps')).toBeNull()
   // 到達の手がかりはあるが、面そのものは出ていない。
-  expect(document.body.textContent ?? '').toContain('⌘N で新しいタスク')
+  expect(actionLabels()).toContain('新規タスク')
+  expect(await shortcutsText()).toContain('⌘N — 新規タスク')
 })
 
 test('⌘N で作成の面に入り、題名に入力位置がある', async () => {
@@ -1575,13 +1599,16 @@ test('コアが読めなくても作成の面には入れ、失敗の理由が�
 
 // --- 開示面 (CAP-9 / FR-19) ---------------------------------------------------
 
-test('初期表示に開示面は現れない (FR-19 / FR-2 / AD-15)', () => {
+test('初期表示に開示面は現れない (FR-19 / FR-2 / AD-15)', async () => {
   expect(document.querySelector('.disclosure')).toBeNull()
   expect(stepRows()).toHaveLength(0)
   // 隠れている間に一覧を取りに行かない。
   expect(invoked).not.toContain('get_disclosure_surface')
   // 到達の手がかりはあるが、面そのものは出ていない。
-  expect(document.body.textContent ?? '').toContain('⌘L で一覧')
+  expect(actionLabels()).toContain('タスク一覧')
+  expect(await shortcutsText()).toContain('⌘L — タスク一覧')
+  expect(document.querySelector('.disclosure')).toBeNull()
+  expect(invoked).not.toContain('get_disclosure_surface')
 })
 
 test('⌘L で一覧に入り、現在地の行に入力位置がある', async () => {
@@ -2268,8 +2295,8 @@ test('休息の終了に失敗したら理由を出し、面は閉じない', as
 test('休息中は案内が入れ替わる — 切り替えも完了の宣言も案内しない', async () => {
   await enterTheRestingSurface()
 
-  const hint = document.querySelector('.hint')?.textContent ?? ''
-  expect(hint).toContain('Enter で休息を終える')
+  const hint = await shortcutsText()
+  expect(hint).toContain('Enter — 休息を終える')
   expect(hint).not.toContain('切り替え')
   expect(hint).not.toContain('完了')
 })
@@ -2379,7 +2406,7 @@ test('作業中の既定表示にすすめは描かれず、⌘T は何も起こ
   expect(restAdviceToggle()).toBeNull()
   expect(document.body.textContent ?? '').not.toContain('休息のすすめ')
   expect(invoked).toEqual([])
-  expect(document.querySelector('.hint')?.textContent ?? '').not.toContain('⌘T')
+  expect(await shortcutsText()).not.toContain('⌘T')
 
   // 作業中の ⌘T は引き継がれる開閉の状態にも触れない。
   await enterTheRestingSurface()
@@ -2401,7 +2428,7 @@ test('押しっぱなしの ⌘T (自動反復) は開閉しない', async () =>
 test('休息中の案内に ⌘T が載る', async () => {
   await enterTheRestingSurface()
 
-  expect(document.querySelector('.hint')?.textContent ?? '').toContain('⌘T で休息のすすめ')
+  expect(await shortcutsText()).toContain('⌘T — 休息のすすめ')
 })
 
 test('すすめが開いたまま Enter を押すと休息が終わり、すすめは消える', async () => {
@@ -2641,15 +2668,249 @@ test('修正の面は進捗率も件数も完了の印も描かない (AD-15)', 
 
 test('既定表示の操作はボタンからも到達できる', async () => {
   expect(actionLabels()).toEqual([
+    '完了',
     '切り替え',
-    '完了して次を選ぶ',
-    '休息に入る',
+    '思いつき',
     '待機',
-    'このタスクを直す',
-    '新しいタスク',
-    '一覧',
+    '新規タスク',
+    'タスク修正',
+    'タスク一覧',
+    '休息',
     '閉じる',
   ])
+})
+
+/** 作業中の既定表示のボタンを段ごとに読む。 */
+function actionRows(): string[][] {
+  return [...document.querySelectorAll('.actions .action-row')].map((row) =>
+    [...row.querySelectorAll('button')].map((button) => button.textContent?.trim() ?? ''),
+  )
+}
+
+test('I/O「作業中」— ボタンは三つのまとまりに分かれる', () => {
+  expect(actionRows()).toEqual([
+    ['完了', '切り替え', '思いつき', '待機'],
+    ['新規タスク', 'タスク修正', 'タスク一覧'],
+    ['休息', '閉じる'],
+  ])
+})
+
+test('受け入れ条件: 前の二つのまとまりは横に並び、休息と閉じるはその下に置かれる', () => {
+  const actions = document.querySelector('.actions') as HTMLElement
+  const line = actions.querySelector(':scope > .action-line') as HTMLElement
+  expect(getComputedStyle(actions).flexDirection).toBe('column')
+  // 1 段目と 2 段目は同じ行の中にある (利用者の裁定 — 縦に三段は読みにくかった)。
+  expect(getComputedStyle(line).display).toBe('flex')
+  expect(getComputedStyle(line).flexDirection).toBe('row')
+  // 窓の幅が足りなければ 2 段目は下へ折り返す — 切り取らない。
+  expect(getComputedStyle(line).flexWrap).toBe('wrap')
+  expect(
+    [...line.querySelectorAll(':scope > .action-row')].map(
+      (row) => row.querySelector('button')?.textContent?.trim(),
+    ),
+  ).toEqual(['完了', '新規タスク'])
+  // 休息と閉じるは、その行の下に独立して置かれる。
+  const below = actions.querySelectorAll(':scope > .action-row')
+  expect(below).toHaveLength(1)
+  expect(below[0].textContent).toContain('休息')
+  // 隙間の大小は jsdom が計算しない (gap を返さない)。make dev で目で見る。
+  // まとまりの外にボタンを置かない (まとまりに属さないボタンを作らない)。
+  expect(actions.querySelectorAll(':scope > button')).toHaveLength(0)
+  expect(line.querySelectorAll(':scope > button')).toHaveLength(0)
+})
+
+test('I/O「待機中」— 1 段目の 4 つ目が「主作業に戻る」に入れ替わる', async () => {
+  snapshot = { ...SNAPSHOT, waiting: true, waitLabel: null }
+  if (component) unmount(component)
+  await mountOverlay()
+
+  expect(actionRows()[0]).toEqual(['完了', '切り替え', '思いつき', '主作業に戻る'])
+  expect(await shortcutsText()).toContain('⌘D — 主作業に戻る')
+})
+
+test('I/O「思いつきボタン」— ⌘I と同じ一行の面が開く', async () => {
+  actionButton('思いつき').click()
+  await settle()
+
+  expect(document.querySelector('input.idea')).not.toBeNull()
+  expect(document.activeElement).toBe(document.querySelector('input.idea'))
+  expect(invoked).not.toContain('capture_idea')
+})
+
+// --- 打鍵の案内 (折りたたみ) ------------------------------------------------
+
+test('I/O「案内 (初回)」— 起動後はじめて開くと見出し 1 行だけである', () => {
+  expect(shortcutsToggle()?.getAttribute('aria-expanded')).toBe('false')
+  expect(shortcutsToggle()?.textContent).toContain('▸')
+  expect((document.querySelector('.shortcuts')?.textContent ?? '').replace(/\s+/g, '')).toBe('▸ショートカット')
+  expect(shortcutLines()).toHaveLength(0)
+  expect(document.querySelector('.shortcuts')?.textContent ?? '').not.toContain('⌘')
+})
+
+test('I/O「案内を開く」— ⌘/ で打鍵ごとに 1 行で並び、もう一度で畳む', async () => {
+  invoked = []
+  const event = pressCancelable('/', { metaKey: true })
+  await settle()
+
+  expect(event.defaultPrevented).toBe(true)
+  expect(shortcutsToggle()?.getAttribute('aria-expanded')).toBe('true')
+  expect(shortcutsToggle()?.textContent).toContain('▾')
+  expect(shortcutLines()).toEqual([
+    'Enter — 切り替え',
+    '⌘Enter — 完了',
+    '⌘D — 待機',
+    '⌘E — タスク修正',
+    '⌘R — 休息',
+    '⌘N — 新規タスク',
+    '⌘I — 思いつき',
+    '⌘L — タスク一覧',
+    '⌘/ — ショートカットの開閉',
+    'Esc — 閉じる',
+    `${SNAPSHOT.hotkey.accelerator} — オーバーレイの開閉`,
+    '開く・終了はメニューバー項目からも',
+  ])
+  // 開閉はコアを呼ばない。
+  expect(invoked).toEqual([])
+
+  press('/', { metaKey: true })
+  await settle()
+  expect(shortcutsToggle()?.getAttribute('aria-expanded')).toBe('false')
+  expect(shortcutLines()).toHaveLength(0)
+})
+
+test('受け入れ条件: 開いた案内は 1 行に打鍵が一つだけ載っている', async () => {
+  await shortcutsText()
+
+  const accelerator = SNAPSHOT.hotkey.accelerator.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+  const keys = new RegExp(`(⌘?Enter|Esc|⌘[A-Z/]|${accelerator})`, 'g')
+  const lines = shortcutLines()
+  expect(lines.some((line) => line.includes(SNAPSHOT.hotkey.accelerator))).toBe(true)
+  for (const line of lines) {
+    expect((line.match(keys) ?? []).length).toBeLessThanOrEqual(1)
+  }
+})
+
+test('作業中に開いた案内は、休息に入っても戻っても開いたままである', async () => {
+  press('/', { metaKey: true })
+  await settle()
+
+  await enterTheRestingSurface()
+  expect(shortcutsToggle()?.getAttribute('aria-expanded')).toBe('true')
+  expect(shortcutLines()).toContain('Enter — 休息を終える')
+
+  snapshot = { ...SNAPSHOT, resting: false }
+  press('Enter')
+  await settle()
+  expect(invoked).toContain('end_rest')
+  expect(shortcutsToggle()?.getAttribute('aria-expanded')).toBe('true')
+  expect(shortcutLines()).toContain('Enter — 切り替え')
+})
+
+test('思いつきのボタンは切り替えの確定中には面を開かない (⌘I と同じ)', async () => {
+  installHangingIPC('switch_current_position')
+  press('Enter')
+  await settle()
+  expect(invoked).toContain('switch_current_position')
+
+  actionButton('思いつき').click()
+  await settle()
+
+  expect(document.querySelector('input.idea')).toBeNull()
+})
+
+test('I/O「案内を開く」— 見出しのクリックでも開閉する', async () => {
+  shortcutsToggle()?.click()
+  await settle()
+  expect(shortcutsToggle()?.getAttribute('aria-expanded')).toBe('true')
+  expect(shortcutsToggle()?.getAttribute('aria-controls')).toBe('shortcuts-list')
+
+  shortcutsToggle()?.click()
+  await settle()
+  expect(shortcutsToggle()?.getAttribute('aria-expanded')).toBe('false')
+  expect(shortcutsToggle()?.hasAttribute('aria-controls')).toBe(false)
+})
+
+test('I/O「案内の記憶」— 開いたまま閉じて、また開くと開いた状態で出る', async () => {
+  press('/', { metaKey: true })
+  await settle()
+  press('Escape')
+  await settle()
+  expect(invoked).toContain('hide_overlay')
+
+  await emit('tauri://focus', null)
+  await settle()
+
+  expect(shortcutsToggle()?.getAttribute('aria-expanded')).toBe('true')
+  expect(shortcutLines().length).toBeGreaterThan(0)
+})
+
+test('押しっぱなしの ⌘/ (自動反復) は開閉しない', async () => {
+  const event = pressCancelable('/', { metaKey: true, repeat: true })
+  await settle()
+
+  expect(event.defaultPrevented).toBe(true)
+  expect(shortcutsToggle()?.getAttribute('aria-expanded')).toBe('false')
+})
+
+test('I/O「休息中の案内」— ⌘/ で休息中の打鍵が並び、ボタンは今のまま', async () => {
+  await enterTheRestingSurface()
+  press('/', { metaKey: true })
+  await settle()
+
+  const lines = shortcutLines()
+  expect(lines).toContain('Enter — 休息を終える')
+  expect(lines).toContain('⌘T — 休息のすすめ')
+  expect(lines.join('\n')).not.toContain('切り替え')
+  expect(lines.join('\n')).not.toContain('⌘R')
+  expect(lines.join('\n')).not.toContain('⌘E')
+  expect(actionLabels()).toEqual(['休息を終える', '新規タスク', 'タスク一覧', '閉じる'])
+  expect(invoked).toEqual([])
+})
+
+test('未着手の案内は現在地に掛かる打鍵を載せない', async () => {
+  snapshot = { ...SNAPSHOT, stepContent: null, stepOrdinal: null, stepCount: null }
+  if (component) unmount(component)
+  await mountOverlay()
+
+  expect(actionLabels()).toEqual(['新規タスク', 'タスク一覧', '閉じる'])
+  const text = await shortcutsText()
+  for (const absent of ['Enter — 切り替え', '⌘Enter', '⌘D', '⌘E', '⌘R', '⌘T']) {
+    expect(text).not.toContain(absent)
+  }
+  expect(text).toContain('⌘N — 新規タスク')
+})
+
+test('ホットキーが登録できていなければ、その行を案内に載せない', async () => {
+  snapshot = {
+    ...SNAPSHOT,
+    hotkey: { accelerator: 'Control + Option + Space', registered: false, error: '衝突' },
+  }
+  if (component) unmount(component)
+  await mountOverlay()
+
+  const text = await shortcutsText()
+  expect(text).not.toContain('Control + Option + Space — オーバーレイの開閉')
+  expect(text).toContain('開く・終了はメニューバー項目からも')
+})
+
+test('I/O「他の面」— 作成の面で ⌘/ は何も起こさず、1 行の案内のまま', async () => {
+  await openCreation()
+  press('/', { metaKey: true })
+  await settle()
+
+  expect(shortcutsToggle()).toBeNull()
+  expect(document.querySelector('.hint')?.textContent ?? '').toContain('⌘Enter で作成')
+
+  press('Escape')
+  await settle()
+  expect(shortcutsToggle()?.getAttribute('aria-expanded')).toBe('false')
+})
+
+test('I/O「IME」— 変換中の ⌘/ は何もしない', async () => {
+  press('/', { metaKey: true, isComposing: true } as KeyboardEventInit)
+  await settle()
+
+  expect(shortcutsToggle()?.getAttribute('aria-expanded')).toBe('false')
 })
 
 test('「切り替え」のボタンは Enter と同じ経路を通る', async () => {
@@ -2667,8 +2928,8 @@ test('「切り替え」のボタンは Enter と同じ経路を通る', async (
   expect(noticeText()).toContain('切り替えた')
 })
 
-test('「完了して次を選ぶ」のボタンは ⌘Enter と同じ経路を通る', async () => {
-  actionButton('完了して次を選ぶ').click()
+test('「完了」のボタンは ⌘Enter と同じ経路を通る', async () => {
+  actionButton('完了').click()
   await settle()
 
   expect(invoked).toContain('complete_current_step')
@@ -2681,7 +2942,7 @@ test('ボタンの押下は入力位置を奪わない', async () => {
 
   // 既定動作 (フォーカスの移動) が止められていること。
   const event = new MouseEvent('mousedown', { bubbles: true, cancelable: true })
-  actionButton('一覧').dispatchEvent(event)
+  actionButton('タスク一覧').dispatchEvent(event)
 
   expect(event.defaultPrevented).toBe(true)
   expect(document.activeElement).toBe(note)
@@ -2710,7 +2971,7 @@ test('休息中のボタンは休息の終了だけである', async () => {
 
   expect(actionLabels()).toContain('休息を終える')
   expect(actionLabels()).not.toContain('切り替え')
-  expect(actionLabels()).not.toContain('完了して次を選ぶ')
+  expect(actionLabels()).not.toContain('完了')
 
   actionButton('休息を終える').click()
   await settle()
@@ -2731,6 +2992,49 @@ test('作成の面のボタンは二つの確定と戻るだけである', async
   expect(argsOf('create_task')).toEqual({
     request: { title: '原稿', steps: '下書き', moveCurrentPosition: true, ideaId: null },
   })
+})
+
+test('「新規タスク」のボタンは ⌘N と同じ経路を通る', async () => {
+  actionButton('新規タスク').click()
+  await settle()
+
+  expect(document.querySelector('input.title')).not.toBeNull()
+  expect(document.activeElement).toBe(titleField())
+})
+
+test('「タスク修正」のボタンは ⌘E と同じ経路を通る', async () => {
+  actionButton('タスク修正').click()
+  await settle()
+
+  expect(invoked).toContain('get_task_draft')
+})
+
+test('「タスク一覧」のボタンは ⌘L と同じ経路を通る', async () => {
+  actionButton('タスク一覧').click()
+  await settle()
+
+  expect(invoked).toContain('get_disclosure_surface')
+})
+
+test('休息中の「新規タスク」「タスク一覧」「閉じる」もそれぞれの経路を通る', async () => {
+  await enterTheRestingSurface()
+  actionButton('新規タスク').click()
+  await settle()
+  expect(document.querySelector('input.title')).not.toBeNull()
+  press('Escape')
+  await settle()
+
+  invoked = []
+  actionButton('タスク一覧').click()
+  await settle()
+  expect(invoked).toContain('get_disclosure_surface')
+  press('Escape')
+  await settle()
+
+  invoked = []
+  actionButton('閉じる').click()
+  await settle()
+  expect(invoked).toContain('hide_overlay')
 })
 
 test('「閉じる」のボタンは Esc と同じ経路を通る', async () => {
@@ -2776,11 +3080,11 @@ test('休息に入ると面が「休息中」へ入れ替わる', async () => {
   expect(text).toContain('休息中')
   expect(text).not.toContain(SNAPSHOT.stepContent)
   // 案内も入れ替わる。
-  expect(document.querySelector('.hint')?.textContent ?? '').toContain('Enter で休息を終える')
+  expect(await shortcutsText()).toContain('Enter — 休息を終える')
 })
 
-test('「休息に入る」のボタンは ⌘R と同じ経路を通る', async () => {
-  actionButton('休息に入る').click()
+test('「休息」のボタンは ⌘R と同じ経路を通る', async () => {
+  actionButton('休息').click()
   await settle()
 
   expect(invoked).toContain('begin_rest')
@@ -2789,8 +3093,8 @@ test('「休息に入る」のボタンは ⌘R と同じ経路を通る', async
 test('休息中には ⌘R もボタンも無い — Enter は終了の宣言だけを意味する', async () => {
   await enterTheRestingSurface()
 
-  expect(actionLabels()).not.toContain('休息に入る')
-  expect(document.querySelector('.hint')?.textContent ?? '').not.toContain('⌘R')
+  expect(actionLabels()).not.toContain('休息')
+  expect(await shortcutsText()).not.toContain('⌘R')
 
   press('r', { metaKey: true })
   await settle()
@@ -2807,7 +3111,7 @@ test('未着手では休息に入れない — 止める計数が無い', async 
   await settle()
 
   expect(invoked).not.toContain('begin_rest')
-  expect(actionLabels()).not.toContain('休息に入る')
+  expect(actionLabels()).not.toContain('休息')
 })
 
 test('何も書かれなかったなら、そう述べる', async () => {
@@ -2882,7 +3186,7 @@ test('思いつきの面は初期表示に無く、⌘I で一行の入力欄が
 })
 
 test('既定表示の案内に ⌘I が載っている', async () => {
-  expect(document.querySelector('.hint')?.textContent ?? '').toContain('⌘I で思いつき')
+  expect(await shortcutsText()).toContain('⌘I — 思いつき')
 })
 
 test('I/O「置く」— Enter で置き、閉じずに既定表示へ戻る。現在地もメモの下書きも変わらない', async () => {
@@ -3085,7 +3389,7 @@ test('思いつきの行でもボタンから昇格でき、⌘E は効かない
   await moveDownTo(`idea:${IDEA_A.ideaId}`)
 
   expect(actionLabels()).toContain('タスクにする')
-  expect(actionLabels()).not.toContain('このタスクを直す')
+  expect(actionLabels()).not.toContain('タスク修正')
   press('e', { metaKey: true })
   await settle()
   expect(invoked).not.toContain('get_task_draft')
@@ -3180,7 +3484,7 @@ test('待機の面は初期表示に無く、⌘D で分数 (既定値) と一�
 })
 
 test('既定表示の案内に ⌘D が載っている', async () => {
-  expect(document.querySelector('.hint')?.textContent ?? '').toContain('⌘D で待機')
+  expect(await shortcutsText()).toContain('⌘D — 待機')
 })
 
 test('I/O「入る」— 「AI の出力」で Enter → 待機中。次の一手は主作業のまま、閉じない', async () => {
@@ -3198,7 +3502,7 @@ test('I/O「入る」— 「AI の出力」で Enter → 待機中。次の一�
   expect(document.querySelector('.next-action')?.textContent).toBe('3 段落目を書き直す')
   expect(document.querySelector('.waiting')?.textContent).toBe('待機中 — AI の出力')
   expect(noteField().value).toBe('接続詞を整える途中 / 次は結論')
-  expect(document.querySelector('.hint')?.textContent ?? '').toContain('⌘D で主作業に戻る')
+  expect(await shortcutsText()).toContain('⌘D — 主作業に戻る')
 })
 
 test('「何を待っているか」が空なら null を送り、「待機中」とだけ添える', async () => {
