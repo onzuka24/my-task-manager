@@ -1908,12 +1908,23 @@
       return
     }
 
-    if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
+    // ↑↓ と同じく j / k でも動く (vi の流儀)。この面に入力欄は無く、文字の打鍵が
+    // 書き込みを意味する場所が無い。**修飾キーを伴うものは受け付けない** — ⌘K などを
+    // 移動に読めば、将来の打鍵と衝突する。CapsLock の `J` / `K` は同じ打鍵として扱う。
+    const vertical =
+      event.key === 'ArrowDown' || event.key === 'ArrowUp'
+        ? event.key === 'ArrowDown'
+          ? 1
+          : -1
+        : !event.metaKey && !event.ctrlKey && !event.altKey && !event.shiftKey
+          ? ({ j: 1, k: -1 } as const)[event.key.toLowerCase() as 'j' | 'k']
+          : undefined
+    if (vertical !== undefined) {
       if (selecting) return
       // 既定の動作 (面ごとのスクロール) を止める。入力位置の移動が選んだ行を
       // 見える位置まで送るため、二重に動かすと行を追い越す。
       event.preventDefault()
-      void moveSelection(event.key === 'ArrowDown' ? 1 : -1)
+      void moveSelection(vertical)
       return
     }
 
@@ -2606,7 +2617,7 @@
       案内と実際に効く打鍵が食い違う。
     -->
     <p class="hint">
-      {#if rowKeys.length > 0}↑↓ で移動 · {selectedIdea !== null
+      {#if rowKeys.length > 0}↑↓ (j k) で移動 · {selectedIdea !== null
           ? 'Enter でタスクにする'
           : selectedRow?.kind === 'task'
             ? 'Enter でこのタスクのステップを見る'
