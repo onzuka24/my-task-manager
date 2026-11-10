@@ -1838,6 +1838,51 @@ test('↑↓ で入力位置が行の間を動く — 見出しにも止まる',
   expect((document.activeElement as HTMLElement)?.dataset.rowKey).toBe(`task:${SHOPPING}`)
 })
 
+test('j / k でも ↓ / ↑ と同じく行の間を動く', async () => {
+  await openDisclosure()
+  const at = (): string | undefined => (document.activeElement as HTMLElement)?.dataset.rowKey
+
+  press('k')
+  press('k')
+  press('k')
+  await settle()
+  expect(at()).toBe(`task:${SHOPPING}`)
+
+  press('k')
+  await settle()
+  expect(at()).toBe(`task:${MANUSCRIPT}`)
+
+  const down = pressCancelable('j')
+  await settle()
+  expect(at()).toBe(`task:${SHOPPING}`)
+  // 打鍵は飲む (webview の既定動作へ抜けさせない)。
+  expect(down.defaultPrevented).toBe(true)
+
+  // CapsLock の J / K も同じ打鍵である。
+  press('K')
+  await settle()
+  expect(at()).toBe(`task:${MANUSCRIPT}`)
+})
+
+test('修飾キーを伴う j / k は移動に読まない', async () => {
+  await openDisclosure()
+  const before = (document.activeElement as HTMLElement)?.dataset.rowKey
+
+  press('k', { metaKey: true })
+  press('k', { ctrlKey: true })
+  press('k', { altKey: true })
+  press('k', { shiftKey: true })
+  await settle()
+
+  expect((document.activeElement as HTMLElement)?.dataset.rowKey).toBe(before)
+})
+
+test('一覧の案内に j k が載る', async () => {
+  await openDisclosure()
+
+  expect(document.querySelector('.hint')?.textContent ?? '').toContain('↑↓ (j k) で移動')
+})
+
 test('端では留まる — 回り込まない', async () => {
   await openDisclosure()
 
