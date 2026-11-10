@@ -915,6 +915,33 @@ test('最終ステップでも完了の宣言は切り替えを伴わない', as
   expect(noticeText()).not.toContain('次のステップが無い')
 })
 
+test('最終ステップで提示されたメモを空にして確定したら、消したと述べる', async () => {
+  switchOutcome = { moved: false }
+  typeNote('')
+  await settle()
+
+  press('Enter')
+  await settle()
+
+  expect(argsOf('switch_current_position')).toEqual({
+    request: { note: '', declareCompletion: false },
+  })
+  const notice = document.querySelector('[role="alert"]')?.textContent ?? ''
+  expect(notice).toContain('メモは消した')
+  // **何も確定しなかったとは述べない。** 消えたメモが残っているように読める。
+  expect(notice).not.toContain('記録するものは無かった')
+})
+
+test('⌘Enter でもメモを空にして確定したら空欄を送る — コアがメモを消す', async () => {
+  typeNote('')
+  await settle()
+
+  press('Enter', { metaKey: true })
+  await settle()
+
+  expect(argsOf('complete_current_step')).toEqual({ request: { note: '' } })
+})
+
 test('最終ステップで何も宣言していないなら、記録は無かったと述べる', async () => {
   switchOutcome = { moved: false }
 
@@ -3287,6 +3314,16 @@ test('I/O「早めに戻る」— 待機中の ⌘D で書きかけのメモを�
   // 移ったため下書きは確定済みであり、主作業のメモで初期化し直される。
   expect(noteField().value).toBe('接続詞を整える途中')
   expect(document.activeElement).toBe(noteField())
+})
+
+test('早めに戻るときメモを空にしていたら空欄を送る — コアが離れる側のメモを消す', async () => {
+  await enterTheWaitingSurface()
+  typeNote('')
+  await settle()
+
+  await openWait()
+
+  expect(argsOf('return_from_wait')).toEqual({ request: { note: '' } })
 })
 
 test('早めに戻るとき、提示されたメモを読み返しただけなら null を送る', async () => {
