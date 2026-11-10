@@ -228,6 +228,40 @@
   let restAdviceOpen = $state(false)
 
   /**
+   * 既定表示の打鍵の案内が開いているか — 揮発ビュー状態 (AD-2)。コアは知らない。
+   *
+   * 休息のすすめと同じく**常駐が動いている間だけ覚える**。`forgetPosition()` /
+   * `dismissNotices()` / `close()` で畳まない。永続化はしない。起動直後は閉じている。
+   */
+  let shortcutsOpen = $state(false)
+
+  /**
+   * 既定表示の打鍵の案内 — 1 要素が 1 行、1 行に打鍵は一つだけ。
+   *
+   * **案内と実際に効く打鍵を食い違わせない。** 休息中は切り替えも完了の宣言も無く、
+   * Enter は休息の終了だけを意味する (CAP-10)。未着手では現在地に掛かる打鍵が効かない。
+   * 待機中は ⌘D が主作業へ戻る打鍵になる。
+   */
+  const shortcutLines = $derived.by((): string[] => {
+    const lines: string[] = []
+    if (resting) {
+      lines.push('Enter — 休息を終える', '⌘T — 休息のすすめ')
+    } else if (stepContent !== null) {
+      lines.push(
+        'Enter — 切り替え',
+        '⌘Enter — 完了',
+        waiting ? '⌘D — 主作業に戻る' : '⌘D — 待機',
+        '⌘E — タスク修正',
+        '⌘R — 休息',
+      )
+    }
+    lines.push('⌘N — 新規タスク', '⌘I — 思いつき', '⌘L — タスク一覧', '⌘/ — ショートカットの開閉', 'Esc — 閉じる')
+    if (hotkey && hotkey.registered) lines.push(`${hotkey.accelerator} — オーバーレイの開閉`)
+    lines.push('開く・終了はメニューバー項目からも')
+    return lines
+  })
+
+  /**
    * 休息のすすめ (緊張型頭痛の対策)。**中身はコードに固定する** (利用者の裁定)。
    *
    * 体の使い方の短い提案に留める — 診断や断定を書かない。時間・回数・達成を問う
@@ -828,6 +862,17 @@
    * 窓は固定寸法である。溢れた行を選んだときにスクロールで到達できるよう、選んだ行を
    * 見える位置まで送る。
    */
+  /**
+   * 打鍵の案内を開閉する。**開いたら一覧を見える位置へ寄せる** — 作業中は三段の
+   * ボタンの下に開くため、固定寸法の窓では見える範囲の外に出て、開いたように見えない。
+   */
+  async function toggleShortcuts(): Promise<void> {
+    shortcutsOpen = !shortcutsOpen
+    if (!shortcutsOpen) return
+    await tick()
+    document.getElementById('shortcuts-list')?.scrollIntoView?.({ block: 'nearest' })
+  }
+
   async function focusSelectedRow(): Promise<void> {
     await tick()
     if (!listElement || selectedRowKey === null) return
@@ -1577,7 +1622,7 @@
    */
   function isSurfaceKey(
     event: KeyboardEvent,
-    letter: 'n' | 'l' | 'e' | 'r' | 't' | 'i' | 'd',
+    letter: 'n' | 'l' | 'e' | 'r' | 't' | 'i' | 'd' | '/',
   ): boolean {
     return (
       event.key.toLowerCase() === letter &&
@@ -1712,6 +1757,16 @@
       // 押しっぱなしの自動反復で開閉を繰り返さない — 最後の状態が反復回数で決まる。
       if (event.repeat || !resting) return
       restAdviceOpen = !restAdviceOpen
+      return
+    }
+
+    // 打鍵の案内の開閉。**コアを呼ばない。** 既定表示ならどの状態でも描かれている
+    // (作業中・休息中・未着手)。他の面はここへ来る前に return しており、⌘/ は効かない。
+    if (isSurfaceKey(event, '/')) {
+      event.preventDefault()
+      // 押しっぱなしの自動反復で開閉を繰り返さない。
+      if (event.repeat) return
+      void toggleShortcuts()
       return
     }
 
@@ -2470,25 +2525,47 @@
         <button type="button" onmousedown={preventStealingFocus} onclick={() => confirmSelection()}>タスクにする</button>
       {/if}
       {#if taskToEdit !== null}
-        <button type="button" onmousedown={preventStealingFocus} onclick={() => openEdit(taskToEdit)}>このタスクを直す</button>
+        <button type="button" onmousedown={preventStealingFocus} onclick={() => openEdit(taskToEdit)}>タスク修正</button>
       {/if}
       <button type="button" onmousedown={preventStealingFocus} onclick={() => leaveDisclosure()}>戻る</button>
-    {:else}
-      {#if resting}
-        <button type="button" onmousedown={preventStealingFocus} onclick={() => declareEndOfRest()}>休息を終える</button>
-      {:else if stepContent !== null}
+    {:else if resting}
+      <!-- 休息中の並びは変えない (名前だけ揃える)。 -->
+      <button type="button" onmousedown={preventStealingFocus} onclick={() => declareEndOfRest()}>休息を終える</button>
+      <button type="button" onmousedown={preventStealingFocus} onclick={() => openCreation()}>新規タスク</button>
+      <button type="button" onmousedown={preventStealingFocus} onclick={() => openDisclosure()}>タスク一覧</button>
+      <button type="button" onmousedown={preventStealingFocus} onclick={() => close()}>閉じる</button>
+    {:else if stepContent !== null}
+      <!--
+        作業中は三段に分ける — 1 段目がいまの作業の進め方、2 段目がタスクの扱い、
+        3 段目が作業から離れる操作である。どれも既存の打鍵の別の入口であり、新しい
+        操作は無い。「思いつき」は ⌘I と、「待機 / 主作業に戻る」は ⌘D と同じ経路を通る。
+      -->
+      <div class="action-row">
+        <button type="button" onmousedown={preventStealingFocus} onclick={() => completeAndChooseNext()}>完了</button>
         <button type="button" onmousedown={preventStealingFocus} onclick={() => confirmSwitch()}>切り替え</button>
-        <button type="button" onmousedown={preventStealingFocus} onclick={() => completeAndChooseNext()}>完了して次を選ぶ</button>
-        <button type="button" onmousedown={preventStealingFocus} onclick={() => declareRest()}>休息に入る</button>
+        <button type="button" onmousedown={preventStealingFocus} onclick={() => {
+            // ⌘I と同じく確定の途中では入らない — 入れば失敗の理由が面ごと消える。
+            if (switching) return
+            void openCapture()
+          }}>思いつき</button>
         {#if waiting}
           <button type="button" onmousedown={preventStealingFocus} onclick={() => returnFromWait()}>主作業に戻る</button>
         {:else}
           <button type="button" onmousedown={preventStealingFocus} onclick={() => openWait()}>待機</button>
         {/if}
-        <button type="button" onmousedown={preventStealingFocus} onclick={() => openEdit(null)}>このタスクを直す</button>
-      {/if}
-      <button type="button" onmousedown={preventStealingFocus} onclick={() => openCreation()}>新しいタスク</button>
-      <button type="button" onmousedown={preventStealingFocus} onclick={() => openDisclosure()}>一覧</button>
+      </div>
+      <div class="action-row">
+        <button type="button" onmousedown={preventStealingFocus} onclick={() => openCreation()}>新規タスク</button>
+        <button type="button" onmousedown={preventStealingFocus} onclick={() => openEdit(null)}>タスク修正</button>
+        <button type="button" onmousedown={preventStealingFocus} onclick={() => openDisclosure()}>タスク一覧</button>
+      </div>
+      <div class="action-row">
+        <button type="button" onmousedown={preventStealingFocus} onclick={() => declareRest()}>休息</button>
+        <button type="button" onmousedown={preventStealingFocus} onclick={() => close()}>閉じる</button>
+      </div>
+    {:else}
+      <button type="button" onmousedown={preventStealingFocus} onclick={() => openCreation()}>新規タスク</button>
+      <button type="button" onmousedown={preventStealingFocus} onclick={() => openDisclosure()}>タスク一覧</button>
       <button type="button" onmousedown={preventStealingFocus} onclick={() => close()}>閉じる</button>
     {/if}
   </div>
@@ -2529,18 +2606,39 @@
           ? 'Enter でタスクにする'
           : selectedRow?.kind === 'task'
             ? 'Enter でこのタスクのステップを見る'
-            : 'Enter でここへ現在地を移す'} · {/if}{#if taskToEdit !== null}⌘E でこのタスクを直す
+            : 'Enter でここへ現在地を移す'} · {/if}{#if taskToEdit !== null}⌘E でタスク修正
         · {/if}Esc で戻る
     </p>
   {:else}
-    <!-- 案内の語を行で割らない。割ると表示に改行が混じる。 -->
     <!--
-      **休息中は案内が入れ替わる。** 切り替えも完了の宣言もこの面には無く、Enter は
-      休息の終了の宣言だけを意味する (CAP-10)。案内と実際に効く打鍵を食い違わせない。
+      既定表示の打鍵の案内は折りたたむ (休息のすすめと同じ形)。閉じているときは見出し
+      1 行だけ、開いたら打鍵ごとに 1 行。**休息中・未着手・待機中で入れ替わる** —
+      案内と実際に効く打鍵を食い違わせない (`shortcutLines`)。
+
+      `onmousedown` で既定動作を止めるのは、他のボタンと同じく入力位置を奪わないため
+      である。フォーカスがこのボタンに残ると、Enter が既定表示の打鍵とボタンの click
+      の両方に読まれうる。
     -->
-    <p class="hint">
-      {#if resting}Enter で休息を終える · ⌘T で休息のすすめ · {:else if stepContent !== null}Enter で切り替え · ⌘Enter で完了して次を選ぶ · ⌘R で休息に入る · {waiting ? '⌘D で主作業に戻る' : '⌘D で待機'} · ⌘E でこのタスクを直す · {/if}⌘N で新しいタスク · ⌘I で思いつき · ⌘L で一覧 · Esc で閉じる{#if hotkey && hotkey.registered} · {hotkey.accelerator} で開閉{/if} · 開く・終了はメニューバー項目からも
-    </p>
+    <section class="hint shortcuts">
+      <button
+        type="button"
+        class="shortcuts-toggle"
+        aria-expanded={shortcutsOpen}
+        aria-controls={shortcutsOpen ? 'shortcuts-list' : undefined}
+        onmousedown={preventStealingFocus}
+        onclick={() => toggleShortcuts()}
+      >
+        <span class="mark" aria-hidden="true">{shortcutsOpen ? '▾' : '▸'}</span>
+        ショートカット
+      </button>
+      {#if shortcutsOpen}
+        <ul class="shortcuts-list" id="shortcuts-list">
+          {#each shortcutLines as line, index (index)}
+            <li>{line}</li>
+          {/each}
+        </ul>
+      {/if}
+    </section>
   {/if}
 </main>
 
@@ -2657,6 +2755,22 @@
     溢れたら折り返す — 窓は固定寸法であり、切り取れば到達できない操作が生まれる。
   */
   .actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.35rem;
+  }
+
+  /*
+    作業中の三段のまとまり。段の間の隙間を段の中の隙間より広くし、まとまりを目で
+    区切る。段がある間は .actions を縦に積む (段の無い面は従来どおり横に並ぶ)。
+  */
+  .actions:has(> .action-row) {
+    flex-direction: column;
+    flex-wrap: nowrap;
+    gap: 0.55rem;
+  }
+
+  .action-row {
     display: flex;
     flex-wrap: wrap;
     gap: 0.35rem;
@@ -2880,6 +2994,41 @@
     margin: 0;
     font-size: 0.78rem;
     color: var(--overlay-muted);
+  }
+
+  .shortcuts {
+    display: flex;
+    flex-direction: column;
+    gap: 0.25rem;
+  }
+
+  .shortcuts-toggle {
+    align-self: flex-start;
+    margin: 0;
+    padding: 0;
+    border: none;
+    background: none;
+    color: var(--overlay-muted);
+    font: inherit;
+    cursor: pointer;
+  }
+
+  .shortcuts-toggle:focus-visible {
+    outline: 1px solid var(--overlay-focus);
+    outline-offset: 2px;
+  }
+
+  .shortcuts-toggle .mark {
+    display: inline-block;
+    width: 1em;
+  }
+
+  /* 打鍵ごとに 1 行。溢れた分は main のスクロールで辿る (切り取らない)。 */
+  .shortcuts-list {
+    margin: 0;
+    padding: 0 0 0 1.2rem;
+    list-style: none;
+    line-height: 1.45;
   }
 
   .alert {
