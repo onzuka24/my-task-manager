@@ -16,6 +16,7 @@
 //! - [`switch`] — [`switch::SwitchRecord`]。**切り替え**が残す 1 行 (SM-C3)
 //! - [`setting`] — [`setting::Setting`]。永続化層に一元化される設定値 (AD-11)
 //! - [`rest`] — **連続作業時間**の計時と**介入**の判断 (CAP-10 / AD-8)
+//! - [`work_log`] — [`work_log::WorkSegment`]。**作業区間** (記録するが表示しない / AD-15)
 //! - [`state`] — 全タスクと唯一の現在地を保持し、状態を変えうる操作を集約する
 
 pub mod idea;
@@ -25,6 +26,7 @@ pub mod setting;
 pub mod state;
 pub mod switch;
 pub mod task;
+pub mod work_log;
 
 use std::fmt;
 

@@ -104,3 +104,7 @@
 - source_spec: `_bmad-output/implementation-artifacts/spec-wait.md`
   summary: スナップショットの取り直しが尽きたときに `forgetPosition()` が `waiting` / `resting` を倒すことを確かめる検査が無い (low)。
   evidence: `forgetPosition` は確認できていない待機・休息に対して ⌘D・Enter が `return_from_wait` / `end_rest` を撃たないための守りだが、待機中・休息中を描いた後にスナップショットを失敗させる検査がどこにも無く、行を消しても全テストが通る。二つの旗をまとめて、古いスナップショットの検査として足す。
+
+- source_spec: `_bmad-output/implementation-artifacts/spec-work-log.md`
+  summary: メニューバー項目の「終了」・`RunEvent::Exit`・`NSWorkspaceWillPowerOffNotification` で開いている作業区間を閉じることを、実際に動かして確かめる検査が無い (字面の守りだけがある)。
+  evidence: 三つの配線はいずれも生きた Tauri アプリ / AppKit の上でしか観測できず、リポジトリに UI 自動化の基盤が無い。消えたら落ちる字面の検査 (`the_work_segment_is_still_closed_on_exit_in_the_source` ほか) は足した。あわせて、ログアウトの通知の後にログアウトが取り消された場合、区間は閉じたまま次の状態の変化まで開き直さない (その間の時間が残らない) — 実機で取り消しが起きうるかを確かめるときに併せて扱う。

@@ -2252,8 +2252,10 @@ dependencies = [
 name = "my-task-manager"
 version = "0.1.0"
 dependencies = [
+ "block2",
  "log",
  "objc2-app-kit",
+ "objc2-foundation",
  "rusqlite",
  "serde",
  "serde_json",

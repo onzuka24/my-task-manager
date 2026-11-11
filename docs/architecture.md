@@ -78,6 +78,7 @@ flowchart LR
 | `domain/switch.rs` | 切り替え履歴 (メモ本文は持たない) |
 | `domain/rest.rs` | 休息閾値・猶予・休息の長さ、介入の判定、スリープ検出 |
 | `domain/setting.rs` | 設定値 (鍵と文字列の組) と、その読み方 |
+| `domain/work_log.rs` | 作業区間 — いま開いているべき区間の判定と閉じ方 (記録するが表示しない) |
 | `domain/state.rs` | `Core` — 上をまとめて状態を移し、ストレージへ確定させる |
 
 ## ウィンドウ
@@ -104,8 +105,8 @@ flowchart LR
 | `capture_idea` | Overlay | 思いつきを置く (`⌘I`)。現在地・中断メモ・休息に触れない。イベントは発行しない |
 | `get_task_draft` / `edit_task` | Overlay | タスクを直す (`⌘E`) |
 | `begin_rest` / `end_rest` | Overlay | 休息に入る (`⌘R`) / 終える。待機中の `begin_rest` は、現在地が戻り先と別のタスクにあれば**現在地を戻り先へ移して** (切り替え履歴 1 行) から休息に入り、待機を終える。表示中の待機の介入は取り下げてパネルを隠す。休息に入れば `current_position_changed` を発行する |
-| `begin_wait` | Overlay | 待機に入る (`⌘D`)。分数 (文字列) と何を待っているかを受け取り、現在地を戻り先として覚える。何も永続化せず、イベントも発行しない |
-| `return_from_wait` | Overlay | 待機中の `⌘D` で主作業に戻る。現在地が戻り先と別のタスクにあれば書きかけのメモの確定・移動・切り替え履歴を 1 トランザクションで書き、そのときだけ `current_position_changed` を発行する。同じタスクの中なら何も書かない。どちらでも待機を終え、表示中の待機の介入を取り下げてパネルを隠す |
+| `begin_wait` | Overlay | 待機に入る (`⌘D`)。分数 (文字列) と何を待っているかを受け取り、現在地を戻り先として覚える。待機そのものは永続化せず、イベントも発行しない (書くのは閉じた作業区間だけ) |
+| `return_from_wait` | Overlay | 待機中の `⌘D` で主作業に戻る。現在地が戻り先と別のタスクにあれば書きかけのメモの確定・移動・切り替え履歴を 1 トランザクションで書き、そのときだけ `current_position_changed` を発行する。同じタスクの中なら現在地も履歴も書かない (閉じた作業区間だけを書く)。どちらでも待機を終え、表示中の待機の介入を取り下げてパネルを隠す |
 | `hide_overlay` / `mark_overlay_hidden` | Overlay | 閉じる |
 | `get_intervention_snapshot` | Intervention | 介入パネルの中身 |
 | `answer_intervention` | Intervention | 介入への応答 |

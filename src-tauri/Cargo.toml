@@ -58,7 +58,18 @@ tauri-plugin-autostart = "=2.5.1"
 # バージョンは Tauri 2.11.5 自身の依存に合わせる — ずらすと crate が二重になり
 # リンクが壊れる。
 [target.'cfg(target_os = "macos")'.dependencies]
-objc2-app-kit = { version = "=0.3.2", features = ["NSWindow", "NSResponder"] }
+objc2-app-kit = { version = "=0.3.2", features = ["NSWindow", "NSResponder", "NSWorkspace"] }
+# ログアウト・再起動・シャットダウンの予告 (`NSWorkspaceWillPowerOffNotification`) を
+# 購読し、開いている作業区間を閉じて書く (adapters/power)。版は objc2-app-kit と
+# Tauri 自身の依存に合わせる — ずらすと crate が二重になる。
+objc2-foundation = { version = "=0.3.2", default-features = false, features = [
+  "std",
+  "block2",
+  "NSNotification",
+  "NSOperation",
+  "NSString",
+] }
+block2 = "=0.6.2"
 # 非活性パネル (AD-6) — Tauri 2.11 に一次的な API は無く、NSPanel への差し替えを
 # 行うのはこのクレートだけである。`=` で固定するのは他の依存と同じ理由 (2.x 系に
 # 留まる) に加え、パネルの style mask と collection behavior の意味が版で変わると

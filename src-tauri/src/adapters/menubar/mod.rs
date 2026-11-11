@@ -91,6 +91,9 @@ pub fn install<R: Runtime>(
             }
             QUIT_ITEM_ID => {
                 log::info!("explicit quit requested from the menu bar item");
+                // 開いている**作業区間**を閉じて書いてから終わる。終了の経路のうち、
+                // 確実にここを通る (書けなければ失われる — ログのみ)。
+                crate::close_work_segment(app);
                 // AppHandle::exit は code: Some(0) で ExitRequested を発火する。
                 // 暗黙の終了 (code: None) だけを拒む第 3 層をここだけが通り抜ける。
                 app.exit(0);
@@ -144,6 +147,21 @@ mod tests {
                 assert_ne!(id, other, "id が重なれば押下の意味が入れ替わる");
             }
         }
+    }
+
+    /// **「終了」が終わる前に作業区間を閉じて書くこと。** 呼び出しを消しても型検査は
+    /// 通り、「終了」のたびに開いていた区間が黙って失われる。順序も見る — `exit` の
+    /// 後に置けば届かない。
+    #[test]
+    fn quitting_still_closes_the_work_segment_first() {
+        let source = include_str!("mod.rs");
+        let close = source
+            .find(concat!("crate::close_work_segment", "(app);"))
+            .expect("「終了」が作業区間を閉じる呼び出しを持つ");
+        let exit = source
+            .find(concat!("app.exit", "(0);"))
+            .expect("「終了」が終了を求める");
+        assert!(close < exit, "作業区間を閉じてから終了する");
     }
 
     /// 「開く」がメニューを組み立てる側にも、押下を捌く側にも書かれていること。

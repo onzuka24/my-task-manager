@@ -104,8 +104,42 @@ CREATE TABLE idea (
 ) STRICT;
 ";
 
+/// 版 4 — **作業区間**。
+///
+/// V1〜V3 を書き換えず追記する (V2 の注釈と同じ理由)。
+///
+/// **閉じた区間だけが行になる。** 開いている区間は永続化しない (AD-2)。状態が変わった
+/// とき、その変化のコミットに相乗りして 1 行書く — 定期的な書き込みはしない。
+///
+/// - `kind = 'step'` — **ステップ**の作業。`step_id` 必須、`label` は持たない。
+/// - `kind = 'wait'` — **待機**。`task_id` は戻り先の**タスク**、`step_id` は持たず、
+///   `label` は何を待っているか (空なら NULL)。主作業のステップには数えない。
+///
+/// 長さ 0 以下の区間は書かない (`started_at < ended_at`)。時刻は UTC の ISO 8601 で
+/// あり、ミリ秒を常に 3 桁で書くため文字列の比較が時刻の比較と一致する。
+///
+/// **読み出す経路を製品コードに作らない。** 読み手は `scripts/export-work-log.sh`
+/// だけであり、SQL で直接読む (AD-15: 記録するが表示しない)。**索引を張らない** —
+/// 書き出しは月に一度の全走査であり、一日数十行の規模に索引は要らない。
+const V4: &str = "\
+CREATE TABLE work_segment (
+    id         TEXT PRIMARY KEY NOT NULL,
+    kind       TEXT NOT NULL CHECK (kind IN ('step', 'wait')),
+    task_id    TEXT NOT NULL REFERENCES task(id),
+    step_id    TEXT REFERENCES step(id),
+    label      TEXT,
+    started_at TEXT NOT NULL,
+    ended_at   TEXT NOT NULL,
+    CHECK (
+        (kind = 'step' AND step_id IS NOT NULL AND label IS NULL)
+        OR (kind = 'wait' AND step_id IS NULL)
+    ),
+    CHECK (started_at < ended_at)
+) STRICT;
+";
+
 /// 版の順序。**追記のみ。** 添字 + 1 が `PRAGMA user_version` の値になる。
-const MIGRATIONS: &[&str] = &[V1, V2, V3];
+const MIGRATIONS: &[&str] = &[V1, V2, V3, V4];
 
 /// コードが期待するスキーマの版。
 pub const LATEST_VERSION: i64 = MIGRATIONS.len() as i64;
@@ -270,18 +304,26 @@ mod tests {
                 "setting",
                 "step",
                 "switch_record",
-                "task"
+                "task",
+                "work_segment"
             ]
         );
     }
 
-    /// **V1 を書き換えず V2・V3 を追記した。** 既存インストールは適用済みの版を
+    /// **V1 を書き換えず V2・V3・V4 を追記した。** 既存インストールは適用済みの版を
     /// 保ったまま、残りの版だけを受け取る。
     #[test]
     fn an_existing_installation_only_receives_the_new_version() {
-        assert_eq!(LATEST_VERSION, 3);
-        assert_eq!(pending(1), &[V2, V3]);
-        assert_eq!(pending(2), &[V3]);
+        assert_eq!(LATEST_VERSION, 4);
+        assert_eq!(pending(1), &[V2, V3, V4]);
+        assert_eq!(pending(2), &[V3, V4]);
+        assert_eq!(pending(3), &[V4]);
+        assert!(
+            !V1.contains("work_segment")
+                && !V2.contains("work_segment")
+                && !V3.contains("work_segment"),
+            "V1〜V3 は書き換えない"
+        );
         assert!(V1.contains("CREATE TABLE task"));
         assert!(!V1.contains("switch_record"), "V1 は書き換えない");
         assert!(
@@ -321,7 +363,7 @@ mod tests {
 
         migrate(&mut connection).expect("残りが適用できる");
 
-        assert_eq!(version_of(&connection), 3);
+        assert_eq!(version_of(&connection), LATEST_VERSION);
         assert!(tables(&connection).contains(&"idea".to_string()));
         let title: String = connection
             .query_row("SELECT title FROM task WHERE id = 't'", [], |row| {
@@ -337,6 +379,95 @@ mod tests {
             )
             .expect("現在地は残っている");
         assert_eq!(step, "s");
+    }
+
+    /// 版 3 の DB を開くと**作業区間**の表が増え、既存の行はそのまま残る。
+    #[test]
+    fn migrating_from_version_three_adds_the_work_segment_table_and_keeps_the_rest() {
+        let mut connection = Connection::open_in_memory().expect("メモリ DB は開ける");
+        configure(&connection).expect("PRAGMA を設定できる");
+        for sql in [V1, V2, V3] {
+            connection.execute_batch(sql).expect("旧版は適用できる");
+        }
+        connection
+            .pragma_update(None, "user_version", 3)
+            .expect("版番号は書ける");
+        connection
+            .execute("INSERT INTO task (id, title) VALUES ('t', '原稿')", [])
+            .expect("タスクは書ける");
+        connection
+            .execute(
+                "INSERT INTO idea (id, content, created_at) VALUES ('i', '一行', '2026-11-01T00:00:00.000Z')",
+                [],
+            )
+            .expect("思いつきは書ける");
+        assert!(!tables(&connection).contains(&"work_segment".to_string()));
+
+        migrate(&mut connection).expect("残りが適用できる");
+
+        assert_eq!(version_of(&connection), 4);
+        assert!(tables(&connection).contains(&"work_segment".to_string()));
+        let kept: i64 = connection
+            .query_row(
+                "SELECT (SELECT count(*) FROM task) + (SELECT count(*) FROM idea)",
+                [],
+                |row| row.get(0),
+            )
+            .expect("数えられる");
+        assert_eq!(kept, 2, "既存のタスクと思いつきは残っている");
+    }
+
+    /// **作業区間**の種類と欄の組み合わせ・長さを SQL のレベルで縛る。
+    #[test]
+    fn a_work_segment_is_constrained_by_its_kind_and_length() {
+        let mut connection = Connection::open_in_memory().expect("メモリ DB は開ける");
+        configure(&connection).expect("PRAGMA を設定できる");
+        migrate(&mut connection).expect("適用できる");
+        connection
+            .execute("INSERT INTO task (id, title) VALUES ('t', '原稿')", [])
+            .expect("タスクは書ける");
+        connection
+            .execute(
+                "INSERT INTO step (id, task_id, ordinal, content) VALUES ('s', 't', 1, '下書き')",
+                [],
+            )
+            .expect("ステップは書ける");
+
+        let insert = |id: &str, kind: &str, step: Option<&str>, label: Option<&str>, end: &str| {
+            connection.execute(
+                "INSERT INTO work_segment (id, kind, task_id, step_id, label, started_at, ended_at) \
+                 VALUES (?1, ?2, 't', ?3, ?4, '2026-11-11T01:00:00.000Z', ?5)",
+                rusqlite::params![id, kind, step, label, end],
+            )
+        };
+        let later = "2026-11-11T01:25:00.000Z";
+        assert!(insert("a", "step", Some("s"), None, later).is_ok());
+        assert!(insert("b", "wait", None, Some("AI の出力"), later).is_ok());
+        assert!(insert("c", "wait", None, None, later).is_ok());
+        assert!(
+            insert("d", "step", None, None, later).is_err(),
+            "ステップの区間はステップを持つ"
+        );
+        assert!(
+            insert("e", "wait", Some("s"), None, later).is_err(),
+            "待機の区間はステップを持たない"
+        );
+        assert!(
+            insert("f", "step", Some("s"), Some("x"), later).is_err(),
+            "ステップの区間は一言を持たない"
+        );
+        assert!(
+            insert("g", "rest", None, None, later).is_err(),
+            "休息は数えない"
+        );
+        assert!(
+            insert("h", "step", Some("s"), None, "2026-11-11T01:00:00.000Z").is_err(),
+            "長さ 0 の区間は書けない"
+        );
+        assert!(
+            insert("i", "step", Some("missing"), None, later).is_err(),
+            "実在するステップだけ"
+        );
     }
 
     /// 版 1 の DB を開くと**切り替え履歴**の表だけが増える。

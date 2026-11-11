@@ -30,6 +30,7 @@ use crate::domain::position::CurrentPosition;
 use crate::domain::setting::Setting;
 use crate::domain::switch::SwitchRecord;
 use crate::domain::task::{InterruptionNote, Step, StepId, Task, TaskId};
+use crate::domain::work_log::{WorkSegment, WorkSegmentKind};
 use crate::domain::Timestamp;
 use crate::ports::storage::{Commit, RestoredState, Storage, StorageError};
 
@@ -146,6 +147,10 @@ impl Storage for SqliteStorage {
         }
         for id in &commit.deleted_ideas {
             delete_idea(&transaction, *id)?;
+        }
+        // **作業区間**は**タスク**と**ステップ**を指す。**タスク**の後に書く。
+        for segment in &commit.work_segments {
+            write_work_segment(&transaction, segment)?;
         }
 
         transaction
@@ -281,6 +286,39 @@ fn write_setting(transaction: &Transaction<'_>, setting: &Setting) -> Result<(),
             rusqlite::params![setting.key(), setting.value()],
         )
         .map_err(|error| StorageError::Write(format!("設定値を書けない: {error}")))?;
+    Ok(())
+}
+
+/// **作業区間**を 1 行追記する。
+///
+/// **追記専用であり、読み戻す関数を対に置かない** (AD-15: 記録するが表示しない)。
+/// 読み手は `scripts/export-work-log.sh` だけである。**一言はエラーにも載せない**
+/// (ログに本文を書かない)。
+fn write_work_segment(
+    transaction: &Transaction<'_>,
+    segment: &WorkSegment,
+) -> Result<(), StorageError> {
+    let (kind, task_id, step_id, label) = match segment.kind() {
+        WorkSegmentKind::Step { task_id, step_id } => {
+            ("step", task_id, Some(step_id.to_string()), None)
+        }
+        WorkSegmentKind::Wait { task_id, label } => ("wait", task_id, None, label.as_deref()),
+    };
+    transaction
+        .execute(
+            "INSERT INTO work_segment (id, kind, task_id, step_id, label, started_at, ended_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            rusqlite::params![
+                segment.id().to_string(),
+                kind,
+                task_id.to_string(),
+                step_id,
+                label,
+                segment.started_at().to_iso8601(),
+                segment.ended_at().to_iso8601(),
+            ],
+        )
+        .map_err(|error| StorageError::Write(format!("作業区間を書けない: {error}")))?;
     Ok(())
 }
 
@@ -753,6 +791,7 @@ mod tests {
                 settings: Vec::new(),
                 idea: None,
                 deleted_ideas: Vec::new(),
+                work_segments: Vec::new(),
             })
             .expect("タスクが同じトランザクションで先に書かれるため成立する");
 
@@ -900,6 +939,7 @@ mod tests {
             settings: Vec::new(),
             idea: None,
             deleted_ideas: Vec::new(),
+            work_segments: Vec::new(),
         });
         assert!(outcome.is_err(), "存在しないステップを指す現在地は書けない");
 
@@ -946,6 +986,7 @@ mod tests {
                 settings: Vec::new(),
                 idea: None,
                 deleted_ideas: Vec::new(),
+                work_segments: Vec::new(),
             })
             .expect("三つが同じトランザクションで書ける");
 
@@ -989,6 +1030,7 @@ mod tests {
             settings: Vec::new(),
             idea: None,
             deleted_ideas: Vec::new(),
+            work_segments: Vec::new(),
         });
         assert!(outcome.is_err());
         assert_eq!(count_switch_records(&storage), 0);
@@ -1018,6 +1060,7 @@ mod tests {
                     settings: Vec::new(),
                     idea: None,
                     deleted_ideas: Vec::new(),
+                    work_segments: Vec::new(),
                 })
                 .expect("書ける");
         }
@@ -1314,6 +1357,449 @@ mod tests {
         let restored = storage.restore().expect("読める");
         assert_eq!(restored.tasks, vec![task]);
         assert!(restored.ideas.is_empty());
+    }
+
+    // --- 作業区間と書き出し --------------------------------------------------------
+
+    /// 区間を (種類, UTC の開始, UTC の終了) から作る。
+    fn segment(kind: WorkSegmentKind, started_at: &str, ended_at: &str) -> WorkSegment {
+        crate::domain::work_log::OpenWorkSegment::new(
+            kind,
+            Timestamp::parse_iso8601(started_at).expect("時刻として読める"),
+        )
+        .close(Timestamp::parse_iso8601(ended_at).expect("時刻として読める"))
+        .expect("長さがある")
+    }
+
+    /// **作業区間**は書いたとおりの列で残り、**タスク**の書き直しと同じコミットにも乗る。
+    #[test]
+    fn work_segments_are_appended_with_their_columns() {
+        let storage = SqliteStorage::in_memory().expect("開ける");
+        let task = a_task();
+        let step = task.steps()[0].id();
+        storage
+            .apply(&Commit {
+                task: Some(task.clone()),
+                work_segments: vec![
+                    segment(
+                        WorkSegmentKind::Step {
+                            task_id: task.id(),
+                            step_id: step,
+                        },
+                        "2026-11-11T01:00:00.000Z",
+                        "2026-11-11T01:25:00.000Z",
+                    ),
+                    segment(
+                        WorkSegmentKind::Wait {
+                            task_id: task.id(),
+                            label: Some("AI の出力".to_string()),
+                        },
+                        "2026-11-11T01:25:00.000Z",
+                        "2026-11-11T01:30:00.000Z",
+                    ),
+                ],
+                ..Commit::default()
+            })
+            .expect("同じトランザクションで書ける");
+
+        /// (kind, step_id, label, started_at, ended_at)
+        type Row = (String, Option<String>, Option<String>, String, String);
+        let rows: Vec<Row> = {
+            let connection = storage.lock();
+            let mut statement = connection
+                .prepare(
+                    "SELECT kind, step_id, label, started_at, ended_at \
+                     FROM work_segment ORDER BY started_at",
+                )
+                .expect("組み立てられる");
+            let rows = statement
+                .query_map([], |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                })
+                .expect("実行できる");
+            rows.map(|row| row.expect("読める")).collect()
+        };
+        assert_eq!(
+            rows,
+            vec![
+                (
+                    "step".to_string(),
+                    Some(step.to_string()),
+                    None,
+                    "2026-11-11T01:00:00.000Z".to_string(),
+                    "2026-11-11T01:25:00.000Z".to_string()
+                ),
+                (
+                    "wait".to_string(),
+                    None,
+                    Some("AI の出力".to_string()),
+                    "2026-11-11T01:25:00.000Z".to_string(),
+                    "2026-11-11T01:30:00.000Z".to_string()
+                ),
+            ]
+        );
+        // 区間だけのコミットは空ではない — 空と判定すると書き込みが黙って落ちる。
+        assert!(Commit::of_work_segments(Vec::new()).is_empty());
+        assert!(!Commit::of_work_segments(vec![segment(
+            WorkSegmentKind::Step {
+                task_id: task.id(),
+                step_id: step,
+            },
+            "2026-11-11T02:00:00.000Z",
+            "2026-11-11T02:01:00.000Z",
+        )])
+        .is_empty());
+    }
+
+    /// 書き出しの検査に使う一時ディレクトリ。
+    fn export_directory(name: &str) -> PathBuf {
+        let directory = std::env::temp_dir().join(format!(
+            "my-task-manager-export-{name}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&directory);
+        directory
+    }
+
+    /// `scripts/export-work-log.sh` を走らせる。時刻帯は東京 (+09:00) に固定する。
+    fn run_export(database: &Path, args: &[&str]) -> std::process::Output {
+        let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("../scripts/export-work-log.sh");
+        std::process::Command::new("bash")
+            .arg(script)
+            .args(args)
+            .env("MY_TASK_MANAGER_DB", database)
+            .env("TZ", "Asia/Tokyo")
+            .output()
+            .expect("bash を起動できる")
+    }
+
+    /// 書き出しの CSV を読む。**先頭に UTF-8 の BOM が無ければ失敗する** (Mac の Excel で
+    /// 日本語が化けないため / 利用者の裁定)。残りは RFC 4180 として読み、**引用の中の
+    /// カンマ・引用符・改行を正しく扱えなければ失敗する** — 書き出しが CSV として壊れて
+    /// いないことの検査である。
+    fn parse_csv(text: &str) -> Vec<Vec<String>> {
+        let text = text
+            .strip_prefix('\u{feff}')
+            .unwrap_or_else(|| panic!("先頭に BOM が付いている: {text:?}"));
+        let mut records = Vec::new();
+        let mut record = Vec::new();
+        let mut field = String::new();
+        let mut quoted = false;
+        let mut chars = text.chars().peekable();
+        while let Some(c) = chars.next() {
+            if quoted {
+                match c {
+                    '"' if chars.peek() == Some(&'"') => {
+                        chars.next();
+                        field.push('"');
+                    }
+                    '"' => quoted = false,
+                    _ => field.push(c),
+                }
+                continue;
+            }
+            match c {
+                '"' => {
+                    assert!(field.is_empty(), "引用は欄の先頭でだけ始まる: {text}");
+                    quoted = true;
+                }
+                ',' => record.push(std::mem::take(&mut field)),
+                '\r' => {}
+                '\n' => {
+                    record.push(std::mem::take(&mut field));
+                    records.push(std::mem::take(&mut record));
+                }
+                _ => field.push(c),
+            }
+        }
+        assert!(!quoted, "引用が閉じている: {text}");
+        assert!(
+            field.is_empty() && record.is_empty(),
+            "最後の行も改行で終わる"
+        );
+        records
+    }
+
+    fn csv(rows: &[[&str; 5]]) -> Vec<Vec<String>> {
+        rows.iter()
+            .map(|row| row.iter().map(|cell| (*cell).to_string()).collect())
+            .collect()
+    }
+
+    /// 書き出し — 日 × ステップ。日またぎ (0 時で分ける)・期間の端・待機の行・CSV の
+    /// 引用・書き出した時点の番号と内容を、実際の DB とスクリプトで確かめる。
+    #[test]
+    fn the_export_script_writes_days_by_steps() {
+        let directory = export_directory("days");
+        let path = SqliteStorage::database_path(&directory);
+        let storage = SqliteStorage::open(&path).expect("開ける");
+
+        let mut draft = Task::create(
+            NOW,
+            "原稿, 第1版",
+            contents(&["下書き \"案\"", "推敲\n二行目"]),
+        )
+        .expect("作れる");
+        let first = draft.steps()[0].id();
+        let second = draft.steps()[1].id();
+        let errand = Task::create(NOW, "買い物", contents(&["米"])).expect("作れる");
+        let rice = errand.steps()[0].id();
+        let on = |step_id, task_id| WorkSegmentKind::Step { task_id, step_id };
+        let waiting = |label: Option<&str>| WorkSegmentKind::Wait {
+            task_id: draft.id(),
+            label: label.map(str::to_string),
+        };
+        storage
+            .apply(&Commit::of_task(draft.clone()))
+            .expect("書ける");
+        storage
+            .apply(&Commit::of_task(errand.clone()))
+            .expect("書ける");
+        storage
+            .apply(&Commit::of_work_segments(vec![
+                // 期間の前日 23:50 から 0:10 — 期間に入る 10 分だけ。
+                segment(
+                    on(first, draft.id()),
+                    "2026-10-31T14:50:00.000Z",
+                    "2026-10-31T15:10:00.000Z",
+                ),
+                // 日またぎ 23:30〜00:45 — 前日 30 分・当日 45 分。
+                segment(
+                    on(first, draft.id()),
+                    "2026-11-10T14:30:00.000Z",
+                    "2026-11-10T15:45:00.000Z",
+                ),
+                // 同じ日の同じステップは合計する (45 + 25.5)。
+                segment(
+                    on(first, draft.id()),
+                    "2026-11-11T01:00:00.000Z",
+                    "2026-11-11T01:25:30.000Z",
+                ),
+                // 秒の精度。丸めない。
+                segment(
+                    on(second, draft.id()),
+                    "2026-11-11T03:00:00.000Z",
+                    "2026-11-11T03:00:01.234Z",
+                ),
+                // 待機は別の行。
+                segment(
+                    waiting(Some("AI の出力")),
+                    "2026-11-11T02:00:00.000Z",
+                    "2026-11-11T02:05:00.000Z",
+                ),
+                segment(
+                    waiting(None),
+                    "2026-11-11T02:10:00.000Z",
+                    "2026-11-11T02:12:00.000Z",
+                ),
+                segment(
+                    on(rice, errand.id()),
+                    "2026-11-11T04:00:00.000Z",
+                    "2026-11-11T04:03:00.000Z",
+                ),
+                // 期間の後 (12 月 1 日 0 時から) — 出ない。
+                segment(
+                    on(rice, errand.id()),
+                    "2026-11-30T15:00:00.000Z",
+                    "2026-11-30T16:00:00.000Z",
+                ),
+            ]))
+            .expect("書ける");
+        // 書き出した時点の番号と内容を使う — 先頭に挿入すれば番号が一つずれる。
+        draft.insert_step(NOW, 1, "資料").expect("挿入できる");
+        storage.apply(&Commit::of_task(draft)).expect("書ける");
+        // アプリを終えた後に書き出す (WAL が畳まれ -shm も無い状態)。動いている間の
+        // 書き出しは下で確かめる。
+        drop(storage);
+
+        let output = run_export(&path, &["2026-11-01", "2026-11-30"]);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "成功する: {stderr}");
+        let stdout = String::from_utf8(output.stdout).expect("UTF-8");
+        assert_eq!(
+            parse_csv(&stdout),
+            csv(&[
+                ["日付", "タスク", "ステップ番号", "ステップ", "分"],
+                ["2026-11-01", "原稿, 第1版", "2", "下書き \"案\"", "10.00"],
+                ["2026-11-10", "原稿, 第1版", "2", "下書き \"案\"", "30.00"],
+                ["2026-11-11", "原稿, 第1版", "2", "下書き \"案\"", "70.50"],
+                ["2026-11-11", "原稿, 第1版", "3", "推敲\n二行目", "0.02"],
+                ["2026-11-11", "原稿, 第1版", "", "待機", "2.00"],
+                ["2026-11-11", "原稿, 第1版", "", "待機: AI の出力", "5.00"],
+                ["2026-11-11", "買い物", "1", "米", "3.00"],
+            ]),
+            "{stdout}"
+        );
+
+        // 一日だけ。アプリが動いている間 (接続が開いたまま) に書き出す。
+        let storage = SqliteStorage::open(&path).expect("開ける");
+        let output = run_export(&path, &["2026-11-10", "2026-11-10"]);
+        assert!(output.status.success());
+        assert_eq!(
+            parse_csv(&String::from_utf8(output.stdout).expect("UTF-8")),
+            csv(&[
+                ["日付", "タスク", "ステップ番号", "ステップ", "分"],
+                ["2026-11-10", "原稿, 第1版", "2", "下書き \"案\"", "30.00"],
+            ])
+        );
+
+        drop(storage);
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    /// 書き出し — 引数なしは今月 1 日から今日まで。前月末の区間は出ない。開始日だけを
+    /// 渡せば今日まで。区間が無い期間でも BOM と見出しは出る。
+    ///
+    /// 「今日」は実際の時計から東京 (+09:00) の日付として求める。1 日に走っても成り立つ
+    /// (1 日 0 時半の区間と今日の区間が同じ日の別の行になる)。
+    #[test]
+    fn the_export_script_defaults_to_this_month() {
+        const OFFSET: i64 = 9 * 60 * 60 * 1_000;
+        let directory = export_directory("default");
+        let path = SqliteStorage::database_path(&directory);
+        let storage = SqliteStorage::open(&path).expect("開ける");
+
+        let now_millis = i64::try_from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("epoch より後")
+                .as_millis(),
+        )
+        .expect("収まる");
+        let today = Timestamp::from_unix_millis(now_millis + OFFSET).to_iso8601()[..10].to_string();
+        let first = format!("{}01", &today[..8]);
+        // 東京の壁時計の時刻を UTC の ISO 8601 に直す。
+        let local = |date: &str, time: &str, shift_millis: i64| {
+            let wall = Timestamp::parse_iso8601(&format!("{date}T{time}.000Z")).expect("読める");
+            Timestamp::from_unix_millis(wall.unix_millis() - OFFSET + shift_millis).to_iso8601()
+        };
+
+        let task = Task::create(NOW, "原稿", contents(&["先月", "月初", "今日"])).expect("作れる");
+        let step = |index: usize| WorkSegmentKind::Step {
+            task_id: task.id(),
+            step_id: task.steps()[index].id(),
+        };
+        storage
+            .apply(&Commit::of_task(task.clone()))
+            .expect("書ける");
+        storage
+            .apply(&Commit::of_work_segments(vec![
+                // 前月の末日 12:00〜12:20 — 出ない。
+                segment(
+                    step(0),
+                    &local(&first, "00:00:00", -12 * 60 * 60 * 1_000),
+                    &local(&first, "00:00:00", -(11 * 60 + 40) * 60 * 1_000),
+                ),
+                // 今月 1 日 00:30〜00:40。
+                segment(
+                    step(1),
+                    &local(&first, "00:30:00", 0),
+                    &local(&first, "00:40:00", 0),
+                ),
+                // 今日 00:00:00〜00:00:30。
+                segment(
+                    step(2),
+                    &local(&today, "00:00:00", 0),
+                    &local(&today, "00:00:30", 0),
+                ),
+            ]))
+            .expect("書ける");
+        drop(storage);
+
+        let header = ["日付", "タスク", "ステップ番号", "ステップ", "分"];
+        let this_month = csv(&[
+            header,
+            [&first, "原稿", "2", "月初", "10.00"],
+            [&today, "原稿", "3", "今日", "0.50"],
+        ]);
+        for args in [&[][..], &[first.as_str()][..]] {
+            let output = run_export(&path, args);
+            assert!(
+                output.status.success(),
+                "{args:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_eq!(
+                parse_csv(&String::from_utf8(output.stdout).expect("UTF-8")),
+                this_month,
+                "{args:?} は今月 1 日から今日まで"
+            );
+        }
+
+        // 開始日だけ — 今日から今日まで。
+        let output = run_export(&path, &[today.as_str()]);
+        assert!(output.status.success());
+        assert_eq!(
+            parse_csv(&String::from_utf8(output.stdout).expect("UTF-8")),
+            csv(&[header, [&today, "原稿", "3", "今日", "0.50"]])
+        );
+
+        // 区間の無い期間 — BOM と見出しだけ。
+        let output = run_export(&path, &["2000-01-01", "2000-01-31"]);
+        assert!(output.status.success());
+        assert_eq!(
+            parse_csv(&String::from_utf8(output.stdout).expect("UTF-8")),
+            csv(&[header])
+        );
+
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    /// 書き出し — DB が無い・日付が不正なら理由を標準エラーへ出して非 0 で終わる。
+    #[test]
+    fn the_export_script_refuses_bad_input() {
+        let directory = export_directory("refuse");
+        let path = SqliteStorage::database_path(&directory);
+
+        let missing = run_export(&path, &["2026-11-01", "2026-11-30"]);
+        assert!(!missing.status.success(), "DB が無い");
+        assert!(!missing.stderr.is_empty());
+        assert!(missing.stdout.is_empty(), "見出しも出さない");
+
+        let storage = SqliteStorage::open(&path).expect("開ける");
+        drop(storage);
+        for args in [
+            // 改行を含む引数 — 行ごとに見れば形が合うが、文字列全体では合わない。
+            &["2026-11-01
+2026-11-30"][..],
+            &[
+                "2026-11-01
+'); DROP TABLE task; --",
+                "2026-11-30",
+            ][..],
+            &["2026-02-30", "2026-03-01"][..],
+            &["2026/11/01"][..],
+            &["2026-11-30", "2026-11-01"][..],
+            &["2026-11-01", "2026-11-30", "余り"][..],
+        ] {
+            let output = run_export(&path, args);
+            assert!(!output.status.success(), "{args:?} は拒まれる");
+            assert!(!output.stderr.is_empty(), "{args:?} の理由が出る");
+            assert!(output.stdout.is_empty(), "{args:?} は何も書き出さない");
+        }
+        let storage = SqliteStorage::open(&path).expect("開ける");
+        assert!(storage.restore().is_ok(), "引数が SQL に入っていない");
+        drop(storage);
+
+        // 作業区間の表が無い DB (版 4 より前) — 理由を出して非 0 で終わる。見出しも出さない。
+        let old = directory.join("old.sqlite3");
+        Connection::open(&old)
+            .expect("開ける")
+            .execute_batch("CREATE TABLE task (id TEXT PRIMARY KEY NOT NULL, title TEXT NOT NULL);")
+            .expect("作れる");
+        let output = run_export(&old, &["2026-11-01", "2026-11-30"]);
+        assert!(!output.status.success(), "表が無い");
+        assert!(String::from_utf8_lossy(&output.stderr).contains("作業区間の表が無い"));
+        assert!(output.stdout.is_empty());
+
+        let _ = std::fs::remove_dir_all(&directory);
     }
 
     /// DB ファイルのパスはアプリデータディレクトリ配下に組み立てられる。
