@@ -6,5 +6,6 @@ pub mod clock;
 pub mod hotkey;
 pub mod intervention;
 pub mod menubar;
+pub mod power;
 pub mod presentation;
 pub mod storage;

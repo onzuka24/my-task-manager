@@ -53,7 +53,7 @@ use tauri::{Emitter, Manager};
 use adapters::hotkey::HotkeyStatus;
 use adapters::intervention::INTERVENTION_LABEL;
 use adapters::storage::SqliteStorage;
-use adapters::{autostart, clock, hotkey, intervention, menubar, presentation};
+use adapters::{autostart, clock, hotkey, intervention, menubar, power, presentation};
 use domain::rest::TICK_INTERVAL_MILLIS;
 use domain::state::Core;
 
@@ -100,6 +100,29 @@ pub fn announce_task_created<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
 /// **介入**が発せられたことを介入パネルへ伝える (AD-3 / CAP-10)。
 pub fn announce_intervention_raised<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
     announce(app, INTERVENTION_RAISED);
+}
+
+/// **開いている作業区間を閉じて書く** — 明示的な終了の直前に呼ぶ。
+///
+/// メニューバー項目の「終了」が `app.exit(0)` の前に呼ぶ (確実に通る経路)。
+/// [`tauri::RunEvent::Exit`] でも呼ぶ (予備)。ログアウト・再起動・シャットダウンは
+/// [`adapters::power`] が電源断の予告を受けて呼ぶ。二度目は閉じる区間が無く、何も
+/// 書かない。
+///
+/// **失敗はログのみである。** 書けなければその区間は失われる (spec I/O マトリクス
+/// 「終了」)。区間の本文 (一言・タスク名) は書かない。
+pub fn close_work_segment<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
+    let Some(core) = app.try_state::<Core>() else {
+        return;
+    };
+    match core.close_work_segment() {
+        Ok(closed) => {
+            log::info!("the open work segment was closed before exiting (closed={closed})")
+        }
+        Err(error) => {
+            log::error!("the open work segment could not be written before exiting: {error}")
+        }
+    }
 }
 
 /// 状態が変わったという事実だけを提示層へ伝える (AD-3)。
@@ -292,6 +315,11 @@ pub fn run() {
             // 被せた形で出かねない。
             restore_core(&handle);
 
+            // ログアウト・再起動・シャットダウンの直前に、開いている作業区間を閉じて
+            // 書く。「終了」を押さずに電源を切ると、終了要求は第 3 層が拒む暗黙の終了と
+            // して届き、`RunEvent::Exit` も通らない (adapters/power)。
+            power::observe(&handle);
+
             // ホットキーが唯一の呼び出し経路である以上、それが死んでいることは確実に
             // 伝わらなければならない。起動時にオーバーレイを出して理由を示す。
             // 以後はメニューバー項目の状態行が副の経路となる。
@@ -321,14 +349,18 @@ pub fn run() {
         })
         .build(tauri::generate_context!())
         .expect("error while building the resident process")
-        .run(|_app, event| {
+        .run(|app, event| match event {
             // 第 3 層 — 暗黙の終了だけを拒む。
-            if let tauri::RunEvent::ExitRequested { code, api, .. } = event {
+            tauri::RunEvent::ExitRequested { code, api, .. } => {
                 if should_prevent_exit(code) {
                     log::info!("an implicit exit request was refused; the process stays resident");
                     api.prevent_exit();
                 }
             }
+            // 開いている作業区間を閉じて書く。メニューバー項目の「終了」は既に閉じて
+            // おり、ここでは何も書かない。それ以外の終了を拾う予備の経路である。
+            tauri::RunEvent::Exit => close_work_segment(app),
+            _ => {}
         });
 }
 
@@ -565,6 +597,34 @@ mod tests {
                 written_in_source(needle),
                 "第 3 層の {needle} が lib.rs から消えている。\
                  暗黙の終了要求を拒む者がいなくなる"
+            );
+        }
+    }
+
+    /// **作業区間を閉じる呼び出しが、終了の予備 (`RunEvent::Exit`) と電源断の予告の
+    /// 購読に残っていること。** 消しても他のどの検査も赤くならず、その日の最後の区間が
+    /// 黙って失われる。メニューバー項目の「終了」側は `adapters/menubar` が固定する。
+    ///
+    /// 主張は[字面の存在][`written_in_source`]までであり、効いていることではない。
+    #[test]
+    fn the_work_segment_is_still_closed_on_exit_in_the_source() {
+        for needle in [
+            concat!("RunEvent::Exit => ", "close_work_segment(app)"),
+            concat!("power::", "observe(&handle)"),
+        ] {
+            assert!(
+                written_in_source(needle),
+                "{needle} が lib.rs から消えている。開いている作業区間が終了で失われる"
+            );
+        }
+        let power = include_str!("adapters/power/mod.rs");
+        for needle in [
+            concat!("NSWorkspaceWill", "PowerOffNotification),"),
+            concat!("crate::close_work_segment", "(&handle);"),
+        ] {
+            assert!(
+                power.contains(needle),
+                "{needle} が adapters/power から消えている。電源断で作業区間が失われる"
             );
         }
     }

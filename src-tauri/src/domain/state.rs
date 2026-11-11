@@ -25,6 +25,7 @@ use super::rest::{
 use super::setting::Setting;
 use super::switch::SwitchRecord;
 use super::task::{InterruptionNote, NoteEdit, Step, StepId, Task, TaskId};
+use super::work_log::{self, OpenWorkSegment};
 use super::{Clock, DomainError, Timestamp};
 use crate::ports::storage::{Commit, RestoredState, Storage, StorageError};
 
@@ -80,6 +81,12 @@ pub struct CoreState {
     /// (利用者の裁定・レビュー後)。取り残したパネルは他の**介入**を塞ぎ、休息中に
     /// オーバーレイを開き、新しい**待機**を終えうるためである。
     wait_panel_withdrawn: bool,
+    /// 開いている**作業区間**。**永続化しない** (AD-2)。開いていなければ `None`。
+    ///
+    /// 状態を変える経路が、変化の後に望ましい区間 ([`work_log::desired`]) と食い違えば
+    /// 閉じた区間を書いて開き直す。**定期的に書かない** — 異常終了したときに開いていた
+    /// 区間は失われてよい (利用者の裁定)。**どこにも表示しない** (AD-15)。
+    open_segment: Option<OpenWorkSegment>,
 }
 
 /// **待機** — 主作業を戻り先として覚えたまま、短い別作業をしている状態。
@@ -117,9 +124,9 @@ impl Wait {
 pub enum WaitReturn {
     /// **待機**中ではなかった。何も起きていない。
     NotWaiting,
-    /// **現在地**を動かさず、何も書かずに**待機**を終えた。**現在地**が戻り先と同じ
-    /// **タスク**の中にある (主作業を進めていた場合を含む) とき、および戻り先が
-    /// 見つからない・**現在地**が無いとき (v1 では起きないはずの状態) である。
+    /// **現在地**を動かさずに**待機**を終えた。**現在地**が戻り先と同じ**タスク**の中に
+    /// ある (主作業を進めていた場合を含む) とき、および戻り先が見つからない・**現在地**が
+    /// 無いとき (v1 では起きないはずの状態) である。書くのは閉じた**作業区間**だけである。
     Stayed,
     /// **現在地**を戻り先へ移し (**切り替え履歴**を 1 行)、**待機**を終えた。
     Moved,
@@ -140,6 +147,7 @@ impl Default for CoreState {
             return_until: None,
             wait: None,
             wait_panel_withdrawn: false,
+            open_segment: None,
         }
     }
 }
@@ -253,6 +261,36 @@ impl CoreState {
         }
     }
 
+    /// 遷移後の**現在地**と**待機**に合わせて、開いている**作業区間**をどう閉じ・開くか。
+    ///
+    /// 閉じる時刻は、[区間が最後に動いていたと分かる時刻][`Self::segment_reference`]から
+    /// 時計が飛んでいれば (スリープ) その時刻、そうでなければ `now` である
+    /// ([`work_log::closing_time`])。
+    fn segment_shift(
+        &self,
+        position: CurrentPosition,
+        wait: Option<&Wait>,
+        now: Timestamp,
+    ) -> work_log::Shift {
+        let desired =
+            work_log::desired(position, wait.map(|wait| (wait.return_to.0, wait.label())));
+        let ended_at =
+            work_log::closing_time(self.segment_reference(), now, rest::TICK_INTERVAL_MILLIS);
+        work_log::shift(self.open_segment.as_ref(), desired, ended_at, now)
+    }
+
+    /// 開いている**作業区間**が最後に動いていたと分かる時刻 — 直前の刻みと区間の開始の
+    /// 遅いほう。スリープの飛びはここから測り、スリープならここで閉じる。
+    ///
+    /// 区間の開始を含めるのは、スリープから戻って最初の刻みより先に操作が区間を開き
+    /// 直したときのためである。直前の刻み (スリープ前) だけを見ると、その区間を刻みが
+    /// 開始より前で閉じようとして長さ 0 として捨て、操作から刻みまでの時間を失う。
+    fn segment_reference(&self) -> Timestamp {
+        self.open_segment
+            .as_ref()
+            .map_or(self.last_tick, |open| open.started_at().max(self.last_tick))
+    }
+
     /// **休息**に入ったことを記録する。開始はいまであり、出直しの約束は残さない。
     fn enter_rest(&mut self, now: Timestamp) {
         self.rest_since = Some(now);
@@ -356,6 +394,11 @@ impl Core {
         // **介入**が出る。
         let rest_since =
             matches!(current_position, CurrentPosition::Inactive { .. }).then_some(last_tick);
+        // **開いている作業区間は永続化しない** (AD-2)。起動時に**活性**なら起動時刻から
+        // 開く — 異常終了で失われた区間は戻らない (利用者の裁定)。待機は永続化しない
+        // ため、開くのは常に**ステップ**の区間である。
+        let open_segment = work_log::desired(current_position, None)
+            .map(|kind| OpenWorkSegment::new(kind, last_tick));
         Ok(Self {
             state: Mutex::new(CoreState {
                 tasks,
@@ -371,6 +414,7 @@ impl Core {
                 // **待機は永続化しない** (利用者の裁定)。
                 wait: None,
                 wait_panel_withdrawn: false,
+                open_segment,
             }),
             clock,
             storage,
@@ -551,20 +595,24 @@ impl Core {
     /// **ステップ**が無いとき、または永続化に失敗したとき。
     pub fn move_current_position(&self, step_id: StepId) -> Result<(), CoreError> {
         let mut state = self.lock();
+        let now = self.clock.now();
         let task_id = state
             .task_of_step(step_id)
             .ok_or(DomainError::UnknownStep)?
             .id();
-        let moved = state
-            .current_position
-            .move_to(task_id, step_id, self.clock.now());
+        let moved = state.current_position.move_to(task_id, step_id, now);
         if moved == state.current_position {
             // 既に指しているステップを選び直しただけ。書くものが無いのにトランザクション
             // を張ると、何も変えない要求が永続化の失敗で `Err` になりうる。
             return Ok(());
         }
-        self.storage.apply(&Commit::of_current_position(moved))?;
+        let shift = state.segment_shift(moved, state.wait.as_ref(), now);
+        self.storage.apply(&Commit {
+            work_segments: shift.closed.into_iter().collect(),
+            ..Commit::of_current_position(moved)
+        })?;
         state.current_position = moved;
+        state.open_segment = shift.open;
         Ok(())
     }
 
@@ -649,6 +697,12 @@ impl Core {
             return Ok(destination);
         }
 
+        // **作業区間**は**現在地**が動いたときだけ閉じる (最終ステップでは動かない)。
+        let shift = state.segment_shift(
+            moved.unwrap_or(state.current_position),
+            state.wait.as_ref(),
+            now,
+        );
         self.storage.apply(&Commit {
             // 変わっていない**タスク**を書き直さない。書けば失敗しうる I/O が増える
             // だけで、確定するものが一つも増えない。
@@ -658,6 +712,7 @@ impl Core {
             settings: Vec::new(),
             idea: None,
             deleted_ideas: Vec::new(),
+            work_segments: shift.closed.into_iter().collect(),
         })?;
 
         if task_changed {
@@ -666,6 +721,7 @@ impl Core {
         if let Some(position) = moved {
             state.current_position = position;
         }
+        state.open_segment = shift.open;
         Ok(destination)
     }
 
@@ -853,6 +909,7 @@ impl Core {
             .step_id()
             .filter(|departed| *departed != step_id);
 
+        let shift = state.segment_shift(moved, state.wait.as_ref(), now);
         self.storage.apply(&Commit {
             // **タスク**は書き直さない。メモにも**完了**にも触れないため、変わるものが
             // 一つも無い。
@@ -863,8 +920,10 @@ impl Core {
             settings: Vec::new(),
             idea: None,
             deleted_ideas: Vec::new(),
+            work_segments: shift.closed.into_iter().collect(),
         })?;
         state.current_position = moved;
+        state.open_segment = shift.open;
         Ok(true)
     }
 
@@ -929,9 +988,41 @@ impl Core {
             showing: state.intervention.is_some(),
         });
 
-        if let Some(adjusted) = adjusted_position(state.current_position, &decision) {
-            self.storage.apply(&Commit::of_current_position(adjusted))?;
+        // **スリープから戻った刻み** — 開いている**作業区間**をスリープ直前の刻み (または
+        // 区間の開始の遅いほう) で閉じ、いまから開き直す。スリープの間はどこにも数えない。
+        // 書けなければ直前の刻みの時刻を進めず、次の刻みが同じ飛びを見てやり直す。
+        let reference = state.segment_reference();
+        let jump = now.unix_millis().saturating_sub(reference.unix_millis());
+        let resumed = (rest::slept_millis(jump, rest::TICK_INTERVAL_MILLIS) > 0)
+            .then(|| state.open_segment.as_ref())
+            .flatten()
+            .map(|open| {
+                (
+                    open.close(reference),
+                    OpenWorkSegment::new(open.kind().clone(), now),
+                )
+            });
+
+        let adjusted = adjusted_position(state.current_position, &decision);
+        let commit = Commit {
+            current_position: adjusted,
+            work_segments: resumed
+                .as_ref()
+                .and_then(|(closed, _)| closed.clone())
+                .into_iter()
+                .collect(),
+            ..Commit::default()
+        };
+        // **何も変わらないなら何も書かない** — 作業中のまま状態が動かない刻みは、区間の
+        // ためにも一度も書かない (定期的な書き込みをしない)。
+        if !commit.is_empty() {
+            self.storage.apply(&commit)?;
+        }
+        if let Some(adjusted) = adjusted {
             state.current_position = adjusted;
+        }
+        if let Some((_, reopened)) = resumed {
+            state.open_segment = Some(reopened);
         }
 
         state.last_tick = now;
@@ -1157,6 +1248,8 @@ impl Core {
         if next == state.current_position {
             return Ok(false);
         }
+        // **休息**は数えない。開いている**作業区間**を休息に入った時刻で閉じる。
+        let shift = state.segment_shift(next, None, now);
         self.storage.apply(&Commit {
             task: None,
             current_position: Some(next),
@@ -1164,8 +1257,10 @@ impl Core {
             settings: Vec::new(),
             idea: None,
             deleted_ideas: Vec::new(),
+            work_segments: shift.closed.into_iter().collect(),
         })?;
         state.current_position = next;
+        state.open_segment = shift.open;
         state.end_wait();
         // **休息**に入った以上、出直しの約束は残さない。開始はいまであり、復帰の
         // **介入**はここから数える。
@@ -1202,8 +1297,14 @@ impl Core {
             return Ok(false);
         }
         let next = state.current_position.activate(now);
-        self.storage.apply(&Commit::of_current_position(next))?;
+        // 休息を終えた時刻から**作業区間**を開く (閉じるものは無い)。
+        let shift = state.segment_shift(next, state.wait.as_ref(), now);
+        self.storage.apply(&Commit {
+            work_segments: shift.closed.into_iter().collect(),
+            ..Commit::of_current_position(next)
+        })?;
         state.current_position = next;
+        state.open_segment = shift.open;
         state.grace_until = None;
         state.follow_rest(now);
         Ok(true)
@@ -1223,24 +1324,34 @@ impl Core {
     /// **待機に入る。** その時点の**現在地**を戻り先として覚え、`minutes` 分の後に
     /// 待機の**介入**を出す。
     ///
-    /// **何も書かない** — 戻り先・期限・何を待っているかは永続化しない (利用者の裁定 /
-    /// AD-2)。**連続作業時間**にも触れない (数え続ける)。
+    /// 戻り先・期限・何を待っているかは永続化しない (利用者の裁定 / AD-2)。
+    /// **連続作業時間**にも触れない (数え続ける)。**書くのは閉じた作業区間だけである** —
+    /// 主作業のステップの区間を閉じ、待機の区間を開く (区間だけの 1 コミット)。
     ///
     /// # 戻り値
     ///
     /// **待機**に入ったか。**現在地**が**活性**でない (**未着手**・**休息**中) とき、
     /// また既に**待機**中のときは `false` であり、何も変えない。
-    pub fn begin_wait(&self, minutes: NonZeroU32, label: Option<String>) -> bool {
+    ///
+    /// # Errors
+    ///
+    /// 閉じた作業区間を永続化できなかったとき。そのとき**待機**には入っていない。
+    pub fn begin_wait(
+        &self,
+        minutes: NonZeroU32,
+        label: Option<String>,
+    ) -> Result<bool, CoreError> {
         let mut state = self.lock();
         if state.wait.is_some() {
-            return false;
+            return Ok(false);
         }
         let CurrentPosition::Active {
             task_id, step_id, ..
         } = state.current_position
         else {
-            return false;
+            return Ok(false);
         };
+        let now = self.clock.now();
         // 分数は上限で頭打ちにする ([`rest::MAX_WAIT_MINUTES`])。
         let length_millis = i64::from(minutes.get())
             .min(rest::MAX_WAIT_MINUTES)
@@ -1248,13 +1359,20 @@ impl Core {
         let label = label
             .map(|text| text.trim().to_string())
             .filter(|text| !text.is_empty());
-        state.wait = Some(Wait {
+        let wait = Wait {
             return_to: (task_id, step_id),
-            until: after(self.clock.now(), length_millis),
+            until: after(now, length_millis),
             length_millis,
             label,
-        });
-        true
+        };
+        let shift = state.segment_shift(state.current_position, Some(&wait), now);
+        if let Some(closed) = shift.closed {
+            self.storage
+                .apply(&Commit::of_work_segments(vec![closed]))?;
+        }
+        state.wait = Some(wait);
+        state.open_segment = shift.open;
+        Ok(true)
     }
 
     /// **主作業に戻る** — 待機中のオーバーレイの ⌘D (早めに戻る)。
@@ -1289,6 +1407,14 @@ impl Core {
             return Ok(WaitReturn::NotWaiting);
         };
         let Some((moved, departed)) = return_move(state, wait, now) else {
+            // **現在地**は動かないが、待機の**作業区間**は閉じて主作業のステップの区間を
+            // 開く (区間だけの 1 コミット)。書けなければ**待機**は続く。
+            let shift = state.segment_shift(state.current_position, None, now);
+            if let Some(closed) = shift.closed {
+                self.storage
+                    .apply(&Commit::of_work_segments(vec![closed]))?;
+            }
+            state.open_segment = shift.open;
             state.end_wait();
             return Ok(WaitReturn::Stayed);
         };
@@ -1313,6 +1439,7 @@ impl Core {
             }
         };
 
+        let shift = state.segment_shift(moved, None, now);
         self.storage.apply(&Commit {
             task: drafted.as_ref().map(|(_, draft)| draft.clone()),
             current_position: Some(moved),
@@ -1320,14 +1447,48 @@ impl Core {
             settings: Vec::new(),
             idea: None,
             deleted_ideas: Vec::new(),
+            work_segments: shift.closed.into_iter().collect(),
         })?;
 
         if let Some((index, draft)) = drafted {
             state.tasks[index] = draft;
         }
         state.current_position = moved;
+        state.open_segment = shift.open;
         state.end_wait();
         Ok(WaitReturn::Moved)
+    }
+
+    // --- 作業区間 -------------------------------------------------------------------
+
+    /// **開いている作業区間を閉じて書く** — メニューバー項目の「終了」の直前に呼ぶ。
+    ///
+    /// 閉じる時刻は [`work_log::closing_time`] に従う (スリープ直後ならスリープの前)。
+    /// 長さ 0 なら書かない。**二度呼んでも二度は書かない** — 閉じた後は開いている区間が
+    /// 無い。
+    ///
+    /// # 戻り値
+    ///
+    /// 開いている区間があったか。
+    ///
+    /// # Errors
+    ///
+    /// 永続化に失敗したとき。そのとき区間は開いたまま残る (呼び出し側はログに残して
+    /// 終了する — 失われてよい)。
+    pub fn close_work_segment(&self) -> Result<bool, CoreError> {
+        let mut state = self.lock();
+        let Some(open) = state.open_segment.as_ref() else {
+            return Ok(false);
+        };
+        let now = self.clock.now();
+        let ended_at =
+            work_log::closing_time(state.segment_reference(), now, rest::TICK_INTERVAL_MILLIS);
+        if let Some(closed) = open.close(ended_at) {
+            self.storage
+                .apply(&Commit::of_work_segments(vec![closed]))?;
+        }
+        state.open_segment = None;
+        Ok(true)
     }
 
     /// **設定値**を書き換える (AD-11)。
@@ -1366,8 +1527,13 @@ impl Core {
             // 得るものが無い。
             return Ok(());
         }
-        self.storage.apply(&Commit::of_current_position(next))?;
+        let shift = state.segment_shift(next, state.wait.as_ref(), now);
+        self.storage.apply(&Commit {
+            work_segments: shift.closed.into_iter().collect(),
+            ..Commit::of_current_position(next)
+        })?;
         state.current_position = next;
+        state.open_segment = shift.open;
         state.follow_rest(now);
         Ok(())
     }
@@ -4071,6 +4237,22 @@ mod tests {
             (core, storage, clock, third, rice)
         }
 
+        /// `before` 以降のコミットが、閉じた**作業区間**の 1 行だけであること —
+        /// **現在地**も**切り替え履歴**も書いていない。
+        fn assert_only_a_work_segment_was_written(storage: &RecordingStorage, before: usize) {
+            let written = &storage.commits()[before..];
+            assert_eq!(written.len(), 1, "区間の 1 コミットだけ");
+            assert_eq!(
+                written[0],
+                Commit {
+                    work_segments: written[0].work_segments.clone(),
+                    ..Commit::default()
+                },
+                "現在地・履歴・タスクを書かない"
+            );
+            assert_eq!(written[0].work_segments.len(), 1);
+        }
+
         fn waiting_label(core: &Core) -> Option<Option<String>> {
             core.snapshot()
                 .wait()
@@ -4084,7 +4266,9 @@ mod tests {
             let before = storage.commits().len();
             let position = core.current_position();
 
-            assert!(core.begin_wait(minutes(5), Some("AI の出力".to_string())));
+            assert!(core
+                .begin_wait(minutes(5), Some("AI の出力".to_string()))
+                .expect("書ける"));
 
             assert_eq!(waiting_label(&core), Some(Some("AI の出力".to_string())));
             assert_eq!(
@@ -4100,7 +4284,9 @@ mod tests {
         #[test]
         fn a_blank_label_is_no_label() {
             let (core, _, _, _, _) = a_core_on_the_main_work();
-            assert!(core.begin_wait(minutes(5), Some("   ".to_string())));
+            assert!(core
+                .begin_wait(minutes(5), Some("   ".to_string()))
+                .expect("書ける"));
             assert_eq!(waiting_label(&core), Some(None));
         }
 
@@ -4108,12 +4294,18 @@ mod tests {
         #[test]
         fn a_wait_needs_an_active_position() {
             let (core, _, _) = a_core();
-            assert!(!core.begin_wait(minutes(5), None), "未着手");
+            assert!(
+                !core.begin_wait(minutes(5), None).expect("書ける"),
+                "未着手"
+            );
             assert!(core.snapshot().wait().is_none());
 
             let (core, _, _, _, _) = a_core_on_the_main_work();
             assert!(core.begin_rest().expect("入れる"));
-            assert!(!core.begin_wait(minutes(5), None), "休息中");
+            assert!(
+                !core.begin_wait(minutes(5), None).expect("書ける"),
+                "休息中"
+            );
             assert!(core.snapshot().wait().is_none());
         }
 
@@ -4121,10 +4313,14 @@ mod tests {
         #[test]
         fn a_second_wait_does_not_replace_the_first() {
             let (core, _, _, third, rice) = a_core_on_the_main_work();
-            assert!(core.begin_wait(minutes(5), Some("一つ目".to_string())));
+            assert!(core
+                .begin_wait(minutes(5), Some("一つ目".to_string()))
+                .expect("書ける"));
             core.select_step(rice).expect("移せる");
 
-            assert!(!core.begin_wait(minutes(9), Some("二つ目".to_string())));
+            assert!(!core
+                .begin_wait(minutes(9), Some("二つ目".to_string()))
+                .expect("書ける"));
             assert_eq!(core.snapshot().wait().map(Wait::return_to), Some(third));
             assert_eq!(waiting_label(&core), Some(Some("一つ目".to_string())));
         }
@@ -4133,7 +4329,7 @@ mod tests {
         #[test]
         fn moving_elsewhere_keeps_the_return_point() {
             let (core, _, _, third, rice) = a_core_on_the_main_work();
-            assert!(core.begin_wait(minutes(5), None));
+            assert!(core.begin_wait(minutes(5), None).expect("書ける"));
 
             assert!(core.select_step(rice).expect("移せる"));
 
@@ -4145,7 +4341,7 @@ mod tests {
         #[test]
         fn the_wait_intervention_comes_after_the_wait_length() {
             let (core, _, clock, _, _) = a_core_on_the_main_work();
-            assert!(core.begin_wait(minutes(5), None));
+            assert!(core.begin_wait(minutes(5), None).expect("書ける"));
 
             assert!(
                 !tick_for(&core, &clock, 5 * MINUTE - TICK_INTERVAL_MILLIS),
@@ -4164,7 +4360,7 @@ mod tests {
         fn returning_from_the_panel_takes_the_main_work_back() {
             let (core, storage, clock, third, rice) = a_core_on_the_main_work();
             let activated_at = core.current_position().activated_at();
-            assert!(core.begin_wait(minutes(5), None));
+            assert!(core.begin_wait(minutes(5), None).expect("書ける"));
             core.select_step(rice).expect("移せる");
             assert!(tick_for(&core, &clock, 5 * MINUTE));
             let before = storage.commits().len();
@@ -4201,7 +4397,7 @@ mod tests {
         #[test]
         fn a_failed_return_keeps_the_wait_and_the_intervention() {
             let (core, storage, clock, _, rice) = a_core_on_the_main_work();
-            assert!(core.begin_wait(minutes(5), None));
+            assert!(core.begin_wait(minutes(5), None).expect("書ける"));
             core.select_step(rice).expect("移せる");
             assert!(tick_for(&core, &clock, 5 * MINUTE));
 
@@ -4214,11 +4410,12 @@ mod tests {
             assert_eq!(shown_kind(&core), Some(InterventionKind::Wait));
         }
 
-        /// I/O マトリクス「戻る (移っていない)」— 何も書かず、待機を終える。
+        /// I/O マトリクス「戻る (移っていない)」— **現在地**も履歴も書かず、待機を終える。
+        /// 書くのは閉じた待機の**作業区間**だけである。
         #[test]
         fn returning_while_still_on_the_main_work_writes_nothing() {
             let (core, storage, clock, third, _) = a_core_on_the_main_work();
-            assert!(core.begin_wait(minutes(5), None));
+            assert!(core.begin_wait(minutes(5), None).expect("書ける"));
             assert!(tick_for(&core, &clock, 5 * MINUTE));
             let before = storage.commits().len();
 
@@ -4228,7 +4425,7 @@ mod tests {
                 Some(InterventionKind::Wait)
             );
 
-            assert_eq!(storage.commits().len(), before, "何も書かない");
+            assert_only_a_work_segment_was_written(&storage, before);
             assert_eq!(core.current_position().step_id(), Some(third));
             assert!(core.snapshot().wait().is_none(), "待機は終わる");
         }
@@ -4237,7 +4434,7 @@ mod tests {
         #[test]
         fn a_little_longer_can_be_taken_without_limit() {
             let (core, _, clock, _, _) = a_core_on_the_main_work();
-            assert!(core.begin_wait(minutes(5), None));
+            assert!(core.begin_wait(minutes(5), None).expect("書ける"));
             assert!(tick_for(&core, &clock, 5 * MINUTE));
 
             for round in 0..5 {
@@ -4260,7 +4457,7 @@ mod tests {
         #[test]
         fn a_little_longer_uses_the_confirmed_minutes() {
             let (core, _, clock, _, _) = a_core_on_the_main_work();
-            assert!(core.begin_wait(minutes(2), None));
+            assert!(core.begin_wait(minutes(2), None).expect("書ける"));
             assert!(tick_for(&core, &clock, 2 * MINUTE));
             core.answer_intervention(InterventionChoice::Grace)
                 .expect("応答できる");
@@ -4274,7 +4471,7 @@ mod tests {
         #[test]
         fn returning_early_commits_the_note_where_it_was_written() {
             let (core, storage, _, third, rice) = a_core_on_the_main_work();
-            assert!(core.begin_wait(minutes(5), None));
+            assert!(core.begin_wait(minutes(5), None).expect("書ける"));
             core.select_step(rice).expect("移せる");
             let before = storage.commits().len();
 
@@ -4307,7 +4504,7 @@ mod tests {
             let (core, storage, _, _, rice) = a_core_on_the_main_work();
             core.set_interruption_note(rice, Some(InterruptionNote::new("前のメモ")))
                 .expect("置ける");
-            assert!(core.begin_wait(minutes(5), None));
+            assert!(core.begin_wait(minutes(5), None).expect("書ける"));
             core.select_step(rice).expect("移せる");
 
             assert_eq!(
@@ -4327,7 +4524,7 @@ mod tests {
             let (core, storage, _, _, rice) = a_core_on_the_main_work();
             core.set_interruption_note(rice, Some(InterruptionNote::new("前のメモ")))
                 .expect("置ける");
-            assert!(core.begin_wait(minutes(5), None));
+            assert!(core.begin_wait(minutes(5), None).expect("書ける"));
             core.select_step(rice).expect("移せる");
 
             assert_eq!(
@@ -4350,7 +4547,7 @@ mod tests {
         #[test]
         fn a_failed_early_return_changes_nothing() {
             let (core, storage, _, _, rice) = a_core_on_the_main_work();
-            assert!(core.begin_wait(minutes(5), None));
+            assert!(core.begin_wait(minutes(5), None).expect("書ける"));
             core.select_step(rice).expect("移せる");
             let before = core.snapshot();
 
@@ -4365,7 +4562,7 @@ mod tests {
         #[test]
         fn returning_early_from_the_main_work_writes_nothing() {
             let (core, storage, _, third, _) = a_core_on_the_main_work();
-            assert!(core.begin_wait(minutes(5), None));
+            assert!(core.begin_wait(minutes(5), None).expect("書ける"));
             let before = storage.commits().len();
 
             let outcome = core
@@ -4396,7 +4593,7 @@ mod tests {
         #[test]
         fn returning_early_withdraws_the_wait_panel() {
             let (core, _, clock, third, rice) = a_core_on_the_main_work();
-            assert!(core.begin_wait(minutes(5), None));
+            assert!(core.begin_wait(minutes(5), None).expect("書ける"));
             core.select_step(rice).expect("移せる");
             assert!(tick_for(&core, &clock, 5 * MINUTE));
             assert!(
@@ -4422,7 +4619,7 @@ mod tests {
         #[test]
         fn resting_withdraws_the_wait_panel() {
             let (core, _, clock, third, rice) = a_core_on_the_main_work();
-            assert!(core.begin_wait(minutes(5), None));
+            assert!(core.begin_wait(minutes(5), None).expect("書ける"));
             core.select_step(rice).expect("移せる");
             assert!(tick_for(&core, &clock, 5 * MINUTE));
 
@@ -4439,14 +4636,14 @@ mod tests {
         #[test]
         fn only_a_wait_panel_left_behind_is_withdrawn() {
             let (core, _, clock, _, _) = a_core_on_the_main_work();
-            assert!(core.begin_wait(minutes(5), None));
+            assert!(core.begin_wait(minutes(5), None).expect("書ける"));
             assert!(tick_for(&core, &clock, 5 * MINUTE));
             core.answer_intervention(InterventionChoice::Rest)
                 .expect("応答できる");
             assert!(!core.take_withdrawn_wait_panel());
 
             // 休息の介入の表示中に早めに戻っても、休息の介入は残る。
-            assert!(core.begin_wait(minutes(120), None));
+            assert!(core.begin_wait(minutes(120), None).expect("書ける"));
             assert!(tick_for(&core, &clock, 45 * MINUTE));
             assert_eq!(shown_kind(&core), Some(InterventionKind::Rest));
             core.return_from_wait(None).expect("戻れる");
@@ -4459,7 +4656,7 @@ mod tests {
         #[test]
         fn progress_within_the_main_work_is_not_undone() {
             let (core, storage, clock, _, _) = a_core_on_the_main_work();
-            assert!(core.begin_wait(minutes(5), None));
+            assert!(core.begin_wait(minutes(5), None).expect("書ける"));
             let fourth = core
                 .switch_current_position(None, false)
                 .expect("切り替えられる")
@@ -4478,11 +4675,11 @@ mod tests {
                 Some(fourth),
                 "第 4 のまま"
             );
-            assert_eq!(storage.commits().len(), before, "何も書かない");
+            assert_only_a_work_segment_was_written(&storage, before);
             assert!(core.snapshot().wait().is_none(), "待機は終わる");
 
             // ⌘D と休息に入るときの戻しも同じ規則である。
-            assert!(core.begin_wait(minutes(5), None));
+            assert!(core.begin_wait(minutes(5), None).expect("書ける"));
             core.switch_current_position(None, false)
                 .expect("切り替えられる");
             assert_eq!(
@@ -4491,7 +4688,7 @@ mod tests {
                 WaitReturn::Stayed
             );
             let position = core.current_position();
-            assert!(core.begin_wait(minutes(5), None));
+            assert!(core.begin_wait(minutes(5), None).expect("書ける"));
             assert!(core.begin_rest().expect("入れる"));
             assert_eq!(core.current_position().step_id(), position.step_id());
             assert!(storage
@@ -4507,7 +4704,7 @@ mod tests {
         fn the_wait_intervention_waits_for_the_rest_intervention() {
             let (core, _, clock, _, _) = a_core_on_the_main_work();
             assert!(!tick_for(&core, &clock, 46 * MINUTE));
-            assert!(core.begin_wait(minutes(5), None));
+            assert!(core.begin_wait(minutes(5), None).expect("書ける"));
 
             assert!(
                 tick_for(&core, &clock, 4 * MINUTE),
@@ -4531,7 +4728,7 @@ mod tests {
         fn the_work_clock_keeps_running_while_waiting() {
             let (core, _, clock, _, rice) = a_core_on_the_main_work();
             let activated_at = core.current_position().activated_at();
-            assert!(core.begin_wait(minutes(120), None));
+            assert!(core.begin_wait(minutes(120), None).expect("書ける"));
             core.select_step(rice).expect("移せる");
 
             assert!(!tick_for(&core, &clock, 50 * MINUTE - TICK_INTERVAL_MILLIS));
@@ -4544,7 +4741,7 @@ mod tests {
         #[test]
         fn declaring_a_rest_while_waiting_returns_to_the_main_work_first() {
             let (core, storage, _, third, rice) = a_core_on_the_main_work();
-            assert!(core.begin_wait(minutes(5), None));
+            assert!(core.begin_wait(minutes(5), None).expect("書ける"));
             core.select_step(rice).expect("移せる");
             let before = storage.commits().len();
 
@@ -4569,7 +4766,7 @@ mod tests {
         #[test]
         fn declaring_a_rest_on_the_main_work_ends_the_wait_without_a_record() {
             let (core, storage, _, third, _) = a_core_on_the_main_work();
-            assert!(core.begin_wait(minutes(5), None));
+            assert!(core.begin_wait(minutes(5), None).expect("書ける"));
 
             assert!(core.begin_rest().expect("入れる"));
 
@@ -4587,7 +4784,7 @@ mod tests {
         #[test]
         fn resting_from_the_intervention_while_waiting_returns_first() {
             let (core, _, clock, third, rice) = a_core_on_the_main_work();
-            assert!(core.begin_wait(minutes(120), None));
+            assert!(core.begin_wait(minutes(120), None).expect("書ける"));
             core.select_step(rice).expect("移せる");
             assert!(tick_for(&core, &clock, 50 * MINUTE));
             assert_eq!(shown_kind(&core), Some(InterventionKind::Rest));
@@ -4604,7 +4801,7 @@ mod tests {
         #[test]
         fn a_failed_rest_while_waiting_keeps_the_wait() {
             let (core, storage, _, _, rice) = a_core_on_the_main_work();
-            assert!(core.begin_wait(minutes(5), None));
+            assert!(core.begin_wait(minutes(5), None).expect("書ける"));
             core.select_step(rice).expect("移せる");
             let before = core.snapshot();
 
@@ -4617,7 +4814,7 @@ mod tests {
         #[test]
         fn a_withdrawn_wait_intervention_comes_back_after_the_wait_length() {
             let (core, _, clock, _, _) = a_core_on_the_main_work();
-            assert!(core.begin_wait(minutes(5), None));
+            assert!(core.begin_wait(minutes(5), None).expect("書ける"));
             assert!(tick_for(&core, &clock, 5 * MINUTE));
 
             assert!(core.withdraw_intervention());
@@ -4642,6 +4839,417 @@ mod tests {
         fn a_restored_core_is_not_waiting() {
             let (core, _, _) = a_core();
             assert!(core.snapshot().wait().is_none());
+        }
+    }
+
+    /// **作業区間** — 状態が変わった瞬間にだけ、閉じた区間を書く。
+    mod work_segments {
+        use super::*;
+        use crate::domain::work_log::WorkSegmentKind;
+        use std::num::NonZeroU32;
+
+        const T0: i64 = 1_789_000_000_000;
+
+        /// 主作業 (原稿) の第 3 **ステップ**で、T0 から働いているコア。別**タスク**
+        /// (買い物) の第 1 **ステップ**も返す。
+        fn at_work() -> (Core, Arc<RecordingStorage>, FixedClock, StepId, StepId) {
+            let (core, storage, clock) = a_core();
+            let main = core
+                .create_task("原稿", contents(&["一", "二", "三", "四"]))
+                .expect("作れる");
+            let other = core
+                .create_task("買い物", contents(&["米", "味噌"]))
+                .expect("作れる");
+            let snapshot = core.snapshot();
+            let third = snapshot.task(main).expect("ある").steps()[2].id();
+            let rice = snapshot.task(other).expect("ある").steps()[0].id();
+            core.move_current_position(third).expect("移せる");
+            (core, storage, clock, third, rice)
+        }
+
+        /// 書かれた区間を (どのステップか・待機の一言, 開始, 終了) の形で読む。時刻は
+        /// T0 からの秒。
+        #[derive(Debug, PartialEq, Eq)]
+        enum Seen {
+            Step(StepId),
+            Wait(Option<String>),
+        }
+
+        fn written(storage: &RecordingStorage) -> Vec<(Seen, i64, i64)> {
+            storage
+                .commits()
+                .iter()
+                .flat_map(|commit| commit.work_segments.clone())
+                .map(|segment| {
+                    let seen = match segment.kind() {
+                        WorkSegmentKind::Step { step_id, .. } => Seen::Step(*step_id),
+                        WorkSegmentKind::Wait { label, .. } => Seen::Wait(label.clone()),
+                    };
+                    (
+                        seen,
+                        (segment.started_at().unix_millis() - T0) / 1_000,
+                        (segment.ended_at().unix_millis() - T0) / 1_000,
+                    )
+                })
+                .collect()
+        }
+
+        const fn min(minutes: i64) -> i64 {
+            minutes * 60
+        }
+
+        /// I/O マトリクス「切り替え」— 第 3 の区間が 1 行。切り替えと同じコミットに乗る。
+        #[test]
+        fn a_switch_closes_the_segment_in_the_same_commit() {
+            let (core, storage, clock, third, _) = at_work();
+            tick_for(&core, &clock, 25 * MINUTE);
+
+            let fourth = core
+                .switch_current_position(None, false)
+                .expect("切り替えられる")
+                .expect("第 4 がある");
+
+            let last = storage.commits().last().cloned().expect("書いた");
+            assert!(
+                last.switch_record.is_some(),
+                "切り替えのコミットに相乗りする"
+            );
+            assert_eq!(last.work_segments.len(), 1);
+            assert_eq!(written(&storage), vec![(Seen::Step(third), 0, min(25))]);
+
+            // 第 4 の区間が開いている — 次の切り替えで閉じる。
+            tick_for(&core, &clock, 5 * MINUTE);
+            core.select_step(third).expect("移せる");
+            assert_eq!(
+                written(&storage),
+                vec![
+                    (Seen::Step(third), 0, min(25)),
+                    (Seen::Step(fourth), min(25), min(30))
+                ]
+            );
+        }
+
+        /// I/O マトリクス「切り替え」の失敗 — 区間も書かれず、メモリの区間も閉じない。
+        #[test]
+        fn a_failed_switch_keeps_the_segment_open() {
+            let (core, storage, clock, third, _) = at_work();
+            tick_for(&core, &clock, 10 * MINUTE);
+            storage.set_failing(true);
+            assert!(core.switch_current_position(None, false).is_err());
+            storage.set_failing(false);
+            assert!(written(&storage).is_empty());
+
+            tick_for(&core, &clock, 5 * MINUTE);
+            core.switch_current_position(None, false)
+                .expect("切り替えられる");
+            assert_eq!(
+                written(&storage),
+                vec![(Seen::Step(third), 0, min(15))],
+                "開いていた区間がそのまま閉じる"
+            );
+        }
+
+        /// 長さ 0 の区間は書かない。
+        #[test]
+        fn a_zero_length_segment_is_not_written() {
+            let (core, storage, _, _, rice) = at_work();
+            core.select_step(rice).expect("移せる");
+            core.switch_current_position(None, false)
+                .expect("切り替えられる");
+            assert!(written(&storage).is_empty());
+        }
+
+        /// I/O マトリクス「休息」— 休息に入った時刻で閉じ、終えた時刻から開く。休息の
+        /// 15 分はどこにも数えない。
+        #[test]
+        fn a_rest_is_not_counted() {
+            let (core, storage, clock, third, _) = at_work();
+            tick_for(&core, &clock, 10 * MINUTE);
+            assert!(core.begin_rest().expect("入れる"));
+            assert_eq!(written(&storage), vec![(Seen::Step(third), 0, min(10))]);
+
+            tick_for(&core, &clock, 15 * MINUTE);
+            assert!(core.end_rest().expect("終えられる"));
+            assert_eq!(written(&storage).len(), 1, "休息明けは開くだけ");
+
+            tick_for(&core, &clock, 5 * MINUTE);
+            core.switch_current_position(None, false)
+                .expect("切り替えられる");
+            assert_eq!(
+                written(&storage),
+                vec![
+                    (Seen::Step(third), 0, min(10)),
+                    (Seen::Step(third), min(25), min(30))
+                ]
+            );
+        }
+
+        /// 休息の介入から休息に入っても同じ (応答の経路)。
+        #[test]
+        fn a_rest_taken_from_the_intervention_closes_the_segment() {
+            let (core, storage, clock, third, _) = at_work();
+            assert!(tick_for(&core, &clock, 50 * MINUTE));
+            core.answer_intervention(InterventionChoice::Rest)
+                .expect("応答できる");
+            assert_eq!(written(&storage), vec![(Seen::Step(third), 0, min(50))]);
+        }
+
+        /// I/O マトリクス「スリープ」— スリープ直前の刻みで閉じ、復帰した刻みで開き直す。
+        #[test]
+        fn a_sleep_is_not_counted() {
+            let (core, storage, clock, third, _) = at_work();
+            tick_for(&core, &clock, 10 * MINUTE);
+            clock.advance(30 * MINUTE);
+            core.tick().expect("刻める");
+            assert_eq!(written(&storage), vec![(Seen::Step(third), 0, min(10))]);
+
+            tick_for(&core, &clock, 5 * MINUTE);
+            core.switch_current_position(None, false)
+                .expect("切り替えられる");
+            assert_eq!(
+                written(&storage),
+                vec![
+                    (Seen::Step(third), 0, min(10)),
+                    (Seen::Step(third), min(40), min(45))
+                ]
+            );
+        }
+
+        /// I/O マトリクス「スリープ」の失敗 — 書けなければ次の刻みでやり直す。
+        #[test]
+        fn a_failed_write_after_a_sleep_is_retried_on_the_next_tick() {
+            let (core, storage, clock, third, _) = at_work();
+            tick_for(&core, &clock, 10 * MINUTE);
+            clock.advance(30 * MINUTE);
+            storage.set_failing(true);
+            assert!(core.tick().is_err());
+            storage.set_failing(false);
+            assert!(written(&storage).is_empty());
+
+            tick_once(&core, &clock);
+            assert_eq!(
+                written(&storage),
+                vec![(Seen::Step(third), 0, min(10))],
+                "スリープ直前の刻みで閉じる"
+            );
+        }
+
+        /// 刻みより先に操作が届いても (スリープから戻ってすぐ切り替えた)、スリープを
+        /// 区間に含めない。
+        #[test]
+        fn an_operation_right_after_a_sleep_does_not_count_the_sleep() {
+            let (core, storage, clock, third, _) = at_work();
+            tick_for(&core, &clock, 10 * MINUTE);
+            clock.advance(30 * MINUTE);
+            core.switch_current_position(None, false)
+                .expect("切り替えられる");
+            assert_eq!(written(&storage), vec![(Seen::Step(third), 0, min(10))]);
+        }
+
+        /// スリープから戻って刻みより先に操作が区間を開き直しても、続く刻みはその区間を
+        /// 閉じ直さない — 操作から刻みまでの時間を失わない。刻みの前の二度目の操作も、
+        /// 一度目からの区間をそのまま閉じる。
+        #[test]
+        fn a_segment_reopened_right_after_a_sleep_keeps_its_time() {
+            let (core, storage, clock, third, rice) = at_work();
+            tick_for(&core, &clock, 10 * MINUTE);
+            clock.advance(30 * MINUTE);
+            let fourth = core
+                .switch_current_position(None, false)
+                .expect("切り替えられる")
+                .expect("第 4 がある");
+            clock.advance(4_000);
+            core.select_step(rice).expect("移せる");
+            clock.advance(5_000);
+            core.tick().expect("刻める");
+            tick_for(&core, &clock, MINUTE);
+            core.close_work_segment().expect("書ける");
+
+            let millis = |seconds: i64| seconds * 1_000;
+            let segments: Vec<(StepId, i64, i64)> = storage
+                .commits()
+                .iter()
+                .flat_map(|commit| commit.work_segments.clone())
+                .map(|segment| {
+                    let WorkSegmentKind::Step { step_id, .. } = segment.kind() else {
+                        panic!("ステップの区間だけ");
+                    };
+                    (
+                        *step_id,
+                        segment.started_at().unix_millis() - T0,
+                        segment.ended_at().unix_millis() - T0,
+                    )
+                })
+                .collect();
+            let woke = millis(min(40));
+            assert_eq!(
+                segments,
+                vec![
+                    (third, 0, millis(min(10))),
+                    (fourth, woke, woke + 4_000),
+                    (rice, woke + 4_000, woke + 9_000 + MINUTE),
+                ],
+                "スリープは数えず、戻ってからの時間は失わない"
+            );
+        }
+
+        /// I/O マトリクス「待機」— 第 3 の区間が閉じ、待機の区間 (一言つき) が 5 分。
+        /// 戻ったら第 3 が開く。
+        #[test]
+        fn a_wait_is_recorded_apart_from_the_step() {
+            let (core, storage, clock, third, _) = at_work();
+            tick_for(&core, &clock, 10 * MINUTE);
+            let minutes = NonZeroU32::new(5).expect("正");
+            assert!(core
+                .begin_wait(minutes, Some("AI の出力".to_string()))
+                .expect("書ける"));
+            assert_eq!(written(&storage), vec![(Seen::Step(third), 0, min(10))]);
+
+            tick_for(&core, &clock, 5 * MINUTE);
+            assert_eq!(
+                core.return_from_wait(NoteEdit::Keep).expect("戻れる"),
+                WaitReturn::Stayed
+            );
+            tick_for(&core, &clock, 5 * MINUTE);
+            core.switch_current_position(None, false)
+                .expect("切り替えられる");
+
+            assert_eq!(
+                written(&storage),
+                vec![
+                    (Seen::Step(third), 0, min(10)),
+                    (Seen::Wait(Some("AI の出力".to_string())), min(10), min(15)),
+                    (Seen::Step(third), min(15), min(20)),
+                ]
+            );
+        }
+
+        /// I/O マトリクス「待機中に別タスク」— その 3 分はそのステップの区間。待機の
+        /// 区間はその間閉じる。
+        #[test]
+        fn another_task_during_a_wait_counts_for_that_step() {
+            let (core, storage, clock, third, rice) = at_work();
+            tick_for(&core, &clock, MINUTE);
+            assert!(core
+                .begin_wait(NonZeroU32::new(30).expect("正"), None)
+                .expect("書ける"));
+            tick_for(&core, &clock, 2 * MINUTE);
+            core.select_step(rice).expect("移せる");
+            tick_for(&core, &clock, 3 * MINUTE);
+            assert_eq!(
+                core.return_from_wait(NoteEdit::Keep).expect("戻れる"),
+                WaitReturn::Moved
+            );
+            let last = storage.commits().last().cloned().expect("書いた");
+            assert!(last.switch_record.is_some(), "戻りの切り替えに相乗りする");
+
+            assert_eq!(
+                written(&storage),
+                vec![
+                    (Seen::Step(third), 0, min(1)),
+                    (Seen::Wait(None), min(1), min(3)),
+                    (Seen::Step(rice), min(3), min(6)),
+                ]
+            );
+        }
+
+        /// 作成して着手する経路 (`move_current_position`) も、離れるステップの区間を
+        /// 現在地の移動と同じコミットで書く。
+        #[test]
+        fn starting_a_new_task_closes_the_left_step() {
+            let (core, storage, clock, third, _) = at_work();
+            tick_for(&core, &clock, 10 * MINUTE);
+            let created = core
+                .create_task("新しい仕事", contents(&["一"]))
+                .expect("作れる");
+            let first = core.snapshot().task(created).expect("ある").steps()[0].id();
+            core.move_current_position(first).expect("移せる");
+
+            let last = storage.commits().last().cloned().expect("書いた");
+            assert_eq!(
+                last.current_position
+                    .and_then(|position| position.step_id()),
+                Some(first),
+                "現在地の移動に相乗りする"
+            );
+            assert_eq!(written(&storage), vec![(Seen::Step(third), 0, min(10))]);
+        }
+
+        /// 待機の区間を書けなければ待機に入らない。
+        #[test]
+        fn a_failed_write_keeps_the_wait_from_starting() {
+            let (core, storage, clock, _, _) = at_work();
+            tick_for(&core, &clock, MINUTE);
+            storage.set_failing(true);
+            assert!(core
+                .begin_wait(NonZeroU32::new(5).expect("正"), None)
+                .is_err());
+            assert!(core.snapshot().wait().is_none());
+        }
+
+        /// I/O マトリクス「完了」— **現在地**は動かず、区間は閉じない。
+        #[test]
+        fn a_completion_does_not_close_the_segment() {
+            let (core, storage, clock, _, _) = at_work();
+            tick_for(&core, &clock, 10 * MINUTE);
+            core.complete_current_step(NoteEdit::Keep)
+                .expect("宣言できる");
+            assert!(written(&storage).is_empty());
+        }
+
+        /// I/O マトリクス「終了」— 開いている区間を閉じて書く。二度は書かない。
+        #[test]
+        fn quitting_closes_the_open_segment_once() {
+            let (core, storage, clock, third, _) = at_work();
+            tick_for(&core, &clock, 10 * MINUTE);
+            assert!(core.close_work_segment().expect("書ける"));
+            assert!(!core.close_work_segment().expect("書ける"));
+            assert_eq!(written(&storage), vec![(Seen::Step(third), 0, min(10))]);
+        }
+
+        /// I/O マトリクス「異常終了」— 失われた区間は戻らない。起動時に**活性**なら
+        /// 起動時刻から開く。休息中なら開かない。
+        #[test]
+        fn a_restored_active_position_opens_a_segment_at_startup() {
+            let now = Timestamp::from_unix_millis(T0);
+            let task = Task::create(now, "原稿", contents(&["一"])).expect("作れる");
+            let step = task.steps()[0].id();
+            for (active, expected) in [(true, 1), (false, 0)] {
+                let storage = Arc::new(RecordingStorage {
+                    restored: RestoredState {
+                        tasks: vec![task.clone()],
+                        current_position: CurrentPosition::rehydrate(
+                            task.id(),
+                            step,
+                            active,
+                            Timestamp::from_unix_millis(T0 - 60 * MINUTE),
+                        ),
+                        ..RestoredState::default()
+                    },
+                    ..RecordingStorage::default()
+                });
+                let clock = FixedClock::at(T0);
+                let core = core_with(Arc::clone(&storage), clock.clone());
+                tick_for(&core, &clock, 10 * MINUTE);
+                core.close_work_segment().expect("書ける");
+                let seen = written(&storage);
+                assert_eq!(seen.len(), expected);
+                if active {
+                    assert_eq!(seen, vec![(Seen::Step(step), 0, min(10))], "起動時刻から");
+                }
+            }
+        }
+
+        /// 受け入れ条件 — 作業中のまま 1 時間、状態が何も変わらなければ、区間のための
+        /// 書き込みは一度も起きない。
+        #[test]
+        fn an_hour_of_unchanged_work_writes_nothing() {
+            let (core, storage, clock, _, _) = at_work();
+            core.store_setting(Setting::new(rest::REST_THRESHOLD_KEY, "36000"))
+                .expect("書ける");
+            let before = storage.commits().len();
+            tick_for(&core, &clock, 60 * MINUTE);
+            assert_eq!(storage.commits().len(), before);
         }
     }
 }

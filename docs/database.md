@@ -15,6 +15,8 @@ erDiagram
     task ||--o| current_position : "指される"
     step ||--o| current_position : "指される"
     step ||--o{ switch_record : "離脱元"
+    task ||--o{ work_segment : "数えた先"
+    step ||--o{ work_segment : "数えた先 (待機は NULL)"
 
     task {
         TEXT id PK "UUID v7"
@@ -49,6 +51,15 @@ erDiagram
         TEXT id PK "UUID v7"
         TEXT content
         TEXT created_at
+    }
+    work_segment {
+        TEXT id PK "UUID v7"
+        TEXT kind "step / wait"
+        TEXT task_id FK
+        TEXT step_id FK "wait なら NULL"
+        TEXT label "待機の一言 / NULL 可"
+        TEXT started_at
+        TEXT ended_at
     }
 ```
 
@@ -119,6 +130,40 @@ erDiagram
 
 外部キーも索引も持たない。
 
+### `work_segment` — 作業区間 (版 4 で追加)
+
+現在地が活性だった時間を、ステップごとの区間として残す。勤怠・工数の報告のための参考値で
+ある。
+
+| 列 | 型 | 制約 | 意味 |
+| --- | --- | --- | --- |
+| `id` | TEXT | PK, NOT NULL | UUID v7 |
+| `kind` | TEXT | NOT NULL, `CHECK IN ('step', 'wait')` | `step` = ステップの作業 / `wait` = 待機 |
+| `task_id` | TEXT | NOT NULL, FK → `task.id` | ステップのタスク。待機なら戻り先のタスク |
+| `step_id` | TEXT | FK → `step.id` | `step` なら必須、`wait` なら NULL |
+| `label` | TEXT | NULL 可 | 待機の「何を待っているか」。`step` なら NULL |
+| `started_at` | TEXT | NOT NULL | 区間の始まり |
+| `ended_at` | TEXT | NOT NULL, `started_at < ended_at` | 区間の終わり。長さ 0 の区間は書かない |
+
+- **閉じた区間だけが行になる。** 開いている区間 (種類・ステップ・開始時刻) はメモリにだけ
+  あり、永続化しない。状態が変わったとき (現在地の移動・休息の出入り・待機の出入り・
+  スリープからの復帰・メニューバー項目の「終了」・Mac のログアウト / 再起動 /
+  シャットダウンの直前 — `NSWorkspaceWillPowerOffNotification`) に、その変化のコミットに
+  相乗りして 1 行書く。**定期的には書かない。** 異常終了したときに開いていた区間は
+  失われる。
+- 数えないもの: 休息中・スリープ中 (刻みの飛びで検出し、直前の刻みで閉じて戻った時刻から
+  開き直す)・未着手・常駐が止まっていた間。スリープでなくても刻みが 30 秒以上空けば
+  (タイマーの間引き・時計を進めたなど) スリープとみなして数えない。実際のスリープの前後
+  10 秒ほどはずれうる。
+- 最終ステップを完了しても現在地は動かないため、次に状態が変わるまでその時間は完了した
+  ステップの区間に数える。
+- `label` は待機の「何を待っているか」をそのまま保存する (待機そのものは永続化しない)。
+- 待機中に現在地が戻り先と同じタスクにある時間は `wait` の区間になり、主作業のステップには
+  数えない。待機中に別タスクへ移った時間はそのステップの `step` の区間である。
+- **追記専用で、製品コードには読み出す経路が無い** (記録するが表示しない / AD-15)。
+  読み手は `scripts/export-work-log.sh` だけであり、日 × ステップの CSV に集計する
+  (使い方は README)。索引は張っていない。
+
 ### `setting` — 設定値
 
 | 列 | 型 | 制約 | 意味 |
@@ -151,9 +196,10 @@ erDiagram
 
 `ports/storage.rs` の `Storage::apply(&Commit)` が **1 回 = 1 トランザクション**である。
 `Commit` は「書き直すタスク (ステップ込み)」「置き換える現在地」「追記する切り替え履歴」
-「置き換える設定値」「追加する思いつき」「削除する思いつき」を同時に運ぶ。切り替え 1 回の
-メモ確定・現在地移動・履歴追記が割れずに確定するのも、昇格でタスクの作成と思いつきの
-削除が割れずに確定するのもこのためである。
+「置き換える設定値」「追加する思いつき」「削除する思いつき」「追記する作業区間」を同時に
+運ぶ。切り替え 1 回のメモ確定・現在地移動・履歴追記が割れずに確定するのも、昇格でタスクの
+作成と思いつきの削除が割れずに確定するのも、閉じた作業区間が状態の変化と同じ
+トランザクションで書かれるのもこのためである。
 
 **消せるのは思いつきだけである。** タスクもステップも削除しない (`DELETE` は `idea` と、
 未着手へ戻すための `current_position` の 1 行にしか向かない)。
@@ -167,6 +213,7 @@ erDiagram
 | 1 | `task` / `step` / `current_position` / `setting` |
 | 2 | `switch_record` |
 | 3 | `idea` |
+| 4 | `work_segment` |
 
 - `MIGRATIONS` は**追記専用**。適用済みの版の SQL を書き換えても、既存の DB には二度と
   適用されない。列や表を足すときは新しい版を末尾に足す。

@@ -18,6 +18,7 @@ use crate::domain::position::CurrentPosition;
 use crate::domain::setting::Setting;
 use crate::domain::switch::SwitchRecord;
 use crate::domain::task::Task;
+use crate::domain::work_log::WorkSegment;
 
 use std::fmt;
 
@@ -91,6 +92,12 @@ pub struct Commit {
     /// 昇格 (**タスク**の作成と同じコミット) と寿命 (刻み) の二つの経路だけが埋める。
     /// 既に無い ID は黙って無視される — 寿命で消えた後の昇格を失敗にしない。
     pub deleted_ideas: Vec<IdeaId>,
+    /// 追記する**作業区間** (閉じた区間)。**状態を変える操作のコミットに相乗りする。**
+    ///
+    /// 追記専用であり、置き換えも削除もしない。**読み戻す経路を持たない** — 読み手は
+    /// `scripts/export-work-log.sh` だけであり、DB を直接読む (AD-15: 記録するが表示しない)。
+    /// 開いている区間はここに載らない (永続化しない / AD-2)。
+    pub work_segments: Vec<WorkSegment>,
 }
 
 impl Commit {
@@ -104,6 +111,7 @@ impl Commit {
             settings: Vec::new(),
             idea: None,
             deleted_ideas: Vec::new(),
+            work_segments: Vec::new(),
         }
     }
 
@@ -117,6 +125,7 @@ impl Commit {
             settings: Vec::new(),
             idea: None,
             deleted_ideas: Vec::new(),
+            work_segments: Vec::new(),
         }
     }
 
@@ -130,6 +139,7 @@ impl Commit {
             settings,
             idea: None,
             deleted_ideas: Vec::new(),
+            work_segments: Vec::new(),
         }
     }
 
@@ -151,6 +161,16 @@ impl Commit {
         }
     }
 
+    /// **作業区間**だけを追記するコミット。書き込みの無い経路 (待機に入るなど) が区間を
+    /// 閉じたときに使う。
+    #[must_use]
+    pub fn of_work_segments(work_segments: Vec<WorkSegment>) -> Self {
+        Self {
+            work_segments,
+            ..Self::default()
+        }
+    }
+
     /// 書き込むものが何も無いか。
     #[must_use]
     pub fn is_empty(&self) -> bool {
@@ -160,6 +180,7 @@ impl Commit {
             && self.settings.is_empty()
             && self.idea.is_none()
             && self.deleted_ideas.is_empty()
+            && self.work_segments.is_empty()
     }
 }
 

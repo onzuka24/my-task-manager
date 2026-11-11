@@ -1641,7 +1641,8 @@ pub fn end_rest<R: Runtime>(app: AppHandle<R>) -> Result<EndRestOutcome, String>
 
 /// **待機に入る。** その時点の**現在地**を戻り先として覚える。
 ///
-/// **何も永続化しない** (利用者の裁定)。**連続作業時間**は数え続ける。
+/// **待機そのものは永続化しない** (利用者の裁定)。書くのは閉じた**作業区間**だけである。
+/// **連続作業時間**は数え続ける。
 ///
 /// # なぜイベントを発行しないのか
 ///
@@ -1651,8 +1652,9 @@ pub fn end_rest<R: Runtime>(app: AppHandle<R>) -> Result<EndRestOutcome, String>
 ///
 /// # Errors
 ///
-/// 分数が正の整数でないとき、またはコアが `manage` されていないとき。いずれの場合も
-/// **待機**には入っていない。呼び出し側は面を残して理由を 1 行示す。
+/// 分数が正の整数でないとき、コアが `manage` されていないとき、または閉じた**作業区間**
+/// を永続化できなかったとき。いずれの場合も**待機**には入っていない。呼び出し側は面を
+/// 残して理由を 1 行示す。
 #[tauri::command]
 pub fn begin_wait<R: Runtime>(
     app: AppHandle<R>,
@@ -1661,7 +1663,10 @@ pub fn begin_wait<R: Runtime>(
     // **コアを要求する前に入力を検める** (`create_task` と同じ順序)。
     let minutes = as_wait_minutes(&request.minutes)?;
     let core = require_core(app.try_state::<Core>())?;
-    let waiting = core.begin_wait(minutes, request.label);
+    // 主作業のステップの**作業区間**を閉じて書く。書けなければ**待機**に入っていない。
+    let waiting = core
+        .begin_wait(minutes, request.label)
+        .map_err(|error| error.to_string())?;
     // 何を待っているかは書かない。書いてよいのは「起きた」という事実だけである。
     log::info!("a wait was declared (waiting={waiting})");
     Ok(BeginWaitOutcome { waiting })
@@ -3626,7 +3631,9 @@ mod tests {
             .expect("作れる");
         let first = core.snapshot().task(task_id).expect("ある").steps()[0].id();
         core.move_current_position(first).expect("移せる");
-        assert!(core.begin_wait(NonZeroU32::new(5).expect("正"), label.map(str::to_string)));
+        assert!(core
+            .begin_wait(NonZeroU32::new(5).expect("正"), label.map(str::to_string))
+            .expect("書ける"));
         core
     }
 
@@ -3729,7 +3736,9 @@ mod tests {
             .expect("作れる");
         let first = core.snapshot().task(task_id).expect("ある").steps()[0].id();
         core.move_current_position(first).expect("移せる");
-        assert!(core.begin_wait(NonZeroU32::new(1).expect("正"), None));
+        assert!(core
+            .begin_wait(NonZeroU32::new(1).expect("正"), None)
+            .expect("書ける"));
         let mut raised = false;
         for _ in 0..6 {
             clock.advance(crate::domain::rest::TICK_INTERVAL_MILLIS);
