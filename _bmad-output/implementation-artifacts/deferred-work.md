@@ -108,3 +108,7 @@
 - source_spec: `_bmad-output/implementation-artifacts/spec-work-log.md`
   summary: メニューバー項目の「終了」・`RunEvent::Exit`・`NSWorkspaceWillPowerOffNotification` で開いている作業区間を閉じることを、実際に動かして確かめる検査が無い (字面の守りだけがある)。
   evidence: 三つの配線はいずれも生きた Tauri アプリ / AppKit の上でしか観測できず、リポジトリに UI 自動化の基盤が無い。消えたら落ちる字面の検査 (`the_work_segment_is_still_closed_on_exit_in_the_source` ほか) は足した。あわせて、ログアウトの通知の後にログアウトが取り消された場合、区間は閉じたまま次の状態の変化まで開き直さない (その間の時間が残らない) — 実機で取り消しが起きうるかを確かめるときに併せて扱う。
+
+- source_spec: `_bmad-output/implementation-artifacts/spec-switch-advice.md`
+  summary: 作業中の画面で「切り替えのすすめ」(6 項目) を開くと、固定寸法の窓 (640×280) に収まらず、ボタンや案内が窓の下へ押し出される可能性がある (未検証)。
+  evidence: 作業中の面は次の一手・位置・待機の 1 行・2 行の中断メモ欄・すすめ・ボタン 2 段・ショートカットの見出しを持ち、休息中の面より背が高い。切り取らず main のスクロールで辿れ、開いたら見える位置へ送るが、jsdom は配置を計算しない。`make dev` で作業中 (と待機中) に ⌘T を押し、開いた状態の見え方を確かめる。休息のすすめの同種の項目 (spec-rest-advice.md) と併せて扱う。
