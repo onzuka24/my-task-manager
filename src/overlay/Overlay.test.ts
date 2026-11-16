@@ -2367,9 +2367,9 @@ function switchAdviceItems(): string[] {
   )
 }
 
-test('中断メモの欄のプレースホルダが、次の作業の余白を作るよう促す', () => {
+test('中断メモの欄のプレースホルダが、次の作業に向かう心の余裕をつくるよう促す', () => {
   const placeholder = noteField().placeholder
-  expect(placeholder).toContain('頭を整理して、次の作業の余白を作りましょう')
+  expect(placeholder).toContain('頭を整理して、次の作業に向かう心の余裕をつくりましょう')
   // 中断メモであること・省略できることは保つ。
   expect(placeholder).toContain('中断メモ')
   expect(placeholder).toContain('省略可')
@@ -2392,12 +2392,12 @@ test('作業中の ⌘T で切り替えのすすめが開き、もう一度で�
   expect(switchAdviceToggle()?.getAttribute('aria-expanded')).toBe('true')
   expect(switchAdviceToggle()?.getAttribute('aria-controls')).toBe('switch-advice-list')
   expect(switchAdviceItems()).toEqual([
-    'どこで止まったかを書き出す — 頭に置いたままにしない',
-    '戻ってきて最初にやる一手を決めておく',
-    '引っかかっている未解決のことも書き出して手放す',
-    '戻るときに開くファイル・画面・URL を残す',
-    '使い終わったタブ・ウィンドウを閉じて、次の作業の場所を空ける',
-    '一息ついてから次へ移る',
+    'どこで止まったかを書き出す — 頭に抱えたままにしない',
+    '戻ってきて最初にやる一手を決めておく — 再開の不安を減らす',
+    '引っかかっていることも書き出して、いったん手放す',
+    '戻るときに開くファイル・画面・URL を残す — 覚えておく負担を減らす',
+    '使い終わったタブ・ウィンドウを閉じる — 目に入るものを減らして気持ちを切り替える',
+    '一息ついて、気持ちを整えてから次へ移る',
   ])
   // 休息のすすめには触れない。
   expect(restAdviceToggle()).toBeNull()
