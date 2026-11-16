@@ -2461,7 +2461,7 @@
       bind:value={noteDraft}
       rows="2"
       spellcheck="false"
-      placeholder="頭を整理して、次の作業に向かう心の余裕をつくりましょう — 中断メモ (省略可)"
+      placeholder="中断メモ - 余白を作りましょう"
       aria-label="中断メモ"
     ></textarea>
 

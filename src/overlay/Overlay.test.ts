@@ -2367,12 +2367,8 @@ function switchAdviceItems(): string[] {
   )
 }
 
-test('中断メモの欄のプレースホルダが、次の作業に向かう心の余裕をつくるよう促す', () => {
-  const placeholder = noteField().placeholder
-  expect(placeholder).toContain('頭を整理して、次の作業に向かう心の余裕をつくりましょう')
-  // 中断メモであること・省略できることは保つ。
-  expect(placeholder).toContain('中断メモ')
-  expect(placeholder).toContain('省略可')
+test('中断メモの欄のプレースホルダが、中断メモであることと余白をつくることを短く示す', () => {
+  expect(noteField().placeholder).toBe('中断メモ - 余白を作りましょう')
 })
 
 test('作業中は「切り替えのすすめ」が見出しだけで出る (閉じた状態)', () => {
