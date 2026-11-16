@@ -236,6 +236,31 @@
   let shortcutsOpen = $state(false)
 
   /**
+   * 切り替えのすすめが開いているか — 揮発ビュー状態 (AD-2)。コアは知らない。
+   *
+   * 休息のすすめと同じく**常駐が動いている間だけ覚える**。`forgetPosition()` /
+   * `dismissNotices()` / `close()` で畳まない。永続化はしない。起動直後は閉じている。
+   */
+  let switchAdviceOpen = $state(false)
+
+  /**
+   * 切り替えのすすめ — 切り替えの瞬間に**頭を整理して、次の作業に向かう心の余裕をつくる**ための
+   * 手がかり。**中身はコードに固定する。** 「余裕」は物の片付けではなく**精神的な余裕**を
+   * 指す (利用者の裁定)。前の作業を頭に抱えたまま次へ移らないよう、書き出して手放すこと、
+   * 覚えておく負担と目に入るものを減らすこと、気持ちを整えることに寄せる。
+   *
+   * こなしたかを問わない — チェックボックスも件数も置かない (AD-15)。
+   */
+  const SWITCH_ADVICE: readonly string[] = [
+    'どこで止まったかを書き出す — 頭に抱えたままにしない',
+    '戻ってきて最初にやる一手を決めておく — 再開の不安を減らす',
+    '引っかかっていることも書き出して、いったん手放す',
+    '戻るときに開くファイル・画面・URL を残す — 覚えておく負担を減らす',
+    '使い終わったタブ・ウィンドウを閉じる — 目に入るものを減らして気持ちを切り替える',
+    '一息ついて、気持ちを整えてから次へ移る',
+  ]
+
+  /**
    * 既定表示の打鍵の案内 — 1 要素が 1 行、1 行に打鍵は一つだけ。
    *
    * **案内と実際に効く打鍵を食い違わせない。** 休息中は切り替えも完了の宣言も無く、
@@ -253,6 +278,7 @@
         waiting ? '⌘D — 主作業に戻る' : '⌘D — 待機',
         '⌘E — タスク修正',
         '⌘R — 休息',
+        '⌘T — 切り替えのすすめ',
       )
     }
     lines.push('⌘N — 新規タスク', '⌘I — 思いつき', '⌘L — タスク一覧', '⌘/ — ショートカットの開閉', 'Esc — 閉じる')
@@ -871,6 +897,18 @@
     if (!shortcutsOpen) return
     await tick()
     document.getElementById('shortcuts-list')?.scrollIntoView?.({ block: 'nearest' })
+  }
+
+  /**
+   * 切り替えのすすめを開閉する。**開いたら見える位置へ送る** — 作業中の面は中身が多く、
+   * 固定寸法の窓 (640×280) では開いた一覧が見える範囲の下に出て、何も起きなかったように
+   * 見えうる ([`toggleShortcuts`] と同じ理由)。
+   */
+  async function toggleSwitchAdvice(): Promise<void> {
+    switchAdviceOpen = !switchAdviceOpen
+    if (!switchAdviceOpen) return
+    await tick()
+    document.getElementById('switch-advice-list')?.scrollIntoView?.({ block: 'nearest' })
   }
 
   async function focusSelectedRow(): Promise<void> {
@@ -1749,14 +1787,18 @@
       return
     }
 
-    // 休息のすすめの開閉。**コアを呼ばない** — 休息の状態も計時も変えない。休息中で
-    // なければすすめは描かれておらず、何も起きない。打鍵は飲む (webview の既定動作へ
-    // 抜けさせない)。
+    // すすめの開閉。**コアを呼ばない** — 状態も計時も変えない。休息中は休息のすすめ、
+    // 作業中 (現在地あり) は切り替えのすすめを開閉する。未着手ではどちらも描かれておらず、
+    // 何も起きない。打鍵は飲む (webview の既定動作へ抜けさせない)。
     if (isSurfaceKey(event, 't')) {
       event.preventDefault()
       // 押しっぱなしの自動反復で開閉を繰り返さない — 最後の状態が反復回数で決まる。
-      if (event.repeat || !resting) return
-      restAdviceOpen = !restAdviceOpen
+      if (event.repeat) return
+      if (resting) {
+        restAdviceOpen = !restAdviceOpen
+      } else if (stepContent !== null) {
+        void toggleSwitchAdvice()
+      }
       return
     }
 
@@ -2419,7 +2461,7 @@
       bind:value={noteDraft}
       rows="2"
       spellcheck="false"
-      placeholder="中断メモ (省略可)"
+      placeholder="中断メモ - 余白を作りましょう"
       aria-label="中断メモ"
     ></textarea>
 
@@ -2437,6 +2479,35 @@
         <span class="detail">{switchError}</span>
       </p>
     {/if}
+
+    <!--
+      切り替えのすすめ。**開閉するだけで、こなしたかは問わない** — チェックボックスも
+      数も置かない (AD-15)。閉じているときは見出し 1 行だけを出す。休息のすすめと同じ作法。
+
+      **切り替えの報せより後に置く。** 開いた一覧が、確定できなかった理由を窓の下へ
+      押し出さないためである。`onmousedown` で既定動作を止めるのは、入力位置を中断メモの
+      欄から奪わないため (休息のすすめと同じ)。
+    -->
+    <section class="switch-advice">
+      <button
+        type="button"
+        class="switch-advice-toggle"
+        aria-expanded={switchAdviceOpen}
+        aria-controls={switchAdviceOpen ? 'switch-advice-list' : undefined}
+        onmousedown={preventStealingFocus}
+        onclick={() => void toggleSwitchAdvice()}
+      >
+        <span class="mark" aria-hidden="true">{switchAdviceOpen ? '▾' : '▸'}</span>
+        切り替えのすすめ
+      </button>
+      {#if switchAdviceOpen}
+        <ul class="switch-advice-list" id="switch-advice-list">
+          {#each SWITCH_ADVICE as advice (advice)}
+            <li>{advice}</li>
+          {/each}
+        </ul>
+      {/if}
+    </section>
   {/if}
 
   <!--
@@ -2720,17 +2791,20 @@
   }
 
   /*
-    休息のすすめ。`.position` 並みの小さな文字で窓 (640×280) に収まりやすくする。
-    収まらない分は main のスクロールで辿る — 切り取らない (max-height / overflow を
-    持たせない)。強調色・バー・進捗の表現を足さない (AD-15)。
+    休息のすすめと切り替えのすすめ (同じ作法の二つの折りたたみ)。`.position` 並みの
+    小さな文字で窓 (640×280) に収まりやすくする。収まらない分は main のスクロールで
+    辿る — 切り取らない (max-height / overflow を持たせない)。強調色・バー・進捗の
+    表現を足さない (AD-15)。
   */
-  .rest-advice {
+  .rest-advice,
+  .switch-advice {
     display: flex;
     flex-direction: column;
     gap: 0.35rem;
   }
 
-  .rest-advice-toggle {
+  .rest-advice-toggle,
+  .switch-advice-toggle {
     align-self: flex-start;
     margin: 0;
     padding: 0;
@@ -2742,17 +2816,20 @@
     cursor: pointer;
   }
 
-  .rest-advice-toggle:focus-visible {
+  .rest-advice-toggle:focus-visible,
+  .switch-advice-toggle:focus-visible {
     outline: 1px solid var(--overlay-focus);
     outline-offset: 2px;
   }
 
-  .rest-advice-toggle .mark {
+  .rest-advice-toggle .mark,
+  .switch-advice-toggle .mark {
     display: inline-block;
     width: 1em;
   }
 
-  .rest-advice-list {
+  .rest-advice-list,
+  .switch-advice-list {
     margin: 0;
     padding: 0 0 0 1.2rem;
     display: grid;

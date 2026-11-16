@@ -2355,6 +2355,177 @@ test('休息中でも残り時間やカウントダウンを出さない (spec N
   }
 })
 
+// --- 切り替えのすすめ ------------------------------------------------------
+
+function switchAdviceToggle(): HTMLButtonElement | null {
+  return document.querySelector<HTMLButtonElement>('button.switch-advice-toggle')
+}
+
+function switchAdviceItems(): string[] {
+  return Array.from(document.querySelectorAll('.switch-advice-list li')).map(
+    (li) => li.textContent ?? '',
+  )
+}
+
+test('中断メモの欄のプレースホルダが、中断メモであることと余白をつくることを短く示す', () => {
+  expect(noteField().placeholder).toBe('中断メモ - 余白を作りましょう')
+})
+
+test('作業中は「切り替えのすすめ」が見出しだけで出る (閉じた状態)', () => {
+  const toggle = switchAdviceToggle()
+  expect(toggle?.textContent).toContain('切り替えのすすめ')
+  expect(toggle?.getAttribute('aria-expanded')).toBe('false')
+  expect(toggle?.hasAttribute('aria-controls')).toBe(false)
+  expect(switchAdviceItems()).toHaveLength(0)
+})
+
+test('作業中の ⌘T で切り替えのすすめが開き、もう一度で畳まれる — コアは呼ばれない', async () => {
+  invoked = []
+
+  const opened = pressCancelable('t', { metaKey: true })
+  await settle()
+  expect(opened.defaultPrevented).toBe(true)
+  expect(switchAdviceToggle()?.getAttribute('aria-expanded')).toBe('true')
+  expect(switchAdviceToggle()?.getAttribute('aria-controls')).toBe('switch-advice-list')
+  expect(switchAdviceItems()).toEqual([
+    'どこで止まったかを書き出す — 頭に抱えたままにしない',
+    '戻ってきて最初にやる一手を決めておく — 再開の不安を減らす',
+    '引っかかっていることも書き出して、いったん手放す',
+    '戻るときに開くファイル・画面・URL を残す — 覚えておく負担を減らす',
+    '使い終わったタブ・ウィンドウを閉じる — 目に入るものを減らして気持ちを切り替える',
+    '一息ついて、気持ちを整えてから次へ移る',
+  ])
+  // 休息のすすめには触れない。
+  expect(restAdviceToggle()).toBeNull()
+
+  press('t', { metaKey: true })
+  await settle()
+  expect(switchAdviceToggle()?.getAttribute('aria-expanded')).toBe('false')
+  expect(switchAdviceItems()).toHaveLength(0)
+  expect(invoked).toEqual([])
+})
+
+test('見出しのクリックでも切り替えのすすめを開閉でき、入力位置は中断メモの欄に残る', async () => {
+  noteField().focus()
+  switchAdviceToggle()?.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true }))
+  switchAdviceToggle()?.click()
+  await settle()
+
+  expect(switchAdviceItems()).toHaveLength(6)
+  expect(document.activeElement).toBe(noteField())
+
+  switchAdviceToggle()?.click()
+  await settle()
+  expect(switchAdviceToggle()?.getAttribute('aria-expanded')).toBe('false')
+  expect(switchAdviceItems()).toHaveLength(0)
+})
+
+test('切り替えのすすめは、切り替えの報せより後に置かれる', async () => {
+  switchOutcome = { moved: false }
+  press('Enter')
+  await settle()
+  press('t', { metaKey: true })
+  await settle()
+
+  const alert = document.querySelector('[role="alert"]') as Element
+  const advice = document.querySelector('.switch-advice') as Element
+  // 開いた一覧が、確定の結末を窓の下へ押し出さない。
+  expect(alert.compareDocumentPosition(advice) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
+})
+
+test('切り替えた後も、切り替えのすすめは開いたまま残る', async () => {
+  press('t', { metaKey: true })
+  await settle()
+
+  press('Enter')
+  await settle()
+
+  expect(invoked).toContain('switch_current_position')
+  expect(switchAdviceToggle()?.getAttribute('aria-expanded')).toBe('true')
+  expect(switchAdviceItems()).toHaveLength(6)
+})
+
+test('待機中も ⌘T で切り替えのすすめを開閉できる', async () => {
+  await enterTheWaitingSurface()
+
+  press('t', { metaKey: true })
+  await settle()
+
+  expect(switchAdviceToggle()?.getAttribute('aria-expanded')).toBe('true')
+  expect(restAdviceToggle()).toBeNull()
+})
+
+test('切り替えのすすめと休息のすすめの開閉は互いに独立している', async () => {
+  // 作業中に切り替えのすすめを開く。
+  press('t', { metaKey: true })
+  await settle()
+
+  // 休息に入っても、休息のすすめは閉じたまま。
+  await enterTheRestingSurface()
+  expect(restAdviceToggle()?.getAttribute('aria-expanded')).toBe('false')
+
+  // 休息を終えると、切り替えのすすめは開いたまま戻る。
+  snapshot = { ...SNAPSHOT, resting: false }
+  press('Enter')
+  await settle()
+  expect(switchAdviceToggle()?.getAttribute('aria-expanded')).toBe('true')
+})
+
+test('押しっぱなしの ⌘T (自動反復) は切り替えのすすめを開閉しない', async () => {
+  press('t', { metaKey: true, repeat: true })
+  await settle()
+  expect(switchAdviceToggle()?.getAttribute('aria-expanded')).toBe('false')
+})
+
+test('切り替えのすすめの開閉は、閉じて開き直しても引き継がれる', async () => {
+  press('t', { metaKey: true })
+  await settle()
+
+  press('Escape')
+  await settle()
+  await emit('tauri://focus', null)
+  await settle()
+
+  expect(switchAdviceToggle()?.getAttribute('aria-expanded')).toBe('true')
+  expect(switchAdviceItems()).toHaveLength(6)
+})
+
+test('休息中は切り替えのすすめを描かず、⌘T は休息のすすめを開く', async () => {
+  await enterTheRestingSurface()
+
+  expect(switchAdviceToggle()).toBeNull()
+  press('t', { metaKey: true })
+  await settle()
+
+  expect(restAdviceToggle()?.getAttribute('aria-expanded')).toBe('true')
+  expect(switchAdviceToggle()).toBeNull()
+})
+
+test('未着手では切り替えのすすめを描かず、⌘T は何も起こさない', async () => {
+  snapshot = { ...SNAPSHOT, stepContent: null, stepOrdinal: null, stepCount: null }
+  currentStepId = null
+  if (component) unmount(component)
+  await mountOverlay()
+
+  const event = pressCancelable('t', { metaKey: true })
+  await settle()
+
+  expect(event.defaultPrevented).toBe(true)
+  expect(switchAdviceToggle()).toBeNull()
+  expect(restAdviceToggle()).toBeNull()
+})
+
+test('切り替えのすすめは件数・チェックボックスを持たない (AD-15)', async () => {
+  press('t', { metaKey: true })
+  await settle()
+
+  expect(document.querySelector('.switch-advice input[type="checkbox"]')).toBeNull()
+  const text = document.querySelector('.switch-advice')?.textContent ?? ''
+  for (const forbidden of ['残り', '経過', '%', '件']) {
+    expect(text).not.toContain(forbidden)
+  }
+})
+
 // --- 休息のすすめ ----------------------------------------------------------
 
 function restAdviceToggle(): HTMLButtonElement | null {
@@ -2440,7 +2611,7 @@ test('IME 変換中の ⌘T は何もしない', async () => {
   expect(invoked).toEqual([])
 })
 
-test('作業中の既定表示にすすめは描かれず、⌘T は何も起こさない', async () => {
+test('作業中の既定表示に休息のすすめは描かれず、⌘T は休息のすすめに触れない', async () => {
   expect(restAdviceToggle()).toBeNull()
   invoked = []
 
@@ -2451,7 +2622,9 @@ test('作業中の既定表示にすすめは描かれず、⌘T は何も起こ
   expect(restAdviceToggle()).toBeNull()
   expect(document.body.textContent ?? '').not.toContain('休息のすすめ')
   expect(invoked).toEqual([])
-  expect(await shortcutsText()).not.toContain('⌘T')
+  // 作業中の ⌘T は切り替えのすすめの打鍵である。
+  expect(await shortcutsText()).toContain('⌘T — 切り替えのすすめ')
+  expect(await shortcutsText()).not.toContain('休息のすすめ')
 
   // 作業中の ⌘T は引き継がれる開閉の状態にも触れない。
   await enterTheRestingSurface()
@@ -2806,6 +2979,7 @@ test('I/O「案内を開く」— ⌘/ で打鍵ごとに 1 行で並び、も�
     '⌘D — 待機',
     '⌘E — タスク修正',
     '⌘R — 休息',
+    '⌘T — 切り替えのすすめ',
     '⌘N — 新規タスク',
     '⌘I — 思いつき',
     '⌘L — タスク一覧',
